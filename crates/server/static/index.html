@@ -195,8 +195,45 @@ async function onSignal(from, { description, candidate }) {
 
 function render(peer) {
   peer.label.textContent = peer.name + (peer.muted ? ' (muted)' : '');
-  peer.state.textContent = peer.pc.connectionState;
+  peer.state.textContent = [peer.pc.connectionState, peer.statsText].filter(Boolean).join(' · ');
 }
+
+// Shows where receive-side delay comes from: the jitter buffer (averaged over
+// the last second), the network round trip, and whether the path is direct.
+async function updateStats(peer) {
+  let report;
+  try {
+    report = await peer.pc.getStats();
+  } catch {
+    return;
+  }
+  let buffer = null;
+  let rtt = null;
+  let route = null;
+  for (const stat of report.values()) {
+    if (stat.type === 'inbound-rtp' && stat.kind === 'audio' && stat.jitterBufferEmittedCount > 0) {
+      const last = peer.lastBuffer;
+      if (last && stat.jitterBufferEmittedCount > last.count) {
+        const seconds = (stat.jitterBufferDelay - last.delay) / (stat.jitterBufferEmittedCount - last.count);
+        buffer = `buffer ${Math.round(seconds * 1000)} ms`;
+      }
+      peer.lastBuffer = { delay: stat.jitterBufferDelay, count: stat.jitterBufferEmittedCount };
+    }
+    if (stat.type === 'candidate-pair' && stat.nominated && stat.state === 'succeeded' && !route) {
+      if (typeof stat.currentRoundTripTime === 'number') {
+        rtt = `rtt ${Math.round(stat.currentRoundTripTime * 1000)} ms`;
+      }
+      const local = report.get(stat.localCandidateId);
+      route = local && local.candidateType === 'relay' ? 'relayed' : 'direct';
+    }
+  }
+  peer.statsText = [buffer, rtt, route].filter(Boolean).join(' · ');
+  render(peer);
+}
+
+setInterval(() => {
+  for (const peer of peers.values()) updateStats(peer);
+}, 1000);
 
 function removePeer(id) {
   const peer = peers.get(id);
