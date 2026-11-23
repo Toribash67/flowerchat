@@ -1,0 +1,246 @@
+//! flowerchat signaling server.
+//!
+//! Keeps track of who is in which room and relays WebRTC signaling between
+//! peers. Media never passes through here.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::Router;
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::{Html, IntoResponse};
+use axum::routing::get;
+use flowerchat_protocol::{
+    ClientMsg, IceServer, MAX_NAME_LEN, MAX_ROOM_SIZE, PeerId, PeerInfo, ServerMsg,
+};
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+
+/// SDP offers are a few kilobytes; anything near this limit is not signaling.
+const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// How long a new connection has to send its `join`.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Keeps reverse proxies from closing idle connections, and lets us notice
+/// clients that vanished without closing the socket.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// A live client answers every ping, so silence this long means it is gone.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Messages queued per peer before new ones are dropped.
+const OUTBOX_CAPACITY: usize = 256;
+
+pub struct Config {
+    /// Handed to every client in its `welcome`.
+    pub ice_servers: Vec<IceServer>,
+}
+
+pub fn app(config: Config) -> Router {
+    let state = AppState(Arc::new(Shared {
+        rooms: Mutex::new(HashMap::new()),
+        next_id: AtomicU64::new(1),
+        ice_servers: config.ice_servers,
+    }));
+    Router::new()
+        .route("/", get(index))
+        .route("/ws", get(ws_handler))
+        .with_state(state)
+}
+
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../static/index.html"))
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.max_message_size(MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+struct Peer {
+    name: String,
+    outbox: mpsc::Sender<ServerMsg>,
+}
+
+type Room = HashMap<PeerId, Peer>;
+
+struct Shared {
+    rooms: Mutex<HashMap<String, Room>>,
+    next_id: AtomicU64,
+    ice_servers: Vec<IceServer>,
+}
+
+#[derive(Clone)]
+struct AppState(Arc<Shared>);
+
+impl AppState {
+    /// Adds a peer to a room and queues its `welcome`.
+    fn join(
+        &self,
+        room_name: &str,
+        name: String,
+        outbox: mpsc::Sender<ServerMsg>,
+    ) -> Result<PeerId, &'static str> {
+        let mut rooms = self.0.rooms.lock().unwrap();
+        if rooms
+            .get(room_name)
+            .is_some_and(|r| r.len() >= MAX_ROOM_SIZE)
+        {
+            return Err("room is full");
+        }
+        let room = rooms.entry(room_name.to_owned()).or_default();
+        let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
+
+        let peers = room
+            .iter()
+            .map(|(&id, peer)| PeerInfo {
+                id,
+                name: peer.name.clone(),
+            })
+            .collect();
+        for (&other, peer) in room.iter() {
+            deliver(
+                other,
+                &peer.outbox,
+                ServerMsg::PeerJoined {
+                    id,
+                    name: name.clone(),
+                },
+            );
+        }
+        deliver(
+            id,
+            &outbox,
+            ServerMsg::Welcome {
+                id,
+                peers,
+                ice_servers: self.0.ice_servers.clone(),
+            },
+        );
+        room.insert(id, Peer { name, outbox });
+        Ok(id)
+    }
+
+    fn relay(&self, room_name: &str, from: PeerId, to: PeerId, data: serde_json::Value) {
+        let rooms = self.0.rooms.lock().unwrap();
+        // The target may have just left; that is not an error.
+        if let Some(peer) = rooms.get(room_name).and_then(|room| room.get(&to)) {
+            deliver(to, &peer.outbox, ServerMsg::Signal { from, data });
+        }
+    }
+
+    fn leave(&self, room_name: &str, id: PeerId) {
+        let mut rooms = self.0.rooms.lock().unwrap();
+        let Some(room) = rooms.get_mut(room_name) else {
+            return;
+        };
+        room.remove(&id);
+        if room.is_empty() {
+            rooms.remove(room_name);
+            return;
+        }
+        for (&other, peer) in room.iter() {
+            deliver(other, &peer.outbox, ServerMsg::PeerLeft { id });
+        }
+    }
+}
+
+fn deliver(to: PeerId, outbox: &mpsc::Sender<ServerMsg>, msg: ServerMsg) {
+    if outbox.try_send(msg).is_err() {
+        warn!(peer = to, "outbox full or closed, dropping message");
+    }
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (sink, mut stream) = socket.split();
+
+    let joined = tokio::time::timeout(JOIN_TIMEOUT, next_client_msg(&mut stream)).await;
+    let (room, name) = match joined {
+        Ok(Some(ClientMsg::Join { room, name })) => (room, name),
+        Ok(None) => return,
+        _ => return reject(sink, "expected a join message").await,
+    };
+    if !valid_name(&room) || !valid_name(&name) {
+        return reject(sink, "room and name must be 1 to 64 bytes").await;
+    }
+
+    let (outbox, inbox) = mpsc::channel(OUTBOX_CAPACITY);
+    let id = match state.join(&room, name.clone(), outbox) {
+        Ok(id) => id,
+        Err(reason) => return reject(sink, reason).await,
+    };
+    info!(peer = id, %name, %room, "joined");
+
+    let mut writer = tokio::spawn(write_loop(sink, inbox));
+    loop {
+        tokio::select! {
+            msg = next_client_msg(&mut stream) => match msg {
+                Some(ClientMsg::Signal { to, data }) => state.relay(&room, id, to, data),
+                Some(ClientMsg::Join { .. }) => debug!(peer = id, "ignoring repeated join"),
+                None => break,
+            },
+            // The socket stopped accepting writes.
+            _ = &mut writer => break,
+        }
+    }
+
+    // Removing the peer drops its outbox sender, which ends the writer.
+    state.leave(&room, id);
+    info!(peer = id, %room, "left");
+}
+
+/// Waits for the next well-formed client message. Returns `None` once the
+/// connection is closed, broken or idle for too long.
+async fn next_client_msg(stream: &mut SplitStream<WebSocket>) -> Option<ClientMsg> {
+    loop {
+        let frame = tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await;
+        match frame {
+            Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str(&text) {
+                Ok(msg) => return Some(msg),
+                // Skipped rather than fatal so that newer clients can send
+                // message types this server does not know yet.
+                Err(err) => debug!(%err, "ignoring unrecognised message"),
+            },
+            // Pings, pongs and binary frames only count as signs of life.
+            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) | Err(_) => return None,
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
+async fn write_loop(mut sink: SplitSink<WebSocket, Message>, mut inbox: mpsc::Receiver<ServerMsg>) {
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.tick().await; // the first tick fires immediately
+    loop {
+        let frame = tokio::select! {
+            msg = inbox.recv() => match msg {
+                Some(msg) => encode(&msg),
+                None => break,
+            },
+            _ = ping.tick() => Message::Ping(Default::default()),
+        };
+        if sink.send(frame).await.is_err() {
+            return;
+        }
+    }
+    let _ = sink.close().await;
+}
+
+async fn reject(mut sink: SplitSink<WebSocket, Message>, reason: &str) {
+    let msg = ServerMsg::Error {
+        message: reason.to_owned(),
+    };
+    let _ = sink.send(encode(&msg)).await;
+    let _ = sink.close().await;
+}
+
+fn encode(msg: &ServerMsg) -> Message {
+    let json = serde_json::to_string(msg).expect("server messages always serialize");
+    Message::Text(json.into())
+}
+
+fn valid_name(s: &str) -> bool {
+    !s.trim().is_empty() && s.len() <= MAX_NAME_LEN
+}

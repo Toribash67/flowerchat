@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flowerchat test client</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.25rem; }
+  form, .bar { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+  input[type=text] { flex: 1; min-width: 8rem; padding: .4rem; font: inherit; }
+  button { padding: .4rem .9rem; font: inherit; }
+  ul { list-style: none; padding: 0; }
+  li { display: flex; gap: .75rem; align-items: center; padding: .4rem 0; border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
+  li .who { flex: 1; }
+  li .state { opacity: .7; font-size: .85rem; }
+  pre { font-size: .8rem; opacity: .8; white-space: pre-wrap; max-height: 14rem; overflow: auto; }
+</style>
+</head>
+<body>
+<h1>flowerchat test client</h1>
+
+<form id="join">
+  <input type="text" id="name" placeholder="Your name" maxlength="64" required>
+  <input type="text" id="room" placeholder="Room" value="lounge" maxlength="64" required>
+  <button>Join</button>
+</form>
+
+<div id="call" hidden>
+  <div class="bar">
+    <strong id="me"></strong>
+    <button id="mute" type="button">Mute</button>
+    <button id="leave" type="button">Leave</button>
+  </div>
+  <ul id="peers"></ul>
+</div>
+
+<pre id="log"></pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+let ws = null;
+let myId = null;
+let localStream = null;
+let iceServers = [];
+let muted = false;
+const peers = new Map();
+
+function log(text) {
+  const line = `${new Date().toLocaleTimeString()}  ${text}\n`;
+  $('log').textContent = line + $('log').textContent;
+}
+
+function signal(to, data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'signal', to, data }));
+  }
+}
+
+$('join').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (err) {
+    log(`Microphone unavailable: ${err.message}`);
+    return;
+  }
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${scheme}://${location.host}/ws`);
+  ws.onopen = () => ws.send(JSON.stringify({
+    type: 'join',
+    room: $('room').value.trim(),
+    name: $('name').value.trim(),
+  }));
+  ws.onmessage = (event) => onServerMessage(JSON.parse(event.data));
+  ws.onclose = () => { log('Disconnected from server'); leave(); };
+});
+
+function onServerMessage(msg) {
+  switch (msg.type) {
+    case 'welcome':
+      myId = msg.id;
+      iceServers = msg.iceServers;
+      $('join').hidden = true;
+      $('call').hidden = false;
+      $('me').textContent = `${$('name').value.trim()} in ${$('room').value.trim()}`;
+      log(`Joined as peer ${myId} with ${msg.peers.length} other(s) in the room`);
+      for (const peer of msg.peers) addPeer(peer.id, peer.name);
+      break;
+    case 'peer-joined':
+      log(`${msg.name} joined`);
+      addPeer(msg.id, msg.name);
+      break;
+    case 'peer-left':
+      removePeer(msg.id);
+      break;
+    case 'signal':
+      onSignal(msg.from, msg.data);
+      break;
+    case 'error':
+      log(`Server refused: ${msg.message}`);
+      break;
+  }
+}
+
+// One RTCPeerConnection per remote peer. Both sides run the same code and
+// may offer at any time; collisions are settled by the "perfect negotiation"
+// pattern, with the higher peer id backing off.
+function addPeer(id, name) {
+  const pc = new RTCPeerConnection({ iceServers });
+  const peer = { id, name, pc, polite: myId > id, makingOffer: false, ignoreOffer: false, muted: false };
+  peers.set(id, peer);
+
+  peer.row = document.createElement('li');
+  peer.label = document.createElement('span');
+  peer.label.className = 'who';
+  peer.state = document.createElement('span');
+  peer.state.className = 'state';
+  peer.audio = document.createElement('audio');
+  peer.audio.autoplay = true;
+  const volume = document.createElement('input');
+  volume.type = 'range';
+  volume.min = 0;
+  volume.max = 100;
+  volume.value = 100;
+  volume.title = 'Volume';
+  volume.oninput = () => { peer.audio.volume = volume.value / 100; };
+  peer.row.append(peer.label, peer.state, volume, peer.audio);
+  $('peers').append(peer.row);
+  render(peer);
+
+  for (const track of localStream.getTracks()) pc.addTrack(track, localStream);
+
+  // Same channel id on both sides, so no in-band negotiation is needed.
+  peer.control = pc.createDataChannel('control', { negotiated: true, id: 0 });
+  peer.control.onopen = () => peer.control.send(JSON.stringify({ muted }));
+  peer.control.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (typeof msg.muted === 'boolean') {
+      peer.muted = msg.muted;
+      render(peer);
+    }
+  };
+
+  pc.onnegotiationneeded = async () => {
+    try {
+      peer.makingOffer = true;
+      await pc.setLocalDescription();
+      signal(id, { description: pc.localDescription });
+    } catch (err) {
+      log(`Offer to ${name} failed: ${err.message}`);
+    } finally {
+      peer.makingOffer = false;
+    }
+  };
+  pc.onicecandidate = ({ candidate }) => { if (candidate) signal(id, { candidate }); };
+  pc.ontrack = ({ streams }) => { peer.audio.srcObject = streams[0]; };
+  pc.onconnectionstatechange = () => {
+    render(peer);
+    if (pc.connectionState === 'failed') pc.restartIce();
+  };
+}
+
+async function onSignal(from, { description, candidate }) {
+  const peer = peers.get(from);
+  if (!peer) return;
+  const pc = peer.pc;
+  try {
+    if (description) {
+      const collision = description.type === 'offer'
+        && (peer.makingOffer || pc.signalingState !== 'stable');
+      peer.ignoreOffer = !peer.polite && collision;
+      if (peer.ignoreOffer) return;
+      await pc.setRemoteDescription(description);
+      if (description.type === 'offer') {
+        await pc.setLocalDescription();
+        signal(from, { description: pc.localDescription });
+      }
+    } else if (candidate) {
+      try {
+        await pc.addIceCandidate(candidate);
+      } catch (err) {
+        // Candidates belonging to an offer we ignored are expected to fail.
+        if (!peer.ignoreOffer) throw err;
+      }
+    }
+  } catch (err) {
+    log(`Signaling with ${peer.name} failed: ${err.message}`);
+  }
+}
+
+function render(peer) {
+  peer.label.textContent = peer.name + (peer.muted ? ' (muted)' : '');
+  peer.state.textContent = peer.pc.connectionState;
+}
+
+function removePeer(id) {
+  const peer = peers.get(id);
+  if (!peer) return;
+  log(`${peer.name} left`);
+  peer.pc.close();
+  peer.row.remove();
+  peers.delete(id);
+}
+
+$('mute').addEventListener('click', () => {
+  muted = !muted;
+  for (const track of localStream.getAudioTracks()) track.enabled = !muted;
+  $('mute').textContent = muted ? 'Unmute' : 'Mute';
+  for (const peer of peers.values()) {
+    if (peer.control.readyState === 'open') peer.control.send(JSON.stringify({ muted }));
+  }
+});
+
+$('leave').addEventListener('click', leave);
+
+function leave() {
+  for (const id of [...peers.keys()]) removePeer(id);
+  if (localStream) {
+    for (const track of localStream.getTracks()) track.stop();
+    localStream = null;
+  }
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+    ws = null;
+  }
+  muted = false;
+  $('mute').textContent = 'Mute';
+  $('call').hidden = true;
+  $('join').hidden = false;
+}
+</script>
+</body>
+</html>
