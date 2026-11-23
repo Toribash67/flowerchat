@@ -255,6 +255,13 @@ $('mute').addEventListener('click', () => {
 
 $('leave').addEventListener('click', leave);
 
+// ?name=…&room=… prefills the form and &autojoin joins straight away, which
+// is handy for scripted tests.
+const params = new URLSearchParams(location.search);
+if (params.has('name')) $('name').value = params.get('name');
+if (params.has('room')) $('room').value = params.get('room');
+if (params.has('autojoin')) $('join').requestSubmit();
+
 function leave() {
   for (const id of [...peers.keys()]) removePeer(id);
   if (localStream) {

@@ -8,6 +8,7 @@ find each other.
 
 - `crates/protocol`: the signaling messages shared by server and clients.
 - `crates/server`: the signaling server. It also serves a browser test client.
+- `crates/client`: the native client, a command-line program for now.
 
 ## Running the server
 
@@ -28,6 +29,48 @@ Configuration is through environment variables:
 Browsers only allow microphone access on `localhost` or over HTTPS, so anything
 beyond local testing needs to sit behind a TLS reverse proxy.
 
+The test page accepts `?name=…&room=…` to prefill the form, and `&autojoin` to
+join without clicking.
+
+## Running the native client
+
+The client needs GStreamer 1.28 with the base, good and bad plugin sets, the
+PipeWire plugin and `gst-plugin-rsrtp`.
+
+```sh
+cargo run -p flowerchat-client -- --name martin
+```
+
+This joins the room `lounge` on the local server and talks to whoever is
+there, including browser tabs. `--help` lists the options; the ones that
+matter most:
+
+| Option | Meaning |
+| --- | --- |
+| `--room`, `--server` | Where to join. |
+| `--input`, `--output` | PipeWire/PulseAudio device names, instead of the defaults. |
+| `--jitter-ms` | Receive buffer, 40 ms by default. Lower means less delay but less tolerance for network jitter. |
+| `--raw-mic` | Skip echo cancellation, noise suppression and automatic gain. |
+
+Set `RUST_LOG=flowerchat=debug` to see the SDP being exchanged.
+
+### Measuring latency
+
+Two clients on the same machine can time the audio path between them without
+any audio device:
+
+```sh
+cargo run -p flowerchat-client -- --name a --test-tone --measure
+cargo run -p flowerchat-client -- --name b --test-tone --measure
+```
+
+`--test-tone` replaces the microphone with one click per second, aligned to
+whole seconds of the system's monotonic clock. `--measure` replaces the
+speakers with a detector that reports how old each click is when it would be
+played. The figure covers encoding, the network, the receive buffer, decoding
+and mixing. It does not include the buffers of the microphone and speaker
+devices, or anything the hardware adds.
+
 ## Signaling protocol
 
 Clients connect to `/ws` and exchange JSON messages, each with a `type` field.
@@ -46,8 +89,16 @@ Clients connect to `/ws` and exchange JSON messages, each with a `type` field.
 `{"candidate": …}` (an ICE candidate). The server does not inspect it.
 A room holds at most 8 peers.
 
+Of two peers, the one with the lower id makes the offer. Each connection also
+carries a data channel named `control`, created by both sides with
+`negotiated: true` and id 0, for small JSON messages such as `{"muted": true}`.
+
 ## Tests
 
 ```sh
 cargo test --workspace
 ```
+
+The client's end-to-end test starts a server and two clients and checks that
+they measure a plausible latency. It needs a network interface other than
+loopback.
