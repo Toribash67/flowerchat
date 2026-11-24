@@ -25,7 +25,7 @@ use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::ice::IceConfig;
 use crate::latency::{ClickDetector, write_clicks};
@@ -43,6 +43,11 @@ const MIXER_SLACK_NS: u64 = 10_000_000;
 /// Sinks default to 20 ms, which is far more than this pipeline needs, and
 /// every millisecond of it is added to the playback delay.
 const SINK_DEADLINE_NS: u64 = 5_000_000;
+/// How often loudness is reported, for level meters and speaking indicators.
+const LEVEL_INTERVAL_NS: u64 = 50_000_000;
+const MIC_LEVEL: &str = "mic_level";
+/// Prefix of the level element in a peer's receive branch; the id follows.
+const PEER_LEVEL_PREFIX: &str = "level-peer-";
 
 pub struct CallConfig {
     /// PulseAudio/PipeWire source name, or the default source.
@@ -71,23 +76,77 @@ pub enum CallEvent {
     },
     PeerState {
         id: PeerId,
-        state: String,
+        state: ConnectionState,
     },
     PeerMuted {
         id: PeerId,
         muted: bool,
     },
+    /// Loudness of what a peer is sending, in dB below full scale.
+    PeerLevel {
+        id: PeerId,
+        db: f32,
+    },
+    /// Loudness of what we are sending, in dB below full scale.
+    MicLevel {
+        db: f32,
+    },
+    PeerStats {
+        id: PeerId,
+        stats: PeerStats,
+    },
+    Chat {
+        from: PeerId,
+        text: String,
+    },
     /// A measurement click arrived this many nanoseconds after it was sent.
     ClickDelay(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Connecting,
+    Connected,
+    Disconnected,
+    Failed,
+    Closed,
+}
+
+/// How the media reaches a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Straight between the two machines.
+    Direct,
+    /// Through a TURN relay.
+    Relayed,
+}
+
+/// What a connection reports about itself. A field is `None` until the
+/// connection has produced the data for it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PeerStats {
+    pub route: Option<Route>,
+    /// Network round trip to the peer and back.
+    pub round_trip_ms: Option<f64>,
+    /// Share of the peer's packets that never arrived, since the last report.
+    pub loss_percent: Option<f64>,
+    /// Variation in packet arrival times.
+    pub jitter_ms: Option<f64>,
+    pub receiving_kbps: Option<f64>,
+    pub sending_kbps: Option<f64>,
 }
 
 pub struct Call {
     pipeline: gst::Pipeline,
     mic_tee: gst::Element,
+    mic_gate: gst::Element,
     mixer: gst::Element,
+    out_gate: gst::Element,
     config: CallConfig,
     events: UnboundedSender<CallEvent>,
     peers: Mutex<HashMap<PeerId, Arc<Peer>>>,
+    /// Shared with the control channels, which announce it when they open.
+    muted: Arc<AtomicBool>,
 }
 
 struct Peer {
@@ -101,6 +160,17 @@ struct Peer {
     send: Mutex<Option<SendBranch>>,
     recv: Mutex<Option<RecvBranch>>,
     control: Mutex<Option<gst_webrtc::WebRTCDataChannel>>,
+    /// Playback gain for this peer, 1.0 being unchanged.
+    volume: Mutex<f64>,
+    /// Counters from the previous stats report, for rates.
+    counters: Mutex<Option<Counters>>,
+}
+
+/// Cumulative counters at the time of a stats report.
+#[derive(Clone, Copy)]
+struct Counters {
+    packets_received: f64,
+    packets_lost: f64,
 }
 
 struct SendBranch {
@@ -111,6 +181,7 @@ struct SendBranch {
 struct RecvBranch {
     bin: gst::Bin,
     mixer_pad: gst::Pad,
+    volume: gst::Element,
 }
 
 impl Call {
@@ -154,12 +225,14 @@ impl Call {
         let jitter_ns = u64::from(config.jitter_ms) * 1_000_000;
         let description = format!(
             "{capture} \
+             ! volume name=mic_gate \
+             ! level name={MIC_LEVEL} interval={LEVEL_INTERVAL_NS} post-messages=true \
              ! opusenc audio-type=voice bitrate=64000 frame-size=10 inband-fec=true \
                packet-loss-percentage=5 \
              ! tee name=mic_tee allow-not-linked=true \
              audiomixer name=mixer force-live=true latency={MIXER_SLACK_NS} \
                min-upstream-latency={jitter_ns} \
-             ! {RAW_AUDIO} ! {playback}"
+             ! {RAW_AUDIO} ! volume name=out_gate ! {playback}"
         );
         debug!(%description, "building pipeline");
 
@@ -192,11 +265,14 @@ impl Call {
 
         let call = Self {
             mic_tee: by_name("mic_tee")?,
+            mic_gate: by_name("mic_gate")?,
             mixer: by_name("mixer")?,
+            out_gate: by_name("out_gate")?,
             pipeline,
             config,
             events,
             peers: Mutex::new(HashMap::new()),
+            muted: Arc::new(AtomicBool::new(false)),
         };
         call.pipeline
             .set_state(gst::State::Playing)
@@ -208,9 +284,99 @@ impl Call {
         self.pipeline.bus().expect("pipelines always have a bus")
     }
 
-    /// Newly added live elements change the pipeline's latency; this applies it.
-    pub fn recalculate_latency(&self) {
-        let _ = self.pipeline.recalculate_latency();
+    /// Reacts to a message from the pipeline's bus. Fails when the pipeline
+    /// itself has failed, after which the call cannot continue.
+    pub fn handle_bus_message(&self, message: &gst::Message) -> Result<()> {
+        match message.view() {
+            gst::MessageView::Error(err) => {
+                let source = err.src().map(|s| s.path_string()).unwrap_or_default();
+                bail!(
+                    "audio pipeline failed in {source}: {} ({})",
+                    err.error(),
+                    err.debug().unwrap_or_default()
+                );
+            }
+            // Newly added live elements change the pipeline's latency.
+            gst::MessageView::Latency(_) => {
+                let _ = self.pipeline.recalculate_latency();
+            }
+            gst::MessageView::Element(element) => {
+                let source = message.src().map(|s| s.name()).unwrap_or_default();
+                let level = element
+                    .structure()
+                    .filter(|s| s.name() == "level")
+                    .and_then(level_db);
+                if let Some(db) = level {
+                    if source == MIC_LEVEL {
+                        let _ = self.events.send(CallEvent::MicLevel { db });
+                    } else if let Some(id) = source
+                        .strip_prefix(PEER_LEVEL_PREFIX)
+                        .and_then(|id| id.parse().ok())
+                    {
+                        let _ = self.events.send(CallEvent::PeerLevel { id, db });
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Stops or resumes sending the microphone, and tells the peers.
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::SeqCst);
+        self.mic_gate.set_property("mute", muted);
+        self.broadcast(&json!({ "muted": muted }));
+    }
+
+    /// Silences or restores everything we play.
+    pub fn set_deafened(&self, deafened: bool) {
+        self.out_gate.set_property("mute", deafened);
+    }
+
+    /// Sets how loud one peer is played, 1.0 being unchanged.
+    pub fn set_peer_volume(&self, id: PeerId, volume: f64) {
+        let Some(peer) = self.peers.lock().unwrap().get(&id).cloned() else {
+            return;
+        };
+        *peer.volume.lock().unwrap() = volume;
+        if let Some(recv) = &*peer.recv.lock().unwrap() {
+            recv.volume.set_property("volume", volume);
+        }
+    }
+
+    /// Sends a chat message to everyone we are connected to.
+    pub fn send_chat(&self, text: &str) {
+        self.broadcast(&json!({ "chat": text }));
+    }
+
+    /// Asks every connection for its statistics; they arrive as events.
+    pub fn request_stats(&self) {
+        for peer in self.peers.lock().unwrap().values() {
+            let events = self.events.clone();
+            let weak_peer = Arc::downgrade(peer);
+            let promise = gst::Promise::with_change_func(move |reply| {
+                let (Ok(Some(reply)), Some(peer)) = (reply, weak_peer.upgrade()) else {
+                    return;
+                };
+                trace!(peer = peer.id, "raw stats: {reply:?}");
+                let stats = read_stats(reply, &mut peer.counters.lock().unwrap());
+                let _ = events.send(CallEvent::PeerStats { id: peer.id, stats });
+            });
+            peer.webrtc
+                .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+        }
+    }
+
+    fn broadcast(&self, message: &Value) {
+        let text = message.to_string();
+        for peer in self.peers.lock().unwrap().values() {
+            if let Some(channel) = &*peer.control.lock().unwrap()
+                && channel.ready_state() == gst_webrtc::WebRTCDataChannelState::Open
+            {
+                let _ = channel.send_string_full(Some(&text));
+            }
+        }
     }
 
     /// Starts a connection to `id`. Exactly one side must pass `we_offer`.
@@ -238,6 +404,8 @@ impl Call {
             send: Mutex::new(None),
             recv: Mutex::new(None),
             control: Mutex::new(None),
+            volume: Mutex::new(1.0),
+            counters: Mutex::new(None),
         });
 
         let events = self.events.clone();
@@ -251,9 +419,14 @@ impl Call {
 
         let events = self.events.clone();
         webrtc.connect_notify(Some("connection-state"), move |webrtc, _| {
-            let state =
-                webrtc.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
-            let state = format!("{state:?}").to_lowercase();
+            use gst_webrtc::WebRTCPeerConnectionState as S;
+            let state = match webrtc.property::<S>("connection-state") {
+                S::Connected => ConnectionState::Connected,
+                S::Disconnected => ConnectionState::Disconnected,
+                S::Failed => ConnectionState::Failed,
+                S::Closed => ConnectionState::Closed,
+                _ => ConnectionState::Connecting,
+            };
             let _ = events.send(CallEvent::PeerState { id, state });
         });
 
@@ -478,15 +651,24 @@ impl Call {
             )
             .ok_or_else(|| anyhow!("webrtcbin could not create the control channel"))?;
 
-        channel.connect_on_open(|channel| {
-            let _ = channel.send_string_full(Some(&json!({ "muted": false }).to_string()));
+        let muted = self.muted.clone();
+        channel.connect_on_open(move |channel| {
+            let state = json!({ "muted": muted.load(Ordering::SeqCst) });
+            let _ = channel.send_string_full(Some(&state.to_string()));
         });
         let events = self.events.clone();
         let id = peer.id;
         channel.connect_on_message_string(move |_, message| {
-            let parsed = message.and_then(|text| serde_json::from_str::<Value>(text).ok());
-            if let Some(muted) = parsed.and_then(|msg| msg["muted"].as_bool()) {
+            let Some(msg) = message.and_then(|text| serde_json::from_str::<Value>(text).ok())
+            else {
+                return;
+            };
+            if let Some(muted) = msg["muted"].as_bool() {
                 let _ = events.send(CallEvent::PeerMuted { id, muted });
+            }
+            if let Some(text) = msg["chat"].as_str() {
+                let text = text.to_owned();
+                let _ = events.send(CallEvent::Chat { from: id, text });
             }
         });
         *peer.control.lock().unwrap() = Some(channel);
@@ -503,13 +685,22 @@ fn attach_recv_branch(
 ) -> Result<()> {
     // Lost packets are concealed (plc) but not recovered from Opus in-band
     // FEC: with use-inband-fec, opusdec reports 120 ms of extra latency.
+    // The level is taken before the volume control, so the speaking indicator
+    // shows what the peer sends, not how loud we chose to play it.
     let bin = gst::parse::bin_from_description(
         &format!(
             "rtpopusdepay ! opusdec plc=true \
-             ! audioconvert ! audioresample ! capsfilter caps={RAW_AUDIO}"
+             ! audioconvert ! audioresample ! capsfilter caps={RAW_AUDIO} \
+             ! level name={PEER_LEVEL_PREFIX}{} interval={LEVEL_INTERVAL_NS} post-messages=true \
+             ! volume name=volume",
+            peer.id
         ),
         true,
     )?;
+    let volume = bin
+        .by_name("volume")
+        .ok_or_else(|| anyhow!("receive branch has no volume control"))?;
+    volume.set_property("volume", *peer.volume.lock().unwrap());
     pipeline.add(&bin)?;
     let mixer_pad = mixer
         .request_pad_simple("sink_%u")
@@ -523,8 +714,97 @@ fn attach_recv_branch(
             .ok_or_else(|| anyhow!("receive branch has no sink pad"))?,
     )?;
     debug!(peer = peer.id, name = %peer.name, "receiving audio");
-    *peer.recv.lock().unwrap() = Some(RecvBranch { bin, mixer_pad });
+    *peer.recv.lock().unwrap() = Some(RecvBranch {
+        bin,
+        mixer_pad,
+        volume,
+    });
     Ok(())
+}
+
+/// The loudness in a message from a `level` element, in dB below full scale.
+fn level_db(level: &gst::StructureRef) -> Option<f32> {
+    let rms = level.get::<&gst::glib::ValueArray>("rms").ok()?;
+    let db = rms.first()?.get::<f64>().ok()?;
+    Some(db as f32)
+}
+
+/// Turns webrtcbin's statistics into the figures we show. `previous` holds
+/// the counters from the last report and is updated for the next one.
+///
+/// The report is a structure with one nested structure per statistics
+/// object, named after its kind (`inbound-rtp`, `candidate-pair`, ...).
+fn read_stats(stats: &gst::StructureRef, previous: &mut Option<Counters>) -> PeerStats {
+    let mut out = PeerStats::default();
+    let entry = |id: &str| stats.get::<gst::Structure>(id).ok();
+    let text = |s: &gst::StructureRef, field: &str| s.get::<String>(field).ok();
+
+    for (_, value) in stats.iter() {
+        let Ok(object) = value.get::<gst::Structure>() else {
+            continue;
+        };
+        let is_audio = text(&object, "kind").as_deref() == Some("audio");
+        match object.name().as_str() {
+            "inbound-rtp" if is_audio => {
+                out.jitter_ms = number(&object, "jitter").map(|seconds| seconds * 1000.0);
+                out.receiving_kbps = source_kbps(&object);
+                let now = Counters {
+                    packets_received: number(&object, "packets-received").unwrap_or(0.0),
+                    packets_lost: number(&object, "packets-lost").unwrap_or(0.0),
+                };
+                if let Some(before) = previous.replace(now) {
+                    let lost = (now.packets_lost - before.packets_lost).max(0.0);
+                    let expected = now.packets_received - before.packets_received + lost;
+                    if expected > 0.0 {
+                        out.loss_percent = Some(100.0 * lost / expected);
+                    }
+                }
+            }
+            "outbound-rtp" if is_audio => out.sending_kbps = source_kbps(&object),
+            "remote-inbound-rtp" if is_audio => {
+                out.round_trip_ms =
+                    number(&object, "round-trip-time").map(|seconds| seconds * 1000.0);
+            }
+            "transport" => {
+                let candidate_type = |pair: &gst::Structure, end: &str| {
+                    let candidate = entry(&text(pair, end)?)?;
+                    text(&candidate, "candidate-type")
+                };
+                let pair = text(&object, "selected-candidate-pair-id").and_then(|id| entry(&id));
+                if let Some(pair) = pair {
+                    let local = candidate_type(&pair, "local-candidate-id");
+                    let remote = candidate_type(&pair, "remote-candidate-id");
+                    if local.is_some() || remote.is_some() {
+                        let relayed = [local, remote].iter().flatten().any(|t| t == "relay");
+                        out.route = Some(if relayed {
+                            Route::Relayed
+                        } else {
+                            Route::Direct
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A numeric field, whichever integer or float type GStreamer gave it.
+fn number(s: &gst::StructureRef, field: &str) -> Option<f64> {
+    let value = s.value(field).ok()?;
+    None.or_else(|| value.get::<f64>().ok())
+        .or_else(|| value.get::<u64>().ok().map(|v| v as f64))
+        .or_else(|| value.get::<i64>().ok().map(|v| v as f64))
+        .or_else(|| value.get::<u32>().ok().map(f64::from))
+        .or_else(|| value.get::<i32>().ok().map(f64::from))
+}
+
+/// The bitrate of an RTP stream including packet headers, as measured by the
+/// RTP session itself.
+fn source_kbps(rtp: &gst::StructureRef) -> Option<f64> {
+    let source = rtp.get::<gst::Structure>("gst-rtpsource-stats").ok()?;
+    number(&source, "bitrate").map(|bits_per_second| bits_per_second / 1000.0)
 }
 
 /// Stops and removes everything that belonged to one peer. The send branch

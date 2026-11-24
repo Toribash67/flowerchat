@@ -8,7 +8,9 @@ find each other.
 
 - `crates/protocol`: the signaling messages shared by server and clients.
 - `crates/server`: the signaling server. It also serves a browser test client.
-- `crates/client`: the native client, a command-line program for now.
+- `crates/client`: the client engine (signaling, calls, audio) and a
+  command-line client built on it.
+- `crates/app`: the desktop app, a window on top of the same engine.
 
 ## Running the server
 
@@ -32,18 +34,39 @@ beyond local testing needs to sit behind a TLS reverse proxy.
 The test page accepts `?name=…&room=…` to prefill the form, and `&autojoin` to
 join without clicking.
 
-## Running the native client
+## Running the app
 
-The client needs GStreamer 1.28 with the base, good and bad plugin sets, the
-PipeWire plugin and `gst-plugin-rsrtp`.
+The app and the command-line client need GStreamer 1.28 with the base, good
+and bad plugin sets, the PipeWire plugin and `gst-plugin-rsrtp`.
+
+```sh
+cargo run -p flowerchat-app
+```
+
+Enter a name, a room and the server's address, and join. The window shows
+who is in the room with each connection's route, delay, loss, jitter and
+bitrate, a volume slider per person, and a chat whose timeline also records
+what happens in the room. Below 900 px wide the columns collapse into one.
+The name, room and server are remembered between runs.
+
+`--name`, `--room` and `--server` prefill the form and `--autojoin` skips it.
+`--input`, `--output`, `--jitter-ms` and `--raw-mic` work as in the
+command-line client below; there is no settings screen yet.
+
+The interface is drawn from a plain data model, so `crates/app/tests`
+renders every screen from fixed data and compares the result with the images
+in `crates/app/tests/snapshots`. After an intended visual change, accept the
+new images with `UPDATE_SNAPSHOTS=1 cargo test -p flowerchat-app`.
+
+## Running the command-line client
 
 ```sh
 cargo run -p flowerchat-client -- --name martin
 ```
 
 This joins the room `lounge` on the local server and talks to whoever is
-there, including browser tabs. `--help` lists the options; the ones that
-matter most:
+there, including browser tabs and the app. `--help` lists the options; the
+ones that matter most:
 
 | Option | Meaning |
 | --- | --- |
@@ -51,8 +74,10 @@ matter most:
 | `--input`, `--output` | PipeWire/PulseAudio device names, instead of the defaults. |
 | `--jitter-ms` | Receive buffer, 40 ms by default. Lower means less delay but less tolerance for network jitter. |
 | `--raw-mic` | Skip echo cancellation, noise suppression and automatic gain. |
+| `--stats` | Print each connection's statistics and levels once a second. |
+| `--say` | Send a chat message to each peer once connected. |
 
-Set `RUST_LOG=flowerchat=debug` to see the SDP being exchanged.
+Set `RUST_LOG=flowerchat_client=debug` to see the SDP being exchanged.
 
 ### Measuring latency
 
@@ -91,7 +116,8 @@ A room holds at most 8 peers.
 
 Of two peers, the one with the lower id makes the offer. Each connection also
 carries a data channel named `control`, created by both sides with
-`negotiated: true` and id 0, for small JSON messages such as `{"muted": true}`.
+`negotiated: true` and id 0, for small JSON messages: `{"muted": true}` for
+status and `{"chat": "…"}` for a chat message.
 
 ## Tests
 

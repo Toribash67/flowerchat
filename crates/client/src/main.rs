@@ -1,25 +1,22 @@
-mod call;
-mod ice;
-mod latency;
-mod signaling;
+//! Command-line client: joins a room and talks, with no window. Also hosts
+//! the test modes used for measuring latency.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use flowerchat_protocol::{ClientMsg, PeerId, ServerMsg};
-use futures_util::StreamExt;
-use gst::prelude::*;
-use gstreamer as gst;
-use tokio::sync::mpsc;
+use flowerchat_client::latency::Summary;
+use flowerchat_client::session::{self, Command, Event, SessionConfig};
+use flowerchat_protocol::PeerId;
+use tokio::sync::mpsc::unbounded_channel;
 
-use crate::call::{Call, CallConfig, CallEvent};
-use crate::ice::IceConfig;
-use crate::latency::Summary;
+/// Stands in for "never" when no --duration is given.
+const FOREVER: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
-/// Voice chat client for flowerchat.
+/// Voice chat client for flowerchat, without a window.
 #[derive(Parser)]
-#[command(name = "flowerchat", version)]
+#[command(name = "flowerchat-cli", version)]
 struct Args {
     /// Name shown to the others in the room.
     #[arg(long)]
@@ -51,6 +48,12 @@ struct Args {
     /// sender on this machine took to arrive.
     #[arg(long)]
     measure: bool,
+    /// Print each connection's statistics once a second.
+    #[arg(long)]
+    stats: bool,
+    /// Send this chat message to each peer once connected to it.
+    #[arg(long)]
+    say: Option<String>,
     /// Leave after this many seconds.
     #[arg(long)]
     duration: Option<u64>,
@@ -65,99 +68,89 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    gst::init()?;
+    gstreamer::init()?;
 
-    let (welcome, mut to_server, mut from_server) =
-        signaling::join(&args.server, &args.room, &args.name).await?;
-    let my_id = welcome.id;
-    println!("joined {} as {} (peer {my_id})", args.room, args.name);
-
-    let (events_tx, mut events) = mpsc::unbounded_channel();
-    let call = Call::new(
-        CallConfig {
+    let (commands, command_rx) = unbounded_channel();
+    let (event_tx, mut events) = unbounded_channel();
+    let session = tokio::spawn(session::run(
+        SessionConfig {
+            server: args.server,
+            room: args.room.clone(),
+            name: args.name.clone(),
             input: args.input,
             output: args.output,
             jitter_ms: args.jitter_ms,
             raw_mic: args.raw_mic,
             test_tone: args.test_tone,
             measure: args.measure,
-            ice: IceConfig::from_servers(&welcome.ice_servers),
         },
-        events_tx,
-    )?;
-    let mut bus = call.bus().stream();
+        command_rx,
+        event_tx,
+    ));
 
-    // The side with the lower id makes the offer. Ids only grow, so that is
-    // always whoever was in the room first.
-    let add_peer = |id: PeerId, name: &str| {
-        println!("{name} (peer {id}) is in the room");
-        if let Err(err) = call.add_peer(id, name, my_id < id) {
-            eprintln!("cannot connect to {name}: {err:#}");
-        }
-    };
-    for peer in &welcome.peers {
-        add_peer(peer.id, &peer.name);
-    }
-
-    let deadline = async {
-        match args.duration {
-            Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
-            None => std::future::pending().await,
-        }
-    };
+    let deadline = tokio::time::sleep(args.duration.map_or(FOREVER, Duration::from_secs));
     tokio::pin!(deadline);
 
+    let mut names: HashMap<PeerId, String> = HashMap::new();
+    let mut levels: HashMap<PeerId, f32> = HashMap::new();
+    let mut mic_level = f32::NEG_INFINITY;
     let mut summary = Summary::default();
-    let outcome = loop {
+    let mut leaving = false;
+    loop {
         tokio::select! {
-            msg = from_server.next() => match msg {
-                Ok(Some(ServerMsg::PeerJoined { id, name })) => add_peer(id, &name),
-                Ok(Some(ServerMsg::PeerLeft { id })) => {
-                    println!("peer {id} left");
-                    call.remove_peer(id);
-                }
-                Ok(Some(ServerMsg::Signal { from, data })) => {
-                    if let Err(err) = call.on_signal(from, &data) {
-                        eprintln!("bad signaling from peer {from}: {err:#}");
+            event = events.recv() => {
+                // The channel closes when the session ends, for any reason.
+                let Some(event) = event else { break };
+                match event {
+                    Event::Joined { id } => {
+                        println!("joined {} as {} (peer {id})", args.room, args.name);
                     }
-                }
-                Ok(Some(ServerMsg::Error { message })) => break Err(anyhow::anyhow!("server: {message}")),
-                Ok(Some(ServerMsg::Welcome { .. })) => {}
-                Ok(None) => break Err(anyhow::anyhow!("the signaling server disconnected")),
-                Err(err) => break Err(err),
-            },
-            Some(event) = events.recv() => match event {
-                CallEvent::Signal { to, data } => {
-                    if let Err(err) = to_server.send(&ClientMsg::Signal { to, data }).await {
-                        break Err(err);
+                    Event::PeerJoined { id, name } => {
+                        println!("{name} (peer {id}) is in the room");
+                        names.insert(id, name);
                     }
+                    Event::PeerLeft { id } => println!("peer {id} left"),
+                    Event::PeerState { id, state } => {
+                        println!("peer {id}: {}", format!("{state:?}").to_lowercase());
+                    }
+                    Event::PeerMuted { id, muted } => {
+                        println!("peer {id} {}", if muted { "muted" } else { "unmuted" });
+                        // The peer's first status message shows that its
+                        // control channel is open, so chat can reach it.
+                        if let Some(text) = &args.say {
+                            let _ = commands.send(Command::SendChat(text.clone()));
+                        }
+                    }
+                    Event::Chat { from, text } => {
+                        let name = names.get(&from).map(String::as_str).unwrap_or("?");
+                        println!("<{name}> {text}");
+                    }
+                    Event::PeerStats { id, stats } if args.stats => {
+                        let level = levels.get(&id).copied().unwrap_or(f32::NEG_INFINITY);
+                        println!("peer {id} level {level:.0} dB, mic {mic_level:.0} dB, {stats:?}");
+                    }
+                    Event::PeerLevel { id, db } => {
+                        levels.insert(id, db);
+                    }
+                    Event::MicLevel { db } => mic_level = db,
+                    Event::ClickDelay(delay_ns) => {
+                        summary.add(delay_ns);
+                        println!("click delay {:.1} ms", delay_ns as f64 / 1e6);
+                    }
+                    Event::PeerStats { .. } => {}
                 }
-                CallEvent::PeerState { id, state } => println!("peer {id}: {state}"),
-                CallEvent::PeerMuted { id, muted } => {
-                    println!("peer {id} {}", if muted { "muted" } else { "unmuted" });
-                }
-                CallEvent::ClickDelay(delay_ns) => {
-                    summary.add(delay_ns);
-                    println!("click delay {:.1} ms", delay_ns as f64 / 1e6);
-                }
-            },
-            Some(message) = bus.next() => match message.view() {
-                gst::MessageView::Error(err) => {
-                    let source = err.src().map(|s| s.path_string()).unwrap_or_default();
-                    break Err(anyhow::anyhow!(
-                        "audio pipeline failed in {source}: {} ({})",
-                        err.error(),
-                        err.debug().unwrap_or_default()
-                    ));
-                }
-                gst::MessageView::Latency(_) => call.recalculate_latency(),
-                _ => {}
-            },
-            _ = tokio::signal::ctrl_c() => break Ok(()),
-            _ = &mut deadline => break Ok(()),
+            }
+            _ = tokio::signal::ctrl_c(), if !leaving => {
+                leaving = true;
+                let _ = commands.send(Command::Leave);
+            }
+            _ = &mut deadline, if !leaving => {
+                leaving = true;
+                let _ = commands.send(Command::Leave);
+            }
         }
-    };
-    call.shutdown();
+    }
+    let outcome = session.await?;
 
     if let Some((min, median, max, count)) = summary.stats() {
         println!(

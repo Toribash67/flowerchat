@@ -23,5 +23,5 @@ axum = "0.8.9"
 flowerchat-server = { path = "../server" }
 
 [[bin]]
-name = "flowerchat"
+name = "flowerchat-cli"
 path = "src/main.rs"

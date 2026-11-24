@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use flowerchat_server::{Config, app};
 
-const CLIENT: &str = env!("CARGO_BIN_EXE_flowerchat");
+const CLIENT: &str = env!("CARGO_BIN_EXE_flowerchat-cli");
 
 fn client(url: &str, name: &str, seconds: u32) -> Command {
     let mut command = Command::new(CLIENT);

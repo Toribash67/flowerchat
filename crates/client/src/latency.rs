@@ -57,6 +57,12 @@ pub struct ClickDetector {
     candidate: Option<(u64, u64)>,
 }
 
+impl Default for ClickDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClickDetector {
     pub fn new() -> Self {
         // Start disarmed so that joining in the middle of a click does not
