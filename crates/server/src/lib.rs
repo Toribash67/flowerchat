@@ -46,6 +46,7 @@ pub fn app(config: Config) -> Router {
     }));
     Router::new()
         .route("/", get(index))
+        .route("/healthz", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }

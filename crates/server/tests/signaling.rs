@@ -186,3 +186,26 @@ async fn a_connection_must_join_before_signaling() {
         .await;
     assert!(matches!(client.recv().await, ServerMsg::Error { .. }));
 }
+
+#[tokio::test]
+async fn the_server_says_when_it_is_up() {
+    use std::io::{Read, Write};
+
+    let url = start_server().await;
+    let address = url
+        .trim_start_matches("ws://")
+        .trim_end_matches("/ws")
+        .to_owned();
+    // What a container's health check does: a plain HTTP request.
+    let reply = tokio::task::spawn_blocking(move || {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.write_all(b"GET /healthz HTTP/1.0\r\n\r\n").unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        reply
+    })
+    .await
+    .unwrap();
+    assert!(reply.starts_with("HTTP/1.0 200"), "{reply}");
+    assert!(reply.ends_with("ok"), "{reply}");
+}

@@ -1,0 +1,6 @@
+target/
+.git/
+.github/
+deploy/
+README.md
+crates/app/tests/snapshots/

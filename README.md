@@ -236,6 +236,15 @@ of them until a peer asks to watch, and then only on the stream of the codec
 the sharer has picked. A browser
 that offers only audio gets only audio.
 
+## Deployment
+
+The signaling server runs as a container; `deploy/dockge` has the stack and
+what the reverse proxy needs. Pushes to `main` publish the image, and
+Watchtower on the host picks it up.
+
+The app and the command-line client reach a server behind TLS with a
+`wss://` address, such as `wss://chat.example.org/ws`.
+
 ## Tests
 
 ```sh
