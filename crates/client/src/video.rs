@@ -12,7 +12,8 @@
 //! call's pipeline would delay the voice as well.
 //!
 //! The part in braces is replaced when the sharer picks another [`Codec`],
-//! and the decoder with it at the other end.
+//! and the decoder with it at the other end. A viewer whose graphics card
+//! cannot decode AV1 decodes it on the processor ([`WatchStats::software`]).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,16 +51,20 @@ pub enum Codec {
     H264,
     /// The same picture in fewer bits, or a better one in as many.
     Hevc,
+    /// Fewer bits still. Only newer graphics cards encode it, and a viewer
+    /// whose card cannot decode it does so on the processor.
+    Av1,
 }
 
 impl Codec {
-    pub const ALL: [Codec; 2] = [Codec::H264, Codec::Hevc];
+    pub const ALL: [Codec; 3] = [Codec::H264, Codec::Hevc, Codec::Av1];
 
     /// The name people know it by.
     pub fn label(self) -> &'static str {
         match self {
             Codec::H264 => "H.264",
             Codec::Hevc => "HEVC",
+            Codec::Av1 => "AV1",
         }
     }
 
@@ -69,6 +74,7 @@ impl Codec {
         match self {
             Codec::H264 => "h264",
             Codec::Hevc => "hevc",
+            Codec::Av1 => "av1",
         }
     }
 
@@ -86,6 +92,7 @@ impl Codec {
         match self {
             Codec::H264 => "H264",
             Codec::Hevc => "H265",
+            Codec::Av1 => "AV1",
         }
     }
 
@@ -95,12 +102,13 @@ impl Codec {
             .find(|codec| codec.rtp_name().eq_ignore_ascii_case(name))
     }
 
-    /// The encoded video as it travels between the pipelines: whole frames
-    /// with start codes.
+    /// The encoded video as it travels between the pipelines: whole frames,
+    /// with start codes where the codec has them.
     pub(crate) fn caps(self) -> &'static str {
         match self {
             Codec::H264 => "video/x-h264,stream-format=byte-stream,alignment=au",
             Codec::Hevc => "video/x-h265,stream-format=byte-stream,alignment=au",
+            Codec::Av1 => "video/x-av1,parsed=true,stream-format=obu-stream,alignment=tu",
         }
     }
 
@@ -116,6 +124,7 @@ impl Codec {
         match self {
             Codec::H264 => "nvh264enc",
             Codec::Hevc => "nvh265enc",
+            Codec::Av1 => "nvav1enc",
         }
     }
 
@@ -126,6 +135,7 @@ impl Codec {
         match self {
             Codec::H264 => "nvd3d11h264enc",
             Codec::Hevc => "nvd3d11h265enc",
+            Codec::Av1 => "nvd3d11av1enc",
         }
     }
 
@@ -144,26 +154,46 @@ impl Codec {
     /// each then holds the lock the other waits for. With the copy made
     /// here, on the capturing thread, no other thread ever holds one.
     fn encoder_description(self) -> String {
-        let (profile, parser) = match self {
-            Codec::H264 => ("video/x-h264,profile=high", "h264parse"),
-            Codec::Hevc => ("video/x-h265,profile=main", "h265parse"),
+        // `headers` makes every keyframe carry what a decoder needs to
+        // start from it. The AV1 encoder has no setting for that.
+        let (headers, profile, parser) = match self {
+            Codec::H264 => (
+                "repeat-sequence-header=true",
+                "video/x-h264,profile=high",
+                "h264parse config-interval=-1",
+            ),
+            Codec::Hevc => (
+                "repeat-sequence-header=true",
+                "video/x-h265,profile=main",
+                "h265parse config-interval=-1",
+            ),
+            Codec::Av1 => ("", "video/x-av1,profile=main", "av1parse"),
         };
         format!(
             "{ENCODER_INPUT}{} name=encoder preset=p4 tune=ultra-low-latency rc-mode=cbr \
-               zerolatency=true bframes=0 gop-size=-1 repeat-sequence-header=true \
+               zerolatency=true bframes=0 gop-size=-1 {headers} \
                min-force-key-unit-interval={KEYFRAME_SPACING_NS} \
-             ! {profile} ! {parser} config-interval=-1 ! capsfilter caps={}",
+             ! {profile} ! {parser} ! capsfilter caps={}",
             self.encoder(),
             self.caps()
         )
     }
 
-    /// The elements that turn the encoded stream into frames. The last is
-    /// named `decoder`.
-    fn decoder_description(self) -> &'static str {
+    /// The elements that turn the encoded stream into frames, and whether
+    /// they do it on the processor instead of the graphics card. The last
+    /// is named `decoder`.
+    ///
+    /// The graphics card only offers the decoders it has, so a card too old
+    /// for AV1 has no `nvav1dec`.
+    fn decoder_description(self) -> (&'static str, bool) {
         match self {
-            Codec::H264 => "h264parse ! nvh264dec name=decoder",
-            Codec::Hevc => "h265parse ! nvh265dec name=decoder",
+            Codec::H264 => ("h264parse ! nvh264dec name=decoder", false),
+            Codec::Hevc => ("h265parse ! nvh265dec name=decoder", false),
+            Codec::Av1 if gst::ElementFactory::find("nvav1dec").is_some() => {
+                ("av1parse ! nvav1dec name=decoder", false)
+            }
+            // One frame at a time, or it holds on to several for speed.
+            Codec::Av1 => ("av1parse ! dav1ddec name=decoder max-frame-delay=1", true),
         }
     }
 
@@ -172,6 +202,7 @@ impl Codec {
         match self {
             Codec::H264 => 4096,
             Codec::Hevc => 8192,
+            Codec::Av1 => 8192,
         }
     }
 
@@ -180,6 +211,7 @@ impl Codec {
         match self {
             Codec::H264 => 1.0,
             Codec::Hevc => 0.75,
+            Codec::Av1 => 0.65,
         }
     }
 }
@@ -939,12 +971,17 @@ pub struct WatchStats {
     pub dropped_percent: f64,
     /// Time from a frame's arrival to it being ready to show.
     pub decode_ms: f64,
+    /// Whether the processor decodes the stream, because the graphics card
+    /// cannot decode its codec.
+    pub software: bool,
 }
 
 /// Decodes one sharer's stream into frames.
 pub(crate) struct Decoder {
     from: PeerId,
     codec: Codec,
+    /// Whether the processor does the decoding.
+    software: bool,
     frames: FrameSink,
     pipeline: gst::Pipeline,
     input: gst_app::AppSrc,
@@ -1066,14 +1103,21 @@ impl Decoder {
         // Encoded frames cannot be skipped, because the ones after them
         // build on them. Decoded ones can, so when preparing frames for
         // display falls behind, frames are dropped ahead of that step.
+        let (decoder, software) = codec.decoder_description();
+        if software {
+            warn!(
+                peer = from,
+                "the graphics card cannot decode {}; the processor does it",
+                codec.label()
+            );
+        }
         let description = format!(
             "appsrc name=in is-live=true format=time caps={} \
-             ! {} \
+             ! {decoder} \
              ! queue leaky=downstream max-size-buffers=2 max-size-time=0 max-size-bytes=0 \
              ! {prepare} \
              ! appsink name=out sync=false max-buffers=2 drop=true",
-            codec.caps(),
-            codec.decoder_description()
+            codec.caps()
         );
         let pipeline = gst::parse::launch(&description)
             .with_context(|| format!("cannot decode {} on this machine", codec.label()))?
@@ -1172,6 +1216,7 @@ impl Decoder {
         Ok(Self {
             from,
             codec,
+            software,
             frames,
             pipeline,
             input,
@@ -1246,6 +1291,7 @@ impl Decoder {
             } else {
                 latency_ns as f64 / shown as f64 / 1e6
             },
+            software: self.software,
         }
     }
 }
@@ -1319,6 +1365,7 @@ mod tests {
         assert_eq!(bitrate_kbps(3840, 2160, 60, Codec::H264), 34800);
         assert_eq!(bitrate_kbps(1920, 1080, 30, Codec::H264), 6200);
         assert_eq!(bitrate_kbps(1920, 1080, 60, Codec::Hevc), 6500);
+        assert_eq!(bitrate_kbps(1920, 1080, 60, Codec::Av1), 5700);
     }
 
     #[test]
@@ -1330,7 +1377,57 @@ mod tests {
             let caps = codec.caps().parse::<gst::Caps>().unwrap();
             assert_eq!(Codec::of_caps(&caps), Some(codec));
         }
-        assert_eq!(Codec::from_id("av1"), None);
+        assert_eq!(Codec::from_id("vp12"), None);
+    }
+
+    /// An AV1 stream is decoded whatever the graphics card: by it if it
+    /// can, and by the processor if not. The stream is made by an encoder
+    /// that runs on the processor, where there is one.
+    #[test]
+    fn av1_is_decoded_with_or_without_the_graphics_card() {
+        gst::init().unwrap();
+        if gst::ElementFactory::find("svtav1enc").is_none() {
+            eprintln!("skipped: no svtav1enc to make a stream with");
+            return;
+        }
+        let hardware = gst::ElementFactory::find("nvav1dec").is_some();
+        assert_eq!(Codec::Av1.decoder_description().1, !hardware);
+
+        let shown = Arc::new(AtomicU64::new(0));
+        let counted = shown.clone();
+        let frames: FrameSink = Arc::new(move |_, frame| {
+            assert_eq!((frame.width, frame.height), (320, 180));
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+        let decoder = Decoder::start(7, frames, 0, Codec::Av1).unwrap();
+        let source = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=30 ! video/x-raw,width=320,height=180,framerate=30/1 \
+             ! svtav1enc preset=12 target-bitrate=500 ! av1parse ! {} \
+             ! appsink name=out sync=false",
+            Codec::Av1.caps()
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let out = source
+            .by_name("out")
+            .unwrap()
+            .downcast::<gst_app::AppSink>()
+            .unwrap();
+        source.set_state(gst::State::Playing).unwrap();
+        while let Ok(sample) = out.pull_sample() {
+            decoder.push(sample.buffer_owned().unwrap());
+        }
+        source.set_state(gst::State::Null).unwrap();
+
+        let started = Instant::now();
+        while shown.load(Ordering::Relaxed) == 0 && started.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(shown.load(Ordering::Relaxed) > 0, "no frame was decoded");
+        let stats = decoder.take_stats();
+        assert_eq!((stats.width, stats.height), (320, 180));
+        assert_eq!(stats.software, !hardware);
     }
 
     #[test]

@@ -185,14 +185,14 @@ async fn a_share_survives_being_pushed() {
             0 => {
                 settings.codec = match settings.codec {
                     Codec::H264 => Codec::Hevc,
-                    Codec::Hevc => Codec::H264,
+                    Codec::Hevc | Codec::Av1 => Codec::H264,
                 }
             }
             1 => settings.kbps = rates[next(rates.len() as u64) as usize],
             _ => {
                 settings.codec = match settings.codec {
                     Codec::H264 => Codec::Hevc,
-                    Codec::Hevc => Codec::H264,
+                    Codec::Hevc | Codec::Av1 => Codec::H264,
                 };
                 settings.kbps = rates[next(rates.len() as u64) as usize];
             }

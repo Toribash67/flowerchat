@@ -711,7 +711,7 @@ fn room_stream(
                             &[
                                 ("Resolution", &figures.resolution),
                                 ("Frame rate", &figures.frame_rate),
-                                ("Codec", figures.codec),
+                                ("Codec", &figures.codec),
                                 ("Bitrate", &figures.bitrate),
                             ],
                         );
@@ -2098,7 +2098,8 @@ fn bitrate(kbps: Option<f64>) -> String {
 struct StreamFigures {
     resolution: String,
     frame_rate: String,
-    codec: &'static str,
+    /// The codec, and a note if the processor has to decode it.
+    codec: String,
     bitrate: String,
     delay: String,
     frames_dropped: String,
@@ -2130,9 +2131,13 @@ impl StreamFigures {
             } else {
                 "–".into()
             },
-            codec: peer
-                .and_then(|peer| peer.sharing.as_ref())
-                .map_or("–", |sharing| sharing.codec.label()),
+            codec: match peer.and_then(|peer| peer.sharing.as_ref()) {
+                Some(sharing) if stats.software => {
+                    format!("{} (software)", sharing.codec.label())
+                }
+                Some(sharing) => sharing.codec.label().into(),
+                None => "–".into(),
+            },
             bitrate: bitrate(peer.and_then(|peer| peer.stats.video_receiving_kbps)),
             delay: millis(delay),
             frames_dropped: percent(started.then_some(stats.dropped_percent)),

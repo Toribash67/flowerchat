@@ -102,6 +102,16 @@ Found on the way:
 - One snapshot differs from the Linux image in four pixels of one line of
   text, so the snapshot tests allow 16 differing pixels on Windows.
 - `gst-plugin-rsrtp` is not needed: nothing was installed for it.
+- AV1 was added later, for a friend's RTX 5070 Ti (`Codec::Av1`). It is
+  offered to whoever has `nvd3d11av1enc` (`nvav1enc` on Linux), which the
+  2070 SUPER does not, so nothing here has encoded with it: the settings
+  are those of the HEVC encoder, which GStreamer's documentation lists for
+  it too, less `repeat-sequence-header`. A viewer decodes with `nvav1dec`
+  if the card has it and with `dav1ddec` on the processor if not, and the
+  stream's figures then say "AV1 (software)". The second was tried here
+  with a stream from `svtav1enc`, as was the way through `rtpav1pay` and
+  `rtpav1depay`; the first has not run anywhere. A client from before
+  this does not see a share in AV1 at all.
 
 Still to do:
 
@@ -134,9 +144,8 @@ else can join.
 - Rust on GStreamer, using `webrtcbin` directly. `webrtcsink` encodes once
   per viewer; here one encode fans out to everyone who watches.
 - Everyone has an NVIDIA card, so video is NVENC and NVDEC only: H.264 and
-  HEVC. AV1 is left out because the 2070 SUPER cannot encode it; `Codec` in
-  `crates/client/src/video.rs` is a table, so adding it is one more entry
-  plus one more video line in the SDP.
+  HEVC. AV1 was left out at first because the 2070 SUPER cannot encode
+  it; see "Found on the way" for how it came in.
 - The window is egui 0.36 through eframe (pinned by `egui-phosphor` 0.14).
   Martin wants desktop density, live figures shown rather than hidden, and
   to be shown a proposal before a change of look or layout is built.
@@ -237,7 +246,7 @@ $env:PKG_CONFIG_PATH = "$gst\lib\pkgconfig"
 
 - `cargo build --release`. Release builds of the app have no console
   window, so they print nothing; debug builds keep it.
-- `bundle.ps1` gathers the programs, the 25 GStreamer plugins the
+- `bundle.ps1` gathers the programs, the 27 GStreamer plugins the
   pipelines use, and the libraries those ask for, read from their import
   tables: 56 MB in `target\bundle`, of GStreamer's 1.1 GB. A pipeline that
   gains an element from another plugin needs that plugin added to the list

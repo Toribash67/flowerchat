@@ -25,8 +25,9 @@ $ErrorActionPreference = 'Stop'
 # which plugin that is.
 $plugins = @(
     'app', 'audioconvert', 'audiomixer', 'audioresample', 'audiotestsrc',
-    'coreelements', 'd3d11', 'debug', 'dtls', 'level', 'nice', 'nvcodec',
-    'opus', 'rtp', 'rtpmanager', 'sctp', 'srtp', 'videoconvertscale',
+    'coreelements', 'd3d11', 'dav1d', 'debug', 'dtls', 'level', 'nice',
+    'nvcodec', 'opus', 'rsrtp', 'rtp', 'rtpmanager', 'sctp', 'srtp',
+    'videoconvertscale',
     'videoparsersbad', 'videorate', 'videotestsrc', 'volume', 'wasapi2',
     'webrtc', 'webrtcdsp'
 )
