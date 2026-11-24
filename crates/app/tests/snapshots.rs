@@ -160,6 +160,7 @@ fn room_watching() -> RoomModel {
             fps: 59.8,
             dropped_percent: 0.1,
             decode_ms: 3.2,
+            software: false,
         },
     });
     room.timeline.push(Entry {

@@ -70,6 +70,7 @@ const fn video_payload_type(codec: Codec) -> i32 {
     match codec {
         Codec::H264 => 96,
         Codec::Hevc => 98,
+        Codec::Av1 => 100,
     }
 }
 /// Least time between two keyframes asked for because frames arrive in a
@@ -1388,9 +1389,14 @@ impl Call {
             .lock()
             .unwrap()
             .push((codec, payload_type));
+        // The first two are told to send what a decoder needs to start
+        // with every keyframe, and each frame as soon as it is there. The
+        // AV1 one does both without being told.
+        const TIMELY: &str = "config-interval=-1 aggregate-mode=zero-latency";
         let payloader = match codec {
-            Codec::H264 => "rtph264pay",
-            Codec::Hevc => "rtph265pay",
+            Codec::H264 => format!("rtph264pay {TIMELY}"),
+            Codec::Hevc => format!("rtph265pay {TIMELY}"),
+            Codec::Av1 => "rtpav1pay".to_owned(),
         };
         let ssrc = gst::glib::random_int();
         let caps = gst::Caps::builder("application/x-rtp")
@@ -1406,8 +1412,7 @@ impl Call {
         // other end, which then asks for a fresh start.
         let bin = gst::parse::bin_from_description(
             &format!(
-                "{payloader} pt={payload_type} ssrc={ssrc} mtu={VIDEO_MTU} config-interval=-1 \
-                   aggregate-mode=zero-latency \
+                "{payloader} pt={payload_type} ssrc={ssrc} mtu={VIDEO_MTU} \
                  ! queue leaky=downstream max-size-bytes={VIDEO_BACKLOG_BYTES} \
                    max-size-buffers=0 max-size-time=0 \
                  ! capsfilter caps=\"{caps}\""
@@ -1640,15 +1645,19 @@ fn attach_video_recv_branch(
     webrtc_src: &gst::Pad,
     codec: Codec,
 ) -> Result<()> {
+    // AV1 arrives in pieces smaller than a frame, which the parser puts
+    // together.
+    const LOSS: &str = "request-keyframe=true wait-for-keyframe=true";
     let depayloader = match codec {
-        Codec::H264 => "rtph264depay",
-        Codec::Hevc => "rtph265depay",
+        Codec::H264 => format!("rtph264depay {LOSS}"),
+        Codec::Hevc => format!("rtph265depay {LOSS}"),
+        Codec::Av1 => format!("rtpav1depay {LOSS} ! av1parse"),
     };
     // After a loss, frames are held back until one arrives that can be
     // decoded on its own, and the sharer is asked for it.
     let bin = gst::parse::bin_from_description(
         &format!(
-            "{depayloader} request-keyframe=true wait-for-keyframe=true ! {} \
+            "{depayloader} ! {} \
              ! appsink name=out sync=false async=false",
             codec.caps()
         ),

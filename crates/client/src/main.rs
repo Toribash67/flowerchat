@@ -80,7 +80,7 @@ struct Args {
     /// Share the picture without the sound that goes with it.
     #[arg(long)]
     share_silent: bool,
-    /// Codec to share in: h264 or hevc.
+    /// Codec to share in: h264, hevc or av1.
     #[arg(long, default_value = "h264", value_parser = parse_codec)]
     share_codec: Codec,
     /// Bitrate to share at, in kbit/s. Without it, the bitrate follows the
@@ -101,7 +101,7 @@ struct Args {
 }
 
 fn parse_codec(id: &str) -> Result<Codec, String> {
-    Codec::from_id(id).ok_or_else(|| format!("{id:?} is not one of h264 and hevc"))
+    Codec::from_id(id).ok_or_else(|| format!("{id:?} is not one of h264, hevc and av1"))
 }
 
 #[tokio::main]
@@ -269,12 +269,17 @@ async fn main() -> Result<()> {
                     Event::Watching { id, stats } => {
                         let sound = stream_levels.remove(&id).unwrap_or(f32::NEG_INFINITY);
                         println!(
-                            "watching peer {id}: {}x{} at {:.1} fps, {:.1}% dropped, ready in {:.1} ms, sound {sound:.0} dB",
+                            "watching peer {id}: {}x{} at {:.1} fps, {:.1}% dropped, ready in {:.1} ms{}, sound {sound:.0} dB",
                             stats.width,
                             stats.height,
                             stats.fps,
                             stats.dropped_percent,
-                            stats.decode_ms
+                            stats.decode_ms,
+                            if stats.software {
+                                " (decoded on the processor)"
+                            } else {
+                                ""
+                            }
                         );
                     }
                     Event::StreamLevel { id, db } => {
