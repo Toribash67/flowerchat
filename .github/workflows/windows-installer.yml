@@ -1,0 +1,67 @@
+name: Windows installer
+
+# Builds the installer that friends on Windows run. Every run keeps it as
+# an artifact; a tag like v0.1.0 also puts it on a release of that name.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The version the client is built and tested against. The installer
+  # brings its libraries along, so this is also what friends run.
+  GSTREAMER_VERSION: "1.28.9"
+  GSTREAMER_SHA256: "ce4008705e8c6fe92803535b82fb3d6551e183f438e6ef26682ac4d0aca61076"
+
+jobs:
+  installer:
+    name: Build installer
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Install GStreamer
+        shell: pwsh
+        run: |
+          $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GSTREAMER_VERSION/msvc/gstreamer-1.0-msvc-x86_64-$env:GSTREAMER_VERSION.exe"
+          Invoke-WebRequest $url -OutFile gstreamer.exe
+          $hash = (Get-FileHash gstreamer.exe -Algorithm SHA256).Hash
+          if ($hash -ne $env:GSTREAMER_SHA256) { throw "GStreamer's installer has the hash $hash" }
+          Start-Process -Wait .\gstreamer.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/CURRENTUSER', '/DIR=C:\gstreamer'
+          # Wherever under there it put itself.
+          $pkgconfig = Get-ChildItem C:\gstreamer -Recurse -Filter pkg-config.exe | Select-Object -First 1
+          if (-not $pkgconfig) { throw 'GStreamer did not install' }
+          "GSTREAMER=$($pkgconfig.Directory.Parent.FullName)" >> $env:GITHUB_ENV
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: ./installer/build.ps1 -GStreamer $env:GSTREAMER
+
+      - name: Keep installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowerchat-setup
+          path: target/installer/*.exe
+          if-no-files-found: error
+
+      - name: Put installer on the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = (Get-Item target/installer/*.exe).FullName
+          gh release create $env:GITHUB_REF_NAME $installer --title $env:GITHUB_REF_NAME --generate-notes

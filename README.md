@@ -45,6 +45,10 @@ and NVDEC), and nothing else is tried.
 What follows describes Linux. Where Windows differs, a paragraph says so;
 `docs/windows-port.md` has how to build there and what is still missing.
 
+On Windows nobody but a developer needs any of that: `installer\build.ps1`
+makes one installer that brings along the parts of GStreamer flowerchat
+uses.
+
 ```sh
 cargo run -p flowerchat-app
 ```

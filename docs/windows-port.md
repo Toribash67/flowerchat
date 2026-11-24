@@ -90,7 +90,11 @@ Still to do:
   decoder's texture would need egui and GStreamer to share one.
 - Two copies of flowerchat on one machine record each other's side of the
   call as stream sound. Windows leaves out one program, not two.
-- The installer.
+- A viewer's decoder (`nvh264dec`) cannot hand its frames to Direct3D
+  directly here ("D3D11 setup failed" at `GST_DEBUG=2`; it wants a CUDA
+  library that is not installed), so they pass through ordinary memory on
+  the way to `d3d11convert`. `d3d11h264dec` and `d3d11h265dec` decode on
+  the same card and stay there; untried.
 
 ## Why Windows comes next
 
@@ -200,10 +204,40 @@ $env:PATH = "$gst\bin;$env:PATH"
 $env:PKG_CONFIG_PATH = "$gst\lib\pkgconfig"
 ```
 
+## The installer
+
+`installer\build.ps1` makes `target\installer\flowerchat-VERSION-setup.exe`,
+16 MB, which is all a friend needs. It also needs Inno Setup 6
+(`winget install JRSoftware.InnoSetup`). In three steps:
+
+- `cargo build --release`. Release builds of the app have no console
+  window, so they print nothing; debug builds keep it.
+- `bundle.ps1` gathers the programs, the 25 GStreamer plugins the
+  pipelines use, and the libraries those ask for, read from their import
+  tables: 56 MB in `target\bundle`, of GStreamer's 1.1 GB. A pipeline that
+  gains an element from another plugin needs that plugin added to the list
+  at the top of the script, or it works here and fails for everyone else.
+- `flowerchat.iss` wraps that folder. Installing asks for an
+  administrator, puts flowerchat under Program Files with a Start menu
+  entry, and tells the firewall to let others reach it. `/CURRENTUSER` on
+  the installer's command line installs for one person without asking.
+
+Checked: the folder ran a real share between two copies with GStreamer
+taken off the `PATH`; the installer was installed for one user into a
+scratch folder, shared a screen from there, and uninstalled without
+leaving anything. Not checked: the ordinary install as administrator with
+its firewall rule, an update over an older version, and any machine but
+this one, which has an NVIDIA driver and the Visual C++ runtime already.
+
+`.github/workflows/windows-installer.yml` does the same on GitHub for a
+tag like `v0.1.0` and puts the installer on a release. It has never run.
+
+The installer is not signed, so Windows warns whoever runs it ("Windows
+protected your PC"; "More info", then "Run anyway"). There is no icon
+yet; that is a matter of looks and wants a proposal.
+
 Still open:
 
-- An installer that brings GStreamer along, since friends will not install
-  it themselves. Undecided how.
 - The app's default server is the live one, `wss://chat.flowerboi.se/ws`.
   The CLI still defaults to `ws://127.0.0.1:8080/ws`, so that test runs do
   not land in the real room; pass `--server` to either to override.
