@@ -3,7 +3,7 @@
 This stack follows the Sengoku Jidai deployment:
 
 - Image: `ghcr.io/toribash67/flowerchat-server:latest`
-- Host port: `18082`
+- Host port: `18084`
 - Container port: `80`
 - Nothing to keep between restarts: the server holds who is in which room
   in memory, and nothing else.
@@ -18,8 +18,8 @@ between the people in a call and never pass through it.
 2. If the GHCR package is private, which it is by default for a private
    repository, either make the package public or log in to GHCR on the
    TrueNAS host and give Watchtower the same login.
-3. Start the stack. `http://<truenas-host>:18082/healthz` answers `ok`, and
-   `http://<truenas-host>:18082/` shows the browser test page.
+3. Start the stack. `http://<truenas-host>:18084/healthz` answers `ok`, and
+   `http://<truenas-host>:18084/` shows the browser test page.
 4. Point a subdomain at it in nginx, as below.
 
 ## nginx
@@ -36,7 +36,7 @@ server {
     # ssl_certificate and ssl_certificate_key as for the other sites
 
     location / {
-        proxy_pass http://127.0.0.1:18082;   # or the TrueNAS host's address
+        proxy_pass http://127.0.0.1:18084;   # or the TrueNAS host's address
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
