@@ -1285,6 +1285,9 @@ fn send_voice(ui: &mut Ui, env: &Env<'_>, state: &mut UiState) {
             GlobalKey::Ready { trigger } => Some(format!(
                 "Works while this window has focus. Everywhere else: {trigger}."
             )),
+            GlobalKey::SameKey => {
+                Some("Works in every window, not only while this one has focus.".to_owned())
+            }
             GlobalKey::Unavailable(reason) => Some(format!(
                 "Works while this window has focus. Nowhere else, because {reason}."
             )),

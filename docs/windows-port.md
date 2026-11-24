@@ -6,6 +6,62 @@ Linux machine (Hyprland, PipeWire 1.6, GStreamer 1.28, RTX 2070 SUPER).
 Nothing in here has been tried on Windows: where a Windows element or
 property is named, it is where to start looking, not a tested answer.
 
+## Where the port stands
+
+Added on Windows 11 on 2026-11-24, on a machine with an RTX 2070 SUPER and
+GStreamer 1.28.9. The rest of this file is the notes as they were written
+on Linux beforehand; where they disagree with this section, this section
+is what was found.
+
+Working, and how each was checked:
+
+- The workspace builds, and `cargo test --workspace` passes, including the
+  app's end-to-end test of sharing and watching.
+- Microphone and speakers (`wasapi2src`, `wasapi2sink`, both with
+  `low-latency=true`): a call between two copies of the CLI with a real
+  microphone had the same 90 ms of delay as with the test tone. Nobody has
+  listened to it.
+- The device list: the real devices under their own names, with the one
+  that is the system default marked. Windows also lists "the default" as a
+  device of its own and the speakers as something to record from; both are
+  left out (`listed` in `audio.rs`).
+- Screen capture (`d3d11screencapturesrc`): a 2560x1440 monitor reached a
+  viewer at 60 fps with nothing dropped. The CLI takes `--share-monitor
+  NUMBER`; the app always shares the main monitor, until there is a picker.
+- Stream sound (`sound/loopback.rs`): a tone played by another program
+  reached the viewer. That our own playback is left out has not been
+  checked by ear.
+- Push-to-talk outside the window: the key chosen with "Set key" is
+  followed everywhere, by asking Windows every 10 ms whether it is down
+  (`talk.rs`). Not tried on a real key yet.
+
+Found on the way:
+
+- The OpenGL elements exist on Windows and pass `gpu_conversion_works`,
+  but when the size asked of them changes in the middle of a stream, no
+  more frames come out. Windows therefore prepares frames with
+  `d3d11upload ! d3d11convert`, and `tests/sharing.rs` now changes the
+  size while watching.
+- `d3d11screencapturesrc` delivers frames at a steady rate that it has to
+  be told, so a `capsfilter` named `capture_rate` follows it.
+- One snapshot differs from the Linux image in four pixels of one line of
+  text, so the snapshot tests allow 16 differing pixels on Windows.
+- `gst-plugin-rsrtp` is not needed: nothing was installed for it.
+
+Still to do:
+
+- A picker for which monitor or window to share. `ScreenSource` can
+  already name either; the picker is new UI and wants a proposal.
+- Capturing a window (`ScreenSource::Window`) has not been run at all.
+- Push-to-talk on a mouse button, which is what many would bind, is not
+  possible on either system: "Set key" only takes keyboard keys.
+- Encoding a 1440p screen takes 13 to 18 ms, most of it bringing each frame
+  into ordinary memory and back to the card. `nvd3d11h264enc` fed straight
+  from the capture would avoid that (step 6 below).
+- Two copies of flowerchat on one machine record each other's side of the
+  call as stream sound. Windows leaves out one program, not two.
+- The installer.
+
 ## Why Windows comes next
 
 The app works on Linux and the server is live, but everyone who would use
@@ -94,14 +150,28 @@ Things to know before starting on each:
 
 ## Building on Windows
 
-Not done yet, so this is a list of what is needed rather than a recipe.
+What was installed, all with `winget`:
 
-- GStreamer 1.28, MSVC build, both the runtime and the development
-  installer, with the complete feature set (the default install leaves out
-  parts of `bad`). The Rust bindings find it through `pkg-config`.
-- The README also lists `gst-plugin-rsrtp`. Nothing in the pipeline
-  descriptions names one of its elements, so find out whether it is still
-  needed before chasing a Windows build of it.
+```powershell
+winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget install gstreamerproject.gstreamer
+```
+
+GStreamer 1.28 comes as one installer for runtime and development files,
+and its default selection had every element used here. It goes into
+`%LOCALAPPDATA%\Programs\gstreamer\1.0\msvc_x86_64` and sets no variables.
+Building needs its `pkg-config`, and running needs its DLLs, so in the
+shell that runs `cargo`:
+
+```powershell
+$gst = "$env:LOCALAPPDATA\Programs\gstreamer\1.0\msvc_x86_64"
+$env:PATH = "$gst\bin;$env:PATH"
+$env:PKG_CONFIG_PATH = "$gst\lib\pkgconfig"
+```
+
+Still open:
+
 - An installer that brings GStreamer along, since friends will not install
   it themselves. Undecided how.
 - The app's default server is the live one, `wss://chat.flowerboi.se/ws`.

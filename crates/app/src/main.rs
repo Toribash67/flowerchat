@@ -502,6 +502,10 @@ impl App {
             self.talk
                 .register_global(&self.runtime, move || ctx.request_repaint());
         }
+        self.talk.set_window(
+            self.ui.settings.talk_key(),
+            ctx.input(|input| input.focused),
+        );
         self.talk
             .set_local(push_to_talk, views::talk_key_down(ctx, &self.ui));
 

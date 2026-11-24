@@ -50,7 +50,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, trace, warn};
 
 use crate::audio::{
-    AudioSettings, LEVEL_INTERVAL_NS, MAX_JITTER_MS, RAW_AUDIO, capture_bin, level_db,
+    AudioSettings, LEVEL_INTERVAL_NS, MAX_JITTER_MS, RAW_AUDIO, SPEAKERS, capture_bin, level_db,
     unique_probe_name,
 };
 use crate::ice::IceConfig;
@@ -408,8 +408,7 @@ impl Call {
                 .map_or_else(String::new, |name| format!("webrtcechoprobe name={name} !"));
             format!(
                 "{probe} audioconvert ! audioresample name=to_speakers \
-                 ! pulsesink name=speakers buffer-time=20000 latency-time=10000 \
-                   processing-deadline={SINK_DEADLINE_NS}"
+                 ! {SPEAKERS} name=speakers processing-deadline={SINK_DEADLINE_NS}"
             )
         };
         let jitter_ns = u64::from(audio.jitter_ms) * 1_000_000;

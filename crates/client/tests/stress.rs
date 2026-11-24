@@ -131,11 +131,16 @@ async fn a_share_survives_being_pushed() {
     };
     // A PipeWire node to share in place of the test picture, such as one
     // made with `videotestsrc ! pipewiresink mode=provide`.
-    let source = match std::env::var("STRESS_NODE")
+    // On Windows it is the number of a monitor instead.
+    let screen = std::env::var("STRESS_NODE")
         .ok()
-        .and_then(|id| id.parse().ok())
-    {
-        Some(node) => ShareSource::Screen(ScreenSource { remote: None, node }),
+        .and_then(|id| id.parse().ok());
+    #[cfg(not(windows))]
+    let screen = screen.map(|node| ScreenSource { remote: None, node });
+    #[cfg(windows)]
+    let screen = screen.map(ScreenSource::MonitorNumber);
+    let source = match screen {
+        Some(screen) => ShareSource::Screen(screen),
         None => ShareSource::TestPicture {
             width: 2560,
             height: 1440,

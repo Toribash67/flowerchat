@@ -219,7 +219,11 @@ fn snapshot(name: &str, size: Vec2, mut draw: impl FnMut(&mut egui::Ui)) {
         .wgpu()
         .build_ui(|ui| draw(ui));
     harness.run();
-    harness.snapshot(name);
+    // The images were made on Linux. Windows draws through another graphics
+    // backend, which rounds the edges of a few letters differently.
+    let options = egui_kittest::SnapshotOptions::new()
+        .max_failed_pixels(egui_kittest::OsThreshold::new(0).windows(16));
+    harness.snapshot_options(name, &options);
 }
 
 #[test]

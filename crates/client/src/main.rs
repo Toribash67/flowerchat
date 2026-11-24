@@ -63,9 +63,15 @@ struct Args {
     share_test: Option<String>,
     /// Share a PipeWire video stream that is open to everyone, by its node
     /// id. Screens are not; the app asks the desktop for those.
+    #[cfg(not(windows))]
     #[arg(long, value_name = "ID", conflicts_with = "share_test")]
     share_node: Option<u32>,
+    /// Share a monitor, by its number from zero.
+    #[cfg(windows)]
+    #[arg(long, value_name = "NUMBER", conflicts_with = "share_test")]
+    share_monitor: Option<u32>,
     /// Scale the shared picture down to this height if it is taller.
+    /// Without it, or with 0, the picture is sent at the size it has.
     #[arg(long)]
     share_height: Option<u32>,
     /// Frames per second to share at.
@@ -121,19 +127,26 @@ async fn main() -> Result<()> {
         audio
     };
 
-    let source = match (&args.share_test, args.share_node) {
+    #[cfg(not(windows))]
+    let screen = args
+        .share_node
+        .map(|node| ScreenSource { remote: None, node });
+    #[cfg(windows)]
+    let screen = args.share_monitor.map(ScreenSource::MonitorNumber);
+    let source = match (&args.share_test, screen) {
         (Some(size), _) => {
             let (width, height) = flowerchat_client::video::parse_size(size)
                 .with_context(|| format!("{size:?} is not a size like 1920x1080"))?;
             Some(ShareSource::TestPicture { width, height })
         }
-        (None, Some(node)) => Some(ShareSource::Screen(ScreenSource { remote: None, node })),
+        (None, Some(screen)) => Some(ShareSource::Screen(screen)),
         (None, None) => None,
     };
     let share = source.map(|source| Command::StartShare {
         source,
         settings: ShareSettings {
-            max_height: args.share_height,
+            // As in the app, 0 stands for the size the screen has.
+            max_height: args.share_height.filter(|height| *height > 0),
             fps: args.share_fps,
             sound: !args.share_silent,
             codec: args.share_codec,

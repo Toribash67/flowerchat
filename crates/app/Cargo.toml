@@ -23,6 +23,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.14.3", default-features = false, features = ["tokio", "global_shortcuts", "screencast"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+
 [dev-dependencies]
 axum = "0.8.9"
 flowerchat-server = { path = "../server" }

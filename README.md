@@ -36,11 +36,14 @@ join without clicking.
 
 ## Running the app
 
-The app and the command-line client need GStreamer 1.28 with the base, good
-and bad plugin sets, the PipeWire plugin and `gst-plugin-rsrtp`. Sharing a
-screen and watching one need an NVIDIA graphics card: the picture is encoded
-and decoded as H.264 or HEVC on the card (NVENC and NVDEC), and nothing else
-is tried.
+The app and the command-line client run on Linux and on Windows. They need
+GStreamer 1.28 with the base, good and bad plugin sets, and on Linux the
+PipeWire plugin. Sharing a screen and watching one need an NVIDIA graphics
+card: the picture is encoded and decoded as H.264 or HEVC on the card (NVENC
+and NVDEC), and nothing else is tried.
+
+What follows describes Linux. Where Windows differs, a paragraph says so;
+`docs/windows-port.md` has how to build there and what is still missing.
 
 ```sh
 cargo run -p flowerchat-app
@@ -76,6 +79,9 @@ ScreenCast portal, and the desktop shows its own picker. Sharing sends
 nothing by itself: a share shows up for the others as a Watch button in the
 Screen column, and the picture goes only to those who press it. It is
 encoded once, however many watch.
+
+On Windows there is no picker yet, and "Share screen" shares the main
+monitor.
 
 Watching opens the screen in the middle of the window, with the people on
 the left and the chat or the audio panel on the right. Under the picture
@@ -117,13 +123,20 @@ of it either. The sound travels as a stream of its own, in stereo, and each
 viewer sets its volume apart from the voices, under the picture. For this,
 flowerchat opens a recording stream in PipeWire and connects every other
 program's playback to it, with PipeWire's own `pw-dump` and `pw-link`. Of a
-surround mix, only the front channels are taken.
+surround mix, only the front channels are taken. On Windows, the system
+records what plays and leaves flowerchat out, which takes Windows 11 or a
+late build of Windows 10.
 
 For trying things out without a second machine, `--share-test 1920x1080`
 makes "Share screen" share a moving test picture of that size, with a tone
 for its sound, without asking the desktop, and `--lose 2` loses 2% of the packets that arrive.
 
 ### Push-to-talk
+
+On Windows, the key chosen with "Set key" works in every window, if it is
+a letter, a digit, a function key or one of the keys for moving about.
+Other keys work while the window has focus. The rest of this section is
+about Linux.
 
 The key chosen with "Set key" works while the window has focus. For a key
 that works everywhere, the app registers a shortcut named `push-to-talk` with
@@ -165,14 +178,15 @@ ones that matter most:
 | Option | Meaning |
 | --- | --- |
 | `--room`, `--server` | Where to join. |
-| `--input`, `--output` | PipeWire/PulseAudio device names, instead of the defaults. |
+| `--input`, `--output` | PipeWire/PulseAudio device names, instead of the defaults. On Windows, the ids `gst-device-monitor-1.0` shows as `device.id`. |
 | `--jitter-ms` | Receive buffer, 40 ms by default. Lower means less delay but less tolerance for network jitter. |
 | `--raw-mic` | Skip echo cancellation, noise suppression and automatic gain. |
 | `--stats` | Print each connection's statistics and levels once a second. |
 | `--say` | Send a chat message to each peer once connected. |
 | `--share-test` | Share a moving test picture of this size, such as `1920x1080`. |
-| `--share-node` | Share a PipeWire video stream that is open to everyone, by its node id. |
-| `--share-height`, `--share-fps` | The tallest picture to send, and how many frames per second. |
+| `--share-node` | Linux: share a PipeWire video stream that is open to everyone, by its node id. |
+| `--share-monitor` | Windows: share a monitor, by its number from zero. |
+| `--share-height`, `--share-fps` | The tallest picture to send (0 for the size it has), and how many frames per second. |
 | `--share-silent` | Share the picture without the sound that goes with it. |
 | `--share-codec` | Codec to share in: `h264` (the default) or `hevc`. |
 | `--share-kbps` | Bitrate to share at, in kbit/s. Without it, the bitrate follows size and frame rate. |

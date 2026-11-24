@@ -15,7 +15,6 @@
 //! and the decoder with it at the other end.
 
 use std::collections::VecDeque;
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -42,9 +41,6 @@ const FRAMES_OF_BURST: f64 = 2.0;
 const KEYFRAME_SPACING_NS: u64 = 250_000_000;
 /// Frame rate of the test picture.
 const TEST_PICTURE_FPS: u32 = 60;
-/// How often a screen that is not changing is sent again anyway. Someone
-/// who starts watching needs a frame to start from.
-const STILL_SCREEN_REFRESH_MS: i32 = 100;
 
 /// How the picture is compressed on its way to the viewers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -207,20 +203,102 @@ impl Default for ShareSettings {
 pub enum ShareSource {
     /// A moving test pattern of this size, standing in for a screen.
     TestPicture { width: u32, height: u32 },
-    /// A screen or a window, as PipeWire delivers it.
+    /// A screen or a window, as the system delivers it.
     Screen(ScreenSource),
 }
 
 /// A PipeWire video stream of a screen or a window. The desktop's
 /// ScreenCast portal hands these out once the user has picked what to share.
+#[cfg(not(windows))]
 #[derive(Debug, Clone)]
 pub struct ScreenSource {
     /// A connection to PipeWire that is allowed to see the stream. Without
     /// one, the ordinary connection is used, which only sees streams that
     /// are open to everyone.
-    pub remote: Option<Arc<OwnedFd>>,
+    pub remote: Option<Arc<std::os::fd::OwnedFd>>,
     /// The stream's node in PipeWire.
     pub node: u32,
+}
+
+#[cfg(not(windows))]
+impl ScreenSource {
+    /// How often a screen that is not changing is sent again anyway.
+    /// Someone who starts watching needs a frame to start from.
+    const STILL_SCREEN_REFRESH_MS: i32 = 100;
+
+    /// The element that captures it, named `screen`, and whatever has to
+    /// follow it. `fps` is the most frames per second that are wanted.
+    fn description(&self, _fps: u32) -> String {
+        // PipeWire only delivers a frame when the screen has changed.
+        format!(
+            "pipewiresrc name=screen do-timestamp=true keepalive-time={}",
+            Self::STILL_SCREEN_REFRESH_MS
+        )
+    }
+
+    /// Points the capturing element at this screen.
+    fn apply(&self, screen: &gst::Element) {
+        use std::os::fd::AsRawFd;
+        screen.set_property("path", self.node.to_string());
+        if let Some(remote) = &self.remote {
+            screen.set_property("fd", remote.as_raw_fd());
+        }
+    }
+}
+
+/// A monitor or a window on Windows, which lets any program look at either.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenSource {
+    /// The monitor Windows calls the main one.
+    PrimaryMonitor,
+    /// A monitor by its place in the graphics card's list, from zero.
+    MonitorNumber(u32),
+    /// A monitor by its handle (`HMONITOR`).
+    Monitor(u64),
+    /// A window by its handle (`HWND`).
+    Window(u64),
+}
+
+#[cfg(windows)]
+impl ScreenSource {
+    /// The element that captures it, named `screen`, and whatever has to
+    /// follow it. `fps` is the most frames per second that are wanted.
+    ///
+    /// The capture delivers frames at a steady rate, changed or not, and
+    /// has to be told which: the filter named `capture_rate` does that.
+    fn description(&self, fps: u32) -> String {
+        format!(
+            "d3d11screencapturesrc name=screen show-cursor=true do-timestamp=true \
+             ! capsfilter name=capture_rate caps=\"{}\"",
+            capture_caps(fps)
+        )
+    }
+
+    /// Points the capturing element at this screen.
+    fn apply(&self, screen: &gst::Element) {
+        match *self {
+            ScreenSource::PrimaryMonitor => {}
+            ScreenSource::MonitorNumber(number) => {
+                screen.set_property("monitor-index", number as i32)
+            }
+            ScreenSource::Monitor(handle) => screen.set_property("monitor-handle", handle),
+            // Only the newer of the two ways to capture knows of windows.
+            ScreenSource::Window(handle) => {
+                screen.set_property_from_str("capture-api", "wgc");
+                screen.set_property("window-handle", handle);
+            }
+        }
+    }
+}
+
+/// The caps that make a Windows screen capture deliver `fps` frames per
+/// second, in ordinary memory.
+#[cfg(windows)]
+fn capture_caps(fps: u32) -> gst::Caps {
+    gst::Caps::builder("video/x-raw")
+        .field("framerate", gst::Fraction::new(fps.max(1) as i32, 1))
+        .build()
 }
 
 /// A share as the room sees it.
@@ -352,8 +430,9 @@ pub(crate) struct Encoder {
     /// When the counters were last read.
     last_read: Mutex<Instant>,
     events: Arc<dyn Fn(EncoderEvent) + Send + Sync>,
-    /// Kept open for as long as the screen is being read through it.
-    _remote: Option<Arc<OwnedFd>>,
+    /// What is being shared. On Linux this holds the connection the screen
+    /// is read through, which has to stay open for as long.
+    _source: ShareSource,
 }
 
 struct EncoderState {
@@ -430,11 +509,7 @@ impl Encoder {
                  ! video/x-raw,format=BGRx,width={width},height={height},\
                    framerate={TEST_PICTURE_FPS}/1"
             ),
-            // PipeWire only delivers a frame when the screen has changed.
-            ShareSource::Screen(_) => format!(
-                "pipewiresrc name=screen do-timestamp=true \
-                   keepalive-time={STILL_SCREEN_REFRESH_MS}"
-            ),
+            ShareSource::Screen(screen) => screen.description(settings.fps),
         };
         // A screen delivers frames at no fixed rate, and says so. The
         // encoder shares out its bitrate by the rate it expects, so it is
@@ -463,17 +538,9 @@ impl Encoder {
         let pace = by_name("pace")?;
         let stage = EncodingStage::new(settings.codec)?;
         stage.place(&pipeline, &size, &out)?;
-        let remote = match source {
-            ShareSource::Screen(screen) => {
-                let pipewire = by_name("screen")?;
-                pipewire.set_property("path", screen.node.to_string());
-                if let Some(remote) = &screen.remote {
-                    pipewire.set_property("fd", remote.as_raw_fd());
-                }
-                screen.remote.clone()
-            }
-            ShareSource::TestPicture { .. } => None,
-        };
+        if let ShareSource::Screen(screen) = source {
+            screen.apply(&by_name("screen")?);
+        }
         let state = Arc::new(Mutex::new(EncoderState {
             settings,
             source: None,
@@ -581,7 +648,7 @@ impl Encoder {
             counters,
             last_read: Mutex::new(Instant::now()),
             events,
-            _remote: remote,
+            _source: source.clone(),
         };
         this.pipeline
             .set_state(gst::State::Playing)
@@ -608,6 +675,10 @@ impl Encoder {
         };
         state.settings = settings;
         self.rate.set_property("max-rate", settings.fps as i32);
+        #[cfg(windows)]
+        if let Some(capture_rate) = self.pipeline.by_name("capture_rate") {
+            capture_rate.set_property("caps", capture_caps(settings.fps));
+        }
         self.pace.set_property("caps", pace_caps(settings.fps));
         // Makes the new pace take effect with the next frame, whether or
         // not anything else about the picture changes.
@@ -842,7 +913,7 @@ impl DecoderState {
                 .field("pixel-aspect-ratio", gst::Fraction::new(1, 1));
         }
         let caps = if on_gpu {
-            caps.features(["memory:GLMemory"]).build()
+            caps.features([GPU_MEMORY]).build()
         } else {
             caps.build()
         };
@@ -850,18 +921,36 @@ impl DecoderState {
     }
 }
 
+/// The elements that take frames to the graphics card and convert and scale
+/// them there, the kind of memory they are in while there, and the element
+/// that brings them back.
+#[cfg(not(windows))]
+const GPU_PREPARE: &str = "glupload ! glcolorconvert ! glcolorscale";
+#[cfg(not(windows))]
+const GPU_MEMORY: &str = "memory:GLMemory";
+#[cfg(not(windows))]
+const GPU_DOWNLOAD: &str = "gldownload";
+// Windows has the OpenGL elements too, and they pass the test below. But a
+// change of size in the middle of a stream stops them (GStreamer 1.28.9).
+#[cfg(windows)]
+const GPU_PREPARE: &str = "d3d11upload ! d3d11convert";
+#[cfg(windows)]
+const GPU_MEMORY: &str = "memory:D3D11Memory";
+#[cfg(windows)]
+const GPU_DOWNLOAD: &str = "d3d11download";
+
 /// Whether frames can be converted and scaled on the graphics card on this
 /// system. Tried once, with a single small frame.
 fn gpu_conversion_works() -> bool {
     static WORKS: OnceLock<bool> = OnceLock::new();
     *WORKS.get_or_init(|| {
         let attempt = || -> Result<bool> {
-            let pipeline = gst::parse::launch(
+            let pipeline = gst::parse::launch(&format!(
                 "videotestsrc num-buffers=1 ! video/x-raw,format=NV12,width=64,height=64 \
-                 ! glupload ! glcolorconvert ! glcolorscale \
-                 ! video/x-raw(memory:GLMemory),format=RGBA,width=32,height=32 \
-                 ! gldownload ! video/x-raw,format=RGBA ! fakesink",
-            )?;
+                 ! {GPU_PREPARE} \
+                 ! video/x-raw({GPU_MEMORY}),format=RGBA,width=32,height=32 \
+                 ! {GPU_DOWNLOAD} ! video/x-raw,format=RGBA ! fakesink"
+            ))?;
             pipeline.set_state(gst::State::Playing)?;
             let bus = pipeline.bus().context("no bus")?;
             let ended = [gst::MessageType::Eos, gst::MessageType::Error];
@@ -902,10 +991,11 @@ impl Decoder {
         // on the processor.
         let on_gpu = gpu_conversion_works();
         let prepare = if on_gpu {
-            "glupload ! glcolorconvert ! glcolorscale ! capsfilter name=size \
-             ! gldownload ! video/x-raw,format=RGBA"
+            format!(
+                "{GPU_PREPARE} ! capsfilter name=size ! {GPU_DOWNLOAD} ! video/x-raw,format=RGBA"
+            )
         } else {
-            "videoconvertscale n-threads=4 ! capsfilter name=size"
+            "videoconvertscale n-threads=4 ! capsfilter name=size".to_owned()
         };
         // Encoded frames cannot be skipped, because the ones after them
         // build on them. Decoded ones can, so when preparing frames for

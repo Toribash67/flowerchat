@@ -19,6 +19,18 @@ pub(crate) const LEVEL_INTERVAL_NS: u64 = 50_000_000;
 /// Largest receive buffer a call accepts.
 pub const MAX_JITTER_MS: u32 = 500;
 
+/// The element that records from a microphone, with as little held back as
+/// the system allows. Its `device` property takes an [`AudioDevice::id`].
+#[cfg(not(windows))]
+const MICROPHONE: &str = "pulsesrc buffer-time=20000 latency-time=10000";
+#[cfg(windows)]
+const MICROPHONE: &str = "wasapi2src low-latency=true";
+/// The element that plays on speakers, likewise.
+#[cfg(not(windows))]
+pub(crate) const SPEAKERS: &str = "pulsesink buffer-time=20000 latency-time=10000";
+#[cfg(windows)]
+pub(crate) const SPEAKERS: &str = "wasapi2sink low-latency=true";
+
 const TEST_SOUND: Duration = Duration::from_millis(600);
 
 /// Everything about a call's audio that can change while it is under way.
@@ -90,7 +102,7 @@ pub(crate) fn capture_bin(settings: &AudioSettings, echo_probe: Option<&str>) ->
     // replaced without the pipeline losing its clock.
     let bin = gst::parse::bin_from_description(
         &format!(
-            "pulsesrc name=mic provide-clock=false buffer-time=20000 latency-time=10000 \
+            "{MICROPHONE} name=mic provide-clock=false \
              ! audioconvert ! audioresample ! capsfilter caps={RAW_AUDIO} {processing}"
         ),
         true,
@@ -159,27 +171,43 @@ impl DeviceWatch {
     /// The devices present right now.
     pub fn devices(&self) -> AudioDevices {
         let mut devices = AudioDevices::default();
+        // The ids of the devices that "system default" stands for.
+        let mut defaults = Vec::new();
         for device in self.monitor.devices() {
             let Some(properties) = device.properties() else {
                 continue;
             };
-            // PipeWire's name for the device is also the name its PulseAudio
-            // side, which the pipelines go through, knows it by.
-            let Ok(id) = properties.get::<String>("node.name") else {
-                continue;
+            let input = device.has_classes("Audio/Source");
+            let (id, is_default) = match listed(&properties) {
+                Listed::Device { id, is_default } => (id, is_default),
+                Listed::DefaultIs(id) => {
+                    defaults.push((input, id));
+                    continue;
+                }
+                Listed::No => continue,
             };
             let entry = AudioDevice {
                 id,
                 label: device.display_name().into(),
-                is_default: properties.get::<bool>("is-default").unwrap_or(false),
+                is_default,
             };
-            let list = if device.has_classes("Audio/Source") {
+            let list = if input {
                 &mut devices.inputs
             } else {
                 &mut devices.outputs
             };
             if !list.contains(&entry) {
                 list.push(entry);
+            }
+        }
+        for (input, id) in defaults {
+            let list = if input {
+                &mut devices.inputs
+            } else {
+                &mut devices.outputs
+            };
+            for device in list.iter_mut().filter(|device| device.id == id) {
+                device.is_default = true;
             }
         }
         for list in [&mut devices.inputs, &mut devices.outputs] {
@@ -197,6 +225,53 @@ impl DeviceWatch {
             changed = true;
         }
         changed
+    }
+}
+
+/// What an entry in the system's list of devices is to us.
+enum Listed {
+    /// A device to offer, by the id the pipelines know it by.
+    Device { id: String, is_default: bool },
+    /// Not a device of its own but "system default", which is currently
+    /// the device with this id.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DefaultIs(String),
+    /// Nothing to offer.
+    No,
+}
+
+#[cfg(not(windows))]
+fn listed(properties: &gst::StructureRef) -> Listed {
+    // PipeWire's name for the device is also the name its PulseAudio side,
+    // which the pipelines go through, knows it by.
+    match properties.get::<String>("node.name") {
+        Ok(id) => Listed::Device {
+            id,
+            is_default: properties.get::<bool>("is-default").unwrap_or(false),
+        },
+        Err(_) => Listed::No,
+    }
+}
+
+#[cfg(windows)]
+fn listed(properties: &gst::StructureRef) -> Listed {
+    let text = |field: &str| properties.get::<String>(field).ok();
+    let flag = |field: &str| properties.get::<bool>(field).unwrap_or(false);
+    // Windows has older ways to reach the same devices, which list them
+    // again under other ids. Speakers are also listed as something to
+    // record from, which is how the sound of a shared screen is taken.
+    if text("device.api").as_deref() != Some("wasapi2") || flag("wasapi2.device.loopback") {
+        return Listed::No;
+    }
+    if flag("device.default") {
+        return text("device.actual-id").map_or(Listed::No, Listed::DefaultIs);
+    }
+    match text("device.id") {
+        Some(id) => Listed::Device {
+            id,
+            is_default: false,
+        },
+        None => Listed::No,
     }
 }
 
@@ -262,7 +337,7 @@ pub fn play_test_sound(output: Option<&str>) -> Result<()> {
     let pipeline = gst::parse::launch(&format!(
         "audiotestsrc wave=sine freq=523.25 volume=0.2 samplesperbuffer=480 \
            num-buffers={buffers} \
-         ! {RAW_AUDIO} ! audioconvert ! audioresample ! pulsesink name=speakers"
+         ! {RAW_AUDIO} ! audioconvert ! audioresample ! {SPEAKERS} name=speakers"
     ))
     .context("cannot build the test sound")?
     .downcast::<gst::Pipeline>()

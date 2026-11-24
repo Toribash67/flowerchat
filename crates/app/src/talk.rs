@@ -34,6 +34,9 @@ pub enum GlobalKey {
     /// There is none, for the reason given, which completes the sentence
     /// "There is no system-wide shortcut, because ...".
     Unavailable(String),
+    /// None is needed: the key chosen in the window is followed wherever
+    /// it is pressed.
+    SameKey,
 }
 
 #[derive(Default)]
@@ -47,6 +50,11 @@ struct State {
     window_key: bool,
     global_key: bool,
     global: GlobalKey,
+    /// The key chosen in the window, and whether the window has focus.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    key: Option<egui::Key>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    focused: bool,
     /// The session under way and what it was last told.
     session: Option<(UnboundedSender<Command>, bool)>,
 }
@@ -85,6 +93,14 @@ impl Talk {
         state.sync();
     }
 
+    /// Sets the key chosen in the window and whether the window has focus,
+    /// for systems where that key is followed outside the window too.
+    pub fn set_window(&self, key: Option<egui::Key>, focused: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.key = key;
+        state.focused = focused;
+    }
+
     /// Follows a new session, which was started with `transmitting`.
     pub fn attach(&self, commands: UnboundedSender<Command>, transmitting: bool) {
         let mut state = self.state.lock().unwrap();
@@ -104,7 +120,7 @@ impl Talk {
 
     fn set_global(&self, global: GlobalKey) {
         let mut state = self.state.lock().unwrap();
-        if !matches!(global, GlobalKey::Ready { .. }) {
+        if !matches!(global, GlobalKey::Ready { .. } | GlobalKey::SameKey) {
             // Without a shortcut nothing will ever release the key.
             state.global_key = false;
         }
@@ -203,7 +219,100 @@ mod portal {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+mod portal {
+    use std::time::Duration;
+
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    use super::{GlobalKey, Talk};
+
+    /// How often the key is looked at. A press is at most this late.
+    const LOOK_EVERY: Duration = Duration::from_millis(10);
+
+    /// Follows the key chosen in the window while the window is in the
+    /// background. Windows tells any program whether a key is down, so
+    /// there is nothing to register and nothing that ends this.
+    pub async fn listen(talk: &Talk, changed: &(impl Fn() + Sync)) -> Result<(), String> {
+        let mut look = tokio::time::interval(LOOK_EVERY);
+        let mut held = false;
+        loop {
+            look.tick().await;
+            let (key, focused) = {
+                let state = talk.state.lock().unwrap();
+                (state.key, state.focused)
+            };
+            let code = key.map(virtual_key);
+            let global = match code {
+                Some(None) => GlobalKey::Unavailable(
+                    "this key can only be followed here; letters, digits and 
+                     function keys work everywhere"
+                        .to_owned(),
+                ),
+                _ => GlobalKey::SameKey,
+            };
+            if talk.global_key() != global {
+                talk.set_global(global);
+                changed();
+            }
+            // With focus, the window sees the key itself, and knows when
+            // it is being typed into a text field.
+            let down = !focused
+                && code
+                    .flatten()
+                    // The top bit says whether the key is down right now.
+                    .is_some_and(|code| unsafe { GetAsyncKeyState(code) } < 0);
+            if down != held {
+                held = down;
+                tracing::debug!(down, "push-to-talk key outside the window");
+                talk.set_global_key(down);
+                changed();
+            }
+        }
+    }
+
+    /// What Windows calls a key, for the keys it calls the same on every
+    /// keyboard layout.
+    pub fn virtual_key(key: egui::Key) -> Option<i32> {
+        use egui::Key;
+        let code = match key {
+            Key::Backspace => 0x08,
+            Key::Tab => 0x09,
+            Key::Enter => 0x0D,
+            Key::Space => 0x20,
+            Key::PageUp => 0x21,
+            Key::PageDown => 0x22,
+            Key::End => 0x23,
+            Key::Home => 0x24,
+            Key::ArrowLeft => 0x25,
+            Key::ArrowUp => 0x26,
+            Key::ArrowRight => 0x27,
+            Key::ArrowDown => 0x28,
+            Key::Insert => 0x2D,
+            Key::Delete => 0x2E,
+            _ => {
+                let name = key.name();
+                match name.as_bytes() {
+                    // Letters and digits have the codes of their characters.
+                    [character] if character.is_ascii_uppercase() || character.is_ascii_digit() => {
+                        i32::from(*character)
+                    }
+                    [b'F', number @ ..] => {
+                        let number: i32 = std::str::from_utf8(number).ok()?.parse().ok()?;
+                        if !(1..=24).contains(&number) {
+                            return None;
+                        }
+                        0x70 + number - 1
+                    }
+                    _ => return None,
+                }
+            }
+        };
+        Some(code)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 mod portal {
     use super::Talk;
 
@@ -259,6 +368,19 @@ mod tests {
         talk.set_local(true, false);
         talk.attach(commands, true);
         assert_eq!(told(&mut received), [false]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn keys_have_the_codes_windows_knows_them_by() {
+        use egui::Key;
+        let code = super::portal::virtual_key;
+        assert_eq!(code(Key::A), Some(0x41));
+        assert_eq!(code(Key::Num7), Some(0x37));
+        assert_eq!(code(Key::F1), Some(0x70));
+        assert_eq!(code(Key::F13), Some(0x7C));
+        assert_eq!(code(Key::Space), Some(0x20));
+        assert_eq!(code(Key::Comma), None, "its code depends on the layout");
     }
 
     #[test]

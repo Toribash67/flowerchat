@@ -206,6 +206,23 @@ async fn a_shared_screen_reaches_whoever_watches() {
         "the tone arrives at {sound:.0} dB"
     );
 
+    // A viewer with less room for the picture gets its frames smaller, and
+    // at full size again when it asks.
+    viewer.send(Command::SetViewHeight {
+        id: sharer.id(),
+        max_height: 360,
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (rate, size) = viewer.frames_over(2).await;
+    assert_eq!(size, Some((640, 360)));
+    assert!(rate > 50.0, "scaled down, {rate:.1} fps");
+    viewer.send(Command::SetViewHeight {
+        id: sharer.id(),
+        max_height: 0,
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(viewer.frames_over(1).await.1, Some((1280, 720)));
+
     // The voice is as quick as it was, in both directions.
     let voice_watching = viewer.median_delay().await;
     let voice_sharing = sharer.median_delay().await;

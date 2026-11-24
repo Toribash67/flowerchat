@@ -119,7 +119,24 @@ mod portal {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows lets a program look at any screen or window without asking, so
+/// the choosing is ours to offer. Until there is a picker, it is always
+/// the main monitor.
+#[cfg(windows)]
+mod portal {
+    use flowerchat_client::session::ScreenSource;
+
+    use super::{Cast, Pick};
+
+    pub async fn pick() -> Result<Pick, String> {
+        Ok(Pick::Chosen {
+            source: ScreenSource::PrimaryMonitor,
+            cast: Cast {},
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 mod portal {
     use super::Pick;
 
