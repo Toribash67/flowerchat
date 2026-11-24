@@ -1,5 +1,5 @@
 //! The flowerchat window: connects the views to a session.
-
+//NICE!
 // On Windows, a program is given a console window unless it says it has
 // windows of its own. Builds for trying things out keep the console, which
 // is where the log goes.
