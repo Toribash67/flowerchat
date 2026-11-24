@@ -23,7 +23,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
-const DEFAULT_SERVER: &str = "ws://127.0.0.1:8080/ws";
+const DEFAULT_SERVER: &str = "wss://chat.flowerboi.se/ws";
 const DEFAULT_ROOM: &str = "lounge";
 /// Longest the window goes without redrawing while in a room, so that
 /// timers and fading indicators keep moving when no events arrive.
