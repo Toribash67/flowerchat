@@ -6,13 +6,19 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
-use flowerchat_app::model::{RoomModel, meter_level};
+use flowerchat_app::model::{OwnShare, RoomModel, meter_level};
+use flowerchat_app::screen::{self, Cast, Pick};
 use flowerchat_app::settings::{DeviceChoice, SendMode, Settings};
 use flowerchat_app::talk::Talk;
 use flowerchat_app::theme;
-use flowerchat_app::views::{self, Action, Env, Screen, UiState};
+use flowerchat_app::views::{self, Action, Env, Picture, Screen, UiState};
 use flowerchat_client::audio::{self, AudioDevice, AudioDevices, DeviceWatch, MicCheck};
-use flowerchat_client::session::{self, AudioSettings, Command, Event, SessionConfig};
+use flowerchat_client::session::{
+    self, AudioSettings, Command, Event, FrameSink, SessionConfig, ShareSettings, ShareSource,
+    VideoFrame,
+};
+use flowerchat_client::video::parse_size;
+use flowerchat_protocol::PeerId;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
@@ -62,6 +68,25 @@ struct Args {
     /// For testing: play nothing, and print how long clicks took to arrive.
     #[arg(long)]
     measure: bool,
+    /// Scale a shared screen down to this height if it is taller. 0 sends
+    /// it at the size it has.
+    #[arg(long, default_value_t = 1080)]
+    share_height: u32,
+    /// Frames per second to share a screen at.
+    #[arg(long, default_value_t = 60)]
+    share_fps: u32,
+    /// For testing: share a moving test picture of this size, such as
+    /// 1920x1080, instead of asking which screen to share.
+    #[arg(long, value_name = "WIDTHxHEIGHT", value_parser = size)]
+    share_test: Option<(u32, u32)>,
+    /// For testing: lose this many percent of the packets that arrive, as
+    /// a poor network would.
+    #[arg(long, default_value_t = 0.0)]
+    lose: f64,
+}
+
+fn size(text: &str) -> Result<(u32, u32), String> {
+    parse_size(text).ok_or_else(|| "not a size like 1920x1080".to_owned())
 }
 
 /// A session that is being joined or is under way.
@@ -71,6 +96,11 @@ struct Active {
     shared: Arc<Mutex<Shared>>,
     /// The audio settings the session was last given.
     audio: AudioSettings,
+    /// The newest frame of a watched screen that has not been drawn yet,
+    /// and whose screen it is.
+    frame: Arc<Mutex<Option<(PeerId, VideoFrame)>>>,
+    /// The desktop's permission to read our screen, while we share it.
+    cast: Arc<Mutex<Option<Cast>>>,
 }
 
 /// What the window draws. A background task keeps it current, because the
@@ -100,7 +130,16 @@ struct App {
     /// `f32` from 0 to 1.
     lobby_level: Arc<AtomicU32>,
     talk: Arc<Talk>,
+    /// The screen being watched, as far as it has arrived.
+    picture: Option<egui::TextureHandle>,
+    /// Whose screen the session was last told a size for, and the size.
+    view_height: Option<(PeerId, u32)>,
 }
+
+/// The heights at which frames of a watched screen are asked for. The
+/// smallest that is no smaller than the picture on the display is used, so
+/// that resizing the window does not mean a new size every moment.
+const VIEW_HEIGHTS: [u32; 9] = [360, 540, 720, 900, 1080, 1260, 1440, 1800, 2160];
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, args: Args) -> anyhow::Result<Self> {
@@ -144,6 +183,8 @@ impl App {
             mic_check: None,
             lobby_level: Arc::default(),
             talk: Arc::default(),
+            picture: None,
+            view_height: None,
             args,
         };
         app.list_devices();
@@ -173,14 +214,46 @@ impl App {
         match action {
             Action::Join => return self.join(),
             Action::TestSpeakers => return self.test_speakers(),
+            Action::ShareScreen => return self.share_screen(),
             _ => {}
         }
         let Some(active) = &self.active else {
             return;
         };
+        // Giving back the permission to read the screen needs the runtime.
+        let _runtime = self.runtime.enter();
         let room = &mut active.shared.lock().unwrap().room;
         let command = match action {
-            Action::Join | Action::TestSpeakers => return,
+            Action::Join | Action::TestSpeakers | Action::ShareScreen => return,
+            Action::StopSharing => {
+                active.cast.lock().unwrap().take();
+                Command::StopShare
+            }
+            Action::Watch(id) => {
+                if let Some(watching) = &room.watching {
+                    if watching.id == id {
+                        return;
+                    }
+                    let previous = watching.id;
+                    room.stop_watching(&clock());
+                    let _ = active.commands.send(Command::Watch {
+                        id: previous,
+                        watch: false,
+                    });
+                }
+                room.watch(id, &clock());
+                // What is left of the last screen is not this one.
+                self.picture = None;
+                self.view_height = None;
+                Command::Watch { id, watch: true }
+            }
+            Action::StopWatching => {
+                let Some(id) = room.watching.as_ref().map(|watching| watching.id) else {
+                    return;
+                };
+                room.stop_watching(&clock());
+                Command::Watch { id, watch: false }
+            }
             Action::Leave => Command::Leave,
             Action::SetMuted(muted) => {
                 room.me.muted = muted;
@@ -206,6 +279,140 @@ impl App {
             }
         };
         let _ = active.commands.send(command);
+    }
+
+    /// Asks which screen to share, and shares it.
+    fn share_screen(&mut self) {
+        let Some(active) = &self.active else {
+            return;
+        };
+        let settings = ShareSettings {
+            max_height: (self.args.share_height > 0).then_some(self.args.share_height),
+            fps: self.args.share_fps,
+        };
+        active.shared.lock().unwrap().room.me.share = OwnShare::Starting;
+        if let Some((width, height)) = self.args.share_test {
+            let source = ShareSource::TestPicture { width, height };
+            let _ = active
+                .commands
+                .send(Command::StartShare { source, settings });
+            return;
+        }
+
+        let (commands, shared) = (active.commands.clone(), active.shared.clone());
+        let (cast_slot, ctx) = (active.cast.clone(), self.ctx.clone());
+        self.runtime.spawn(async move {
+            let outcome = screen::pick().await;
+            let mut shared = shared.lock().unwrap();
+            match outcome {
+                Ok(Pick::Chosen { source, cast }) => {
+                    *cast_slot.lock().unwrap() = Some(cast);
+                    let source = ShareSource::Screen(source);
+                    let _ = commands.send(Command::StartShare { source, settings });
+                }
+                Ok(Pick::Cancelled) => shared.room.me.share = OwnShare::NotSharing,
+                Err(reason) => {
+                    shared.room.me.share = OwnShare::NotSharing;
+                    let problem = format!("the screen cannot be shared, because {reason}");
+                    shared.room.log(&clock(), sentence(&problem));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Brings the picture of the watched screen up to date, and says what
+    /// there is to draw.
+    fn update_picture(&mut self, ctx: &egui::Context) -> Option<Picture> {
+        let watched = self.active.as_ref().and_then(|active| {
+            let shared = active.shared.lock().unwrap();
+            shared.room.watching.as_ref().map(|watching| watching.id)
+        });
+        let frame = self
+            .active
+            .as_ref()
+            .and_then(|active| active.frame.lock().unwrap().take());
+        let Some(watched) = watched else {
+            self.picture = None;
+            return None;
+        };
+        if let Some((from, frame)) = frame
+            && from == watched
+        {
+            let size = [frame.width as usize, frame.height as usize];
+            // Frames have no transparency, so their colours are already
+            // what egui calls premultiplied.
+            let image = egui::ColorImage::from_rgba_premultiplied(size, frame.rgba());
+            let options = egui::TextureOptions::LINEAR;
+            match &mut self.picture {
+                Some(texture) => texture.set(image, options),
+                None => self.picture = Some(ctx.load_texture("shared-screen", image, options)),
+            }
+        }
+        self.picture.as_ref().map(|texture| Picture {
+            texture: texture.id(),
+            size: texture.size_vec2(),
+        })
+    }
+
+    /// Asks for the frames of the watched screen at about the size they are
+    /// drawn at. Larger ones would cost time to prepare, for nothing.
+    fn sync_view_height(&mut self) {
+        let Some(active) = &self.active else {
+            self.view_height = None;
+            return;
+        };
+        let watched = {
+            let shared = active.shared.lock().unwrap();
+            shared.room.watching.as_ref().map(|watching| watching.id)
+        };
+        let (Some(id), Some(drawn)) = (watched, self.ui.picture_height) else {
+            return;
+        };
+        // Past the largest step, frames come at whatever size is sent.
+        let max_height = VIEW_HEIGHTS
+            .into_iter()
+            .find(|height| *height >= drawn)
+            .unwrap_or(0);
+        if self.view_height != Some((id, max_height)) {
+            self.view_height = Some((id, max_height));
+            let _ = active
+                .commands
+                .send(Command::SetViewHeight { id, max_height });
+        }
+    }
+
+    /// Shows the watched screen in a window of its own, for as long as the
+    /// user wants it there.
+    fn popped_out_window(&mut self, ctx: &egui::Context, picture: Option<Picture>) {
+        let name = self.active.as_ref().and_then(|active| {
+            let shared = active.shared.lock().unwrap();
+            let watching = shared.room.watching.as_ref()?;
+            Some(shared.room.peer(watching.id)?.name.clone())
+        });
+        let Some(name) = name else {
+            self.ui.popped_out = false;
+            return;
+        };
+        let viewport = egui::ViewportBuilder::default()
+            .with_title(format!("{name}'s screen · flowerchat"))
+            .with_app_id("flowerchat")
+            .with_inner_size([1280.0, 720.0]);
+        let id = egui::ViewportId::from_hash_of("shared-screen");
+        let closed = ctx.show_viewport_immediate(id, viewport, |ui, _| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme::STAGE))
+                .show(ui, |ui| {
+                    if let Some(picture) = picture {
+                        let height = views::draw_picture(ui, ui.max_rect(), picture);
+                        self.ui.picture_height = Some(height);
+                    }
+                });
+            ui.input(|input| input.viewport().close_requested())
+        });
+        if closed {
+            self.ui.popped_out = false;
+        }
     }
 
     /// The audio settings to use, given what is chosen and plugged in.
@@ -323,6 +530,14 @@ impl App {
         );
         let audio = self.audio();
         let transmitting = self.talk.transmitting();
+        // Only the newest frame is kept: the window draws when it can, and
+        // has no use for frames it was too late for.
+        let frame: Arc<Mutex<Option<(PeerId, VideoFrame)>>> = Arc::default();
+        let (slot, ctx) = (frame.clone(), self.ctx.clone());
+        let frames: FrameSink = Arc::new(move |from, frame| {
+            *slot.lock().unwrap() = Some((from, frame));
+            ctx.request_repaint();
+        });
         let config = SessionConfig {
             server: server.clone(),
             room: room.clone(),
@@ -331,6 +546,8 @@ impl App {
             transmitting,
             test_tone: self.args.test_tone,
             measure: self.args.measure,
+            frames: Some(frames),
+            incoming_loss: self.args.lose / 100.0,
         };
 
         let (commands, command_rx) = unbounded_channel();
@@ -339,8 +556,13 @@ impl App {
             room: RoomModel::new(&room, host_of(&server), &name),
             joined_at: None,
         }));
-        self.runtime
-            .spawn(follow(events, shared.clone(), self.ctx.clone()));
+        let cast: Arc<Mutex<Option<Cast>>> = Arc::default();
+        self.runtime.spawn(follow(
+            events,
+            shared.clone(),
+            cast.clone(),
+            self.ctx.clone(),
+        ));
         self.talk.attach(commands.clone(), transmitting);
         self.active = Some(Active {
             commands,
@@ -349,6 +571,8 @@ impl App {
                 .spawn(session::run(config, command_rx, event_tx)),
             shared,
             audio,
+            frame,
+            cast,
         });
     }
 }
@@ -357,6 +581,7 @@ impl App {
 async fn follow(
     mut events: UnboundedReceiver<Event>,
     shared: Arc<Mutex<Shared>>,
+    cast: Arc<Mutex<Option<Cast>>>,
     ctx: egui::Context,
 ) {
     while let Some(event) = events.recv().await {
@@ -368,13 +593,20 @@ async fn follow(
                 Event::ClickDelay(delay_ns) => {
                     println!("click delay {:.1} ms", *delay_ns as f64 / 1e6);
                 }
+                // However a share ends, the screen is no longer ours to
+                // read.
+                Event::OwnShare(None) | Event::ShareFailed(_) => {
+                    cast.lock().unwrap().take();
+                }
                 _ => {}
             }
             shared.room.apply(event, now, &clock());
         }
         ctx.request_repaint();
     }
-    // The session is over; the window has to redraw to notice.
+    // The session is over, and with it any share.
+    cast.lock().unwrap().take();
+    // The window has to redraw to notice.
     ctx.request_repaint();
 }
 
@@ -382,10 +614,15 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.reap();
         self.sync_audio(ui.ctx());
+        let picture = self.update_picture(ui.ctx());
+        if self.ui.popped_out {
+            self.popped_out_window(ui.ctx(), picture);
+        }
         let env = Env {
             devices: &self.devices,
             global_key: self.talk.global_key(),
             transmitting: self.talk.transmitting(),
+            picture,
         };
         let mic_level = f32::from_bits(self.lobby_level.load(Ordering::Relaxed));
         let actions = match &self.active {
@@ -413,6 +650,7 @@ impl eframe::App for App {
                 views::draw(ui, screen, &env, &mut self.ui)
             }
         };
+        self.sync_view_height();
         for action in actions {
             self.perform(action);
         }

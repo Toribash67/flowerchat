@@ -18,13 +18,17 @@ use flowerchat_client::audio::{AudioDevice, AudioDevices};
 use flowerchat_client::session::{ConnectionState, Route};
 use flowerchat_protocol::PeerId;
 
-use crate::model::{Entry, EntryKind, PeerRow, RoomModel};
+use crate::model::{Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
 use crate::settings::{DeviceChoice, MAX_RECEIVE_BUFFER_MS, SendMode, Settings};
 use crate::talk::GlobalKey;
 use crate::theme::{self, muted, strong};
 
 const SIDE_WIDTH: f32 = 232.0;
+/// The left column while a screen is open: it holds the list of people too.
+const STREAM_SIDE_WIDTH: f32 = 264.0;
 const CHAT_WIDTH: f32 = 300.0;
+/// Height of the bars above and below a shared screen.
+const BAR_HEIGHT: f32 = 44.0;
 const AUDIO_WIDTH: f32 = 280.0;
 const BIG_BUTTON_HEIGHT: f32 = 30.0;
 const ICON_SIZE: f32 = 16.0;
@@ -50,6 +54,16 @@ pub struct Env<'a> {
     /// Whether the microphone is let out right now, as far as the choice
     /// between open mic and push-to-talk goes.
     pub transmitting: bool,
+    /// The latest frame of the screen being watched, once there is one.
+    pub picture: Option<Picture>,
+}
+
+/// A frame of a shared screen, ready to draw.
+#[derive(Debug, Clone, Copy)]
+pub struct Picture {
+    pub texture: egui::TextureId,
+    /// Width and height in pixels.
+    pub size: Vec2,
 }
 
 /// Input that lives between frames but is not part of the room.
@@ -68,6 +82,28 @@ pub struct UiState {
     /// The receive buffer while its slider is being dragged. It becomes a
     /// setting when the slider is let go.
     pub buffer_draft: Option<u32>,
+    /// What the column beside a shared screen shows.
+    pub beside_screen: Beside,
+    /// Whether the shared screen fills the window.
+    pub maximized: bool,
+    /// Whether the chat is open beside a screen that fills the window.
+    pub chat_while_maximized: bool,
+    /// Whether the shared screen is shown in a window of its own. The
+    /// caller draws that window.
+    pub popped_out: bool,
+    /// How many chat messages had arrived when the chat was last on screen.
+    pub messages_seen: usize,
+    /// How tall, in pixels of the display, the shared screen was last
+    /// drawn. The caller asks for frames of about that size.
+    pub picture_height: Option<u32>,
+}
+
+/// What the column beside a shared screen shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Beside {
+    #[default]
+    Chat,
+    Audio,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -75,6 +111,7 @@ pub enum Tab {
     #[default]
     People,
     Chat,
+    Screens,
     Audio,
 }
 
@@ -92,6 +129,12 @@ pub enum Action {
     SendChat(String),
     /// Play a sound on the chosen speakers.
     TestSpeakers,
+    /// Let the user pick a screen and share it.
+    ShareScreen,
+    StopSharing,
+    /// Open this peer's shared screen, in place of any other.
+    Watch(PeerId),
+    StopWatching,
 }
 
 /// Whether the push-to-talk key chosen in the window is being held. Typing
@@ -157,8 +200,22 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState)
                     join_form(ui, connecting, error, state, &mut actions);
                 });
         }
-        Screen::Room(room) if wide => room_wide(ui, room, env, state, &mut actions),
-        Screen::Room(room) => room_narrow(ui, room, env, state, &mut actions),
+        Screen::Room(room) => {
+            if room.watching.is_none() {
+                state.maximized = false;
+                state.popped_out = false;
+            }
+            match &room.watching {
+                Some(watching) if wide && state.maximized => {
+                    room_maximized(ui, room, watching, env, state, &mut actions);
+                }
+                Some(watching) if wide => {
+                    room_stream(ui, room, watching, env, state, &mut actions);
+                }
+                _ if wide => room_wide(ui, room, env, state, &mut actions),
+                _ => room_narrow(ui, room, env, state, &mut actions),
+            }
+        }
     }
     actions
 }
@@ -231,7 +288,7 @@ fn room_wide(
                 top: 12,
                 ..Margin::ZERO
             }))
-            .show(ui, |ui| me_block(ui, room, mode, actions));
+            .show(ui, |ui| me_block(ui, room, mode, true, actions));
         CentralPanel::no_frame().show(ui, |ui| {
             app_name(ui);
             ui.add_space(10.0);
@@ -292,16 +349,15 @@ fn people_table(ui: &mut Ui, room: &RoomModel, actions: &mut Vec<Action>) {
     TableBuilder::new(ui)
         .cell_layout(Layout::left_to_right(Align::Center))
         .column(Column::exact(18.0))
-        .column(Column::remainder().at_least(80.0))
-        .column(Column::exact(100.0))
-        .column(Column::exact(64.0))
-        .column(Column::exact(58.0))
-        .column(Column::exact(50.0))
-        .column(Column::exact(54.0))
-        .column(Column::exact(76.0))
-        // A gap, so the sliders do not run into the right-aligned figures.
-        .column(Column::exact(8.0))
-        .column(Column::exact(136.0))
+        .column(Column::remainder().at_least(64.0))
+        .column(Column::exact(96.0))
+        .column(Column::exact(56.0))
+        .column(Column::exact(52.0))
+        .column(Column::exact(44.0))
+        .column(Column::exact(48.0))
+        .column(Column::exact(70.0))
+        .column(Column::exact(70.0))
+        .column(Column::exact(118.0))
         .header(24.0, |mut header| {
             header.col(|_| {});
             for text in ["Name", "Status", "Route"] {
@@ -312,10 +368,14 @@ fn people_table(ui: &mut Ui, room: &RoomModel, actions: &mut Vec<Action>) {
             for text in ["Delay", "Loss", "Jitter", "Receiving"] {
                 header.col(|ui| numeric(ui, heading(text)));
             }
-            header.col(|_| {});
-            header.col(|ui| {
-                ui.label(heading("Volume"));
-            });
+            // Left-aligned text straight after right-aligned figures needs
+            // some air.
+            for text in ["Screen", "Volume"] {
+                header.col(|ui| {
+                    ui.add_space(6.0);
+                    ui.label(heading(text));
+                });
+            }
         })
         .body(|mut body| {
             for peer in &room.peers {
@@ -335,8 +395,18 @@ fn people_table(ui: &mut Ui, room: &RoomModel, actions: &mut Vec<Action>) {
                     cells.col(|ui| numeric(ui, figure(percent(stats.loss_percent))));
                     cells.col(|ui| numeric(ui, figure(millis(stats.jitter_ms))));
                     cells.col(|ui| numeric(ui, figure(kbps(stats.receiving_kbps))));
-                    cells.col(|_| {});
-                    cells.col(|ui| volume(ui, peer, 82.0, actions));
+                    cells.col(|ui| {
+                        ui.add_space(6.0);
+                        if peer.sharing.is_none() {
+                            ui.label(figure("–".into()));
+                        } else if watch_button(ui, peer).clicked() {
+                            actions.push(Action::Watch(peer.id));
+                        }
+                    });
+                    cells.col(|ui| {
+                        ui.add_space(6.0);
+                        volume(ui, peer, 62.0, actions);
+                    });
                 });
             }
         });
@@ -353,13 +423,6 @@ fn room_narrow(
 ) {
     let bar = |margin: Margin| Frame::new().fill(theme::PANEL).inner_margin(margin);
     let mode = mode_text(env, state);
-    let tab_button = |label: &str, selected: bool| {
-        if selected {
-            Button::new(strong(label)).fill(theme::CONTROL_HOVER)
-        } else {
-            Button::new(RichText::new(label).color(theme::MUTED)).fill(egui::Color32::TRANSPARENT)
-        }
-    };
 
     Panel::top("header")
         .resizable(false)
@@ -389,7 +452,19 @@ fn room_narrow(
                 });
             });
             row(ui, theme::CONTROL_HEIGHT, |ui| {
-                for (tab, label) in [(Tab::People, "People"), (Tab::Chat, "Chat")] {
+                let chat = match unread(room, state) {
+                    0 => "Chat".to_owned(),
+                    new => format!("Chat · {new} new"),
+                };
+                let screens = match room.sharing_count() {
+                    0 => "Screens".to_owned(),
+                    shared => format!("Screens · {shared}"),
+                };
+                for (tab, label) in [
+                    (Tab::People, "People"),
+                    (Tab::Chat, chat.as_str()),
+                    (Tab::Screens, screens.as_str()),
+                ] {
                     if ui.add(tab_button(label, state.tab == tab)).clicked() {
                         state.tab = tab;
                     }
@@ -400,7 +475,8 @@ fn room_narrow(
     Panel::bottom("me")
         .resizable(false)
         .frame(bar(Margin::symmetric(12, 10)))
-        .show(ui, |ui| me_block(ui, room, mode, actions));
+        // The Screens tab has what a wider window shows here about sharing.
+        .show(ui, |ui| me_block(ui, room, mode, false, actions));
 
     CentralPanel::default()
         .frame(
@@ -411,25 +487,11 @@ fn room_narrow(
         .show(ui, |ui| match state.tab {
             Tab::People => {
                 ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    for peer in &room.peers {
-                        row(ui, 40.0, |ui| {
-                            indicator(ui, peer);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                ui.add_space(3.0);
-                                ui.label(peer_name(peer));
-                                ui.label(muted(summary_line(peer)));
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                // Laid out from the right, so the slider
-                                // comes out left of its percentage.
-                                volume_rtl(ui, peer, 72.0, actions);
-                            });
-                        });
-                    }
+                    people_rows(ui, room, 72.0, actions);
                 });
             }
             Tab::Chat => chat(ui, room, state, actions, false),
+            Tab::Screens => screens_tab(ui, room, env, state, actions),
             Tab::Audio => {
                 ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                     ui.add_space(4.0);
@@ -437,6 +499,484 @@ fn room_narrow(
                 });
             }
         });
+}
+
+/// The people in the room as a list, for where there is no room for the
+/// table.
+fn people_rows(ui: &mut Ui, room: &RoomModel, slider_width: f32, actions: &mut Vec<Action>) {
+    let watched = room.watching.as_ref().map(|watching| watching.id);
+    for peer in &room.peers {
+        row(ui, 40.0, |ui| {
+            indicator(ui, peer);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    ui.label(peer_name(peer));
+                    if peer.sharing.is_some() {
+                        let tag = |text: &str| strong(text).size(theme::TINY).color(theme::ACCENT);
+                        if watched == Some(peer.id) {
+                            ui.label(tag("· sharing"));
+                        } else {
+                            let link = Button::new(tag("· watch screen")).frame(false);
+                            if ui.add(link).clicked() {
+                                actions.push(Action::Watch(peer.id));
+                            }
+                        }
+                    }
+                });
+                ui.label(muted(summary_line(peer)));
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // Laid out from the right, so the slider comes out left of
+                // its percentage.
+                volume_rtl(ui, peer, slider_width, actions);
+            });
+        });
+    }
+}
+
+// --- Room, with a shared screen open ----------------------------------------
+
+/// The room around someone's shared screen.
+fn room_stream(
+    ui: &mut Ui,
+    room: &RoomModel,
+    watching: &Watching,
+    env: &Env<'_>,
+    state: &mut UiState,
+    actions: &mut Vec<Action>,
+) {
+    let mode = mode_text(env, state);
+    Panel::left("stream-people")
+        .exact_size(STREAM_SIDE_WIDTH)
+        .resizable(false)
+        .frame(
+            Frame::new()
+                .fill(theme::PANEL)
+                .inner_margin(Margin::symmetric(14, 12)),
+        )
+        .show(ui, |ui| {
+            Panel::bottom("me")
+                .resizable(false)
+                .frame(Frame::new().inner_margin(Margin {
+                    top: 10,
+                    ..Margin::ZERO
+                }))
+                .show(ui, |ui| me_block(ui, room, mode, true, actions));
+            CentralPanel::no_frame().show(ui, |ui| {
+                row(ui, 36.0, |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Leave").clicked() {
+                            actions.push(Action::Leave);
+                        }
+                        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(strong(&room.room).size(15.0));
+                            let status = format!(
+                                "Connected · {} · {}",
+                                room.peers.len() + 1,
+                                clock(room.in_room)
+                            );
+                            ui.add(egui::Label::new(muted(status)).truncate());
+                        });
+                    });
+                });
+                ui.add_space(6.0);
+                ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    people_rows(ui, room, 60.0, actions);
+                });
+            });
+        });
+
+    Panel::right("beside-screen")
+        .exact_size(CHAT_WIDTH)
+        .resizable(false)
+        .frame(
+            Frame::new()
+                .fill(theme::PANEL)
+                .inner_margin(Margin::symmetric(14, 10)),
+        )
+        .show(ui, |ui| {
+            Panel::top("beside-screen-tabs")
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(Frame::new().inner_margin(Margin {
+                    bottom: 8,
+                    ..Margin::ZERO
+                }))
+                .show(ui, |ui| {
+                    row(ui, theme::CONTROL_HEIGHT, |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        for (beside, label) in [(Beside::Chat, "Chat"), (Beside::Audio, "Audio")] {
+                            let selected = state.beside_screen == beside;
+                            if ui.add(tab_button(label, selected)).clicked() {
+                                state.beside_screen = beside;
+                            }
+                        }
+                    });
+                });
+            match state.beside_screen {
+                Beside::Chat => chat(ui, room, state, actions, false),
+                Beside::Audio => {
+                    CentralPanel::no_frame().show(ui, |ui| {
+                        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                            audio_stacked(ui, env, state, actions, None);
+                        });
+                    });
+                }
+            }
+        });
+
+    let name = sharer_name(room, watching);
+    let figures = StreamFigures::of(room, watching, state);
+    CentralPanel::default()
+        .frame(Frame::new().fill(theme::BACKGROUND))
+        .show(ui, |ui| {
+            Panel::top("stage-header")
+                .exact_size(BAR_HEIGHT)
+                .resizable(false)
+                .frame(Frame::new().inner_margin(Margin::symmetric(12, 0)))
+                .show(ui, |ui| {
+                    row(ui, BAR_HEIGHT, |ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let maximize = Button::new(icon_label(
+                                icon::CORNERS_OUT,
+                                "Maximize",
+                                theme::ON_ACCENT,
+                                true,
+                            ))
+                            .fill(theme::ACCENT);
+                            if ui.add(maximize).clicked() {
+                                state.maximized = true;
+                            }
+                            pop_out_button(ui, state);
+                            if ui.button("Stop watching").clicked() {
+                                actions.push(Action::StopWatching);
+                            }
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.label(strong(format!("{name}'s screen")));
+                                let watchers = room.watchers_of(watching.id);
+                                let text =
+                                    format!("{} watching: {}", watchers.len(), watchers.join(", "));
+                                ui.add(egui::Label::new(muted(text)).truncate());
+                            });
+                        });
+                    });
+                });
+            Panel::bottom("stage-figures")
+                .resizable(false)
+                .frame(Frame::new().inner_margin(Margin::symmetric(16, 12)))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 24.0;
+                    ui.columns(3, |columns| {
+                        let [picture, delivery, _] = columns else {
+                            return;
+                        };
+                        figure_group(
+                            picture,
+                            "Picture",
+                            &[
+                                ("Resolution", &figures.resolution),
+                                ("Frame rate", &figures.frame_rate),
+                                ("Codec", "H.264"),
+                                ("Bitrate", &figures.bitrate),
+                            ],
+                        );
+                        figure_group(
+                            delivery,
+                            "Delivery",
+                            &[
+                                ("Delay", &figures.delay),
+                                ("Frames dropped", &figures.frames_dropped),
+                                ("Packets lost", &figures.packets_lost),
+                                ("Route", &figures.route),
+                            ],
+                        );
+                    });
+                });
+            CentralPanel::no_frame().show(ui, |ui| stage(ui, &name, env.picture, state));
+        });
+}
+
+/// The shared screen across the whole window, with the room reduced to a
+/// bar above and a bar below.
+fn room_maximized(
+    ui: &mut Ui,
+    room: &RoomModel,
+    watching: &Watching,
+    env: &Env<'_>,
+    state: &mut UiState,
+    actions: &mut Vec<Action>,
+) {
+    let bar = || {
+        Frame::new()
+            .fill(theme::BACKGROUND)
+            .inner_margin(Margin::symmetric(12, 0))
+    };
+    let name = sharer_name(room, watching);
+    let figures = StreamFigures::of(room, watching, state);
+
+    Panel::top("maximized-top")
+        .exact_size(BAR_HEIGHT)
+        .resizable(false)
+        .frame(bar())
+        .show(ui, |ui| {
+            row(ui, BAR_HEIGHT, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let restore =
+                        Button::new(icon_label(icon::CORNERS_IN, "Restore", theme::TEXT, false));
+                    if ui.add(restore).clicked() {
+                        state.maximized = false;
+                    }
+                    pop_out_button(ui, state);
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        ui.label(strong(format!("{name}'s screen")));
+                        let line = format!(
+                            "{} · {} · H.264 · {} · delay {} · {} frames dropped",
+                            figures.resolution,
+                            figures.frame_rate,
+                            figures.bitrate,
+                            figures.delay,
+                            figures.frames_dropped
+                        );
+                        ui.add(egui::Label::new(muted(line)).truncate());
+                    });
+                });
+            });
+        });
+
+    Panel::bottom("maximized-bottom")
+        .exact_size(BAR_HEIGHT)
+        .resizable(false)
+        .frame(bar())
+        .show(ui, |ui| {
+            row(ui, BAR_HEIGHT, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let me = &room.me;
+                    let (label, glyph) = if me.deafened {
+                        ("Undeafen", icon::SPEAKER_SLASH)
+                    } else {
+                        ("Deafen", icon::SPEAKER_HIGH)
+                    };
+                    if ui.add(toggle(glyph, label, me.deafened)).clicked() {
+                        actions.push(Action::SetDeafened(!me.deafened));
+                    }
+                    let (label, glyph) = if me.muted {
+                        ("Unmute", icon::MICROPHONE_SLASH)
+                    } else {
+                        ("Mute", icon::MICROPHONE)
+                    };
+                    if ui.add(toggle(glyph, label, me.muted)).clicked() {
+                        actions.push(Action::SetMuted(!me.muted));
+                    }
+                    let open = state.chat_while_maximized;
+                    if ui.add(tab_button("Chat", open)).clicked() {
+                        state.chat_while_maximized = !open;
+                    }
+                    match unread(room, state) {
+                        0 => {}
+                        1 => drop(ui.label(muted("1 new message"))),
+                        new => drop(ui.label(muted(format!("{new} new messages")))),
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for peer in room.peers.iter().filter(|peer| peer.connected()) {
+                            indicator(ui, peer);
+                            let color = if peer.muted {
+                                theme::WARN
+                            } else if peer.speaking {
+                                theme::TEXT
+                            } else {
+                                theme::MUTED
+                            };
+                            ui.label(RichText::new(&peer.name).color(color));
+                            ui.add_space(10.0);
+                        }
+                    });
+                });
+            });
+        });
+
+    if state.chat_while_maximized {
+        Panel::right("maximized-chat")
+            .exact_size(CHAT_WIDTH)
+            .resizable(false)
+            .frame(
+                Frame::new()
+                    .fill(theme::PANEL)
+                    .inner_margin(Margin::symmetric(14, 12)),
+            )
+            .show(ui, |ui| chat(ui, room, state, actions, true));
+    }
+
+    CentralPanel::default()
+        .frame(Frame::new().fill(theme::STAGE))
+        .show(ui, |ui| stage(ui, &name, env.picture, state));
+}
+
+/// What the Screens tab of a narrow window shows: the screen being
+/// watched, what the others share, and our own share.
+fn screens_tab(
+    ui: &mut Ui,
+    room: &RoomModel,
+    env: &Env<'_>,
+    state: &mut UiState,
+    actions: &mut Vec<Action>,
+) {
+    ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        if let Some(watching) = &room.watching {
+            let name = sharer_name(room, watching);
+            let width = ui.available_width();
+            let size = Vec2::new(width, (width * 9.0 / 16.0).round());
+            ui.allocate_ui(size, |ui| stage(ui, &name, env.picture, state));
+            let figures = StreamFigures::of(room, watching, state);
+            for (key, value) in [
+                ("Resolution", &figures.resolution),
+                ("Frame rate", &figures.frame_rate),
+                ("Bitrate", &figures.bitrate),
+                ("Delay", &figures.delay),
+                ("Frames dropped", &figures.frames_dropped),
+                ("Packets lost", &figures.packets_lost),
+            ] {
+                kv(ui, key, value.as_str());
+            }
+            ui.add_space(8.0);
+        }
+
+        ui.label(muted("Shared by others"));
+        let watched = room.watching.as_ref().map(|watching| watching.id);
+        let mut anyone = false;
+        for peer in &room.peers {
+            let Some(sharing) = &peer.sharing else {
+                continue;
+            };
+            anyone = true;
+            row(ui, 34.0, |ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if watched == Some(peer.id) {
+                        if ui.button("Stop watching").clicked() {
+                            actions.push(Action::StopWatching);
+                        }
+                    } else if watch_button(ui, peer).clicked() {
+                        actions.push(Action::Watch(peer.id));
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(peer_name(peer));
+                        let text = format!(
+                            "{} · {} fps",
+                            resolution(sharing.width, sharing.height),
+                            sharing.fps
+                        );
+                        ui.add(egui::Label::new(muted(text)).truncate());
+                    });
+                });
+            });
+        }
+        if !anyone {
+            ui.label("Nobody else is sharing a screen.");
+        }
+        ui.add_space(8.0);
+
+        ui.label(muted("Your screen"));
+        own_share_figures(ui, room);
+        ui.add_space(2.0);
+        share_button(ui, &room.me.share, actions);
+    });
+}
+
+fn sharer_name(room: &RoomModel, watching: &Watching) -> String {
+    room.peer(watching.id)
+        .map_or_else(|| format!("peer {}", watching.id), |peer| peer.name.clone())
+}
+
+/// Moves the shared screen into a window of its own, or back.
+fn pop_out_button(ui: &mut Ui, state: &mut UiState) {
+    let label = if state.popped_out {
+        "Bring back"
+    } else {
+        "Pop out"
+    };
+    if ui.button(label).clicked() {
+        state.popped_out = !state.popped_out;
+    }
+}
+
+/// The shared screen itself, as large as fits the space available.
+fn stage(ui: &mut Ui, name: &str, picture: Option<Picture>, state: &mut UiState) {
+    let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::ZERO, theme::STAGE);
+    let note = match picture {
+        _ if state.popped_out => format!("{name}'s screen is in its own window"),
+        Some(picture) => {
+            state.picture_height = Some(draw_picture(ui, rect, picture));
+            return;
+        }
+        None => {
+            // Until a frame shows the shape of the picture, the usual
+            // shape of a screen is assumed.
+            let fitted = fit(rect, Vec2::new(16.0, 9.0));
+            state.picture_height = Some(display_pixels(ui, fitted.height()));
+            format!("Waiting for {name}'s screen…")
+        }
+    };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        note,
+        FontId::proportional(theme::BODY),
+        theme::MUTED,
+    );
+}
+
+/// Draws `picture` in the middle of `within`, as large as fits without
+/// changing its shape. Returns how tall that is in pixels of the display.
+pub fn draw_picture(ui: &Ui, within: Rect, picture: Picture) -> u32 {
+    let fitted = fit(within, picture.size);
+    let whole = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    ui.painter()
+        .image(picture.texture, fitted, whole, egui::Color32::WHITE);
+    display_pixels(ui, fitted.height())
+}
+
+/// The largest rectangle of the given shape that fits in the middle of
+/// `within`.
+fn fit(within: Rect, shape: Vec2) -> Rect {
+    let shape = shape.max(Vec2::splat(1.0));
+    let scale = (within.width() / shape.x).min(within.height() / shape.y);
+    Rect::from_center_size(within.center(), shape * scale)
+}
+
+/// A length of the interface in pixels of the display.
+fn display_pixels(ui: &Ui, length: f32) -> u32 {
+    (length * ui.ctx().pixels_per_point()).ceil().max(0.0) as u32
+}
+
+/// A heading with labelled figures under it.
+fn figure_group(ui: &mut Ui, heading: &str, figures: &[(&str, &str)]) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(8.0, 2.0);
+        ui.label(strong(heading).size(theme::SMALL).color(theme::MUTED));
+        ui.add_space(4.0);
+        for (key, value) in figures {
+            kv(ui, key, *value);
+        }
+    });
+}
+
+/// A button for one of several views, lit while its view is the one shown.
+fn tab_button<'a>(label: &str, selected: bool) -> Button<'a> {
+    if selected {
+        Button::new(strong(label)).fill(theme::CONTROL_HOVER)
+    } else {
+        Button::new(RichText::new(label).color(theme::MUTED)).fill(egui::Color32::TRANSPARENT)
+    }
 }
 
 // --- Audio settings ---------------------------------------------------------
@@ -812,8 +1352,9 @@ fn app_name(ui: &mut Ui) {
     ui.label(strong("flowerchat").color(theme::MUTED));
 }
 
-/// Your own status and controls: what you are sending, and mute and deafen.
-fn me_block(ui: &mut Ui, room: &RoomModel, mode: &str, actions: &mut Vec<Action>) {
+/// Your own status and controls: what you are sending, mute and deafen,
+/// and with `screen` also what you share of your screen.
+fn me_block(ui: &mut Ui, room: &RoomModel, mode: &str, screen: bool, actions: &mut Vec<Action>) {
     let me = &room.me;
     row(ui, 20.0, |ui| {
         ui.label(strong(&me.name));
@@ -830,6 +1371,9 @@ fn me_block(ui: &mut Ui, room: &RoomModel, mode: &str, actions: &mut Vec<Action>
     kv(ui, "Sending", kbps(me.sending_kbps));
     kv(ui, "Codec", "Opus, 48 kHz");
     kv(ui, "Mode", mode);
+    if screen {
+        own_share_figures(ui, room);
+    }
     ui.add_space(4.0);
 
     let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
@@ -857,6 +1401,58 @@ fn me_block(ui: &mut Ui, room: &RoomModel, mode: &str, actions: &mut Vec<Action>
             actions.push(Action::SetDeafened(!me.deafened));
         }
     });
+    if screen {
+        share_button(ui, &me.share, actions);
+    }
+}
+
+/// What we share of our screen, and with whom.
+fn own_share_figures(ui: &mut Ui, room: &RoomModel) {
+    kv(ui, "Screen", own_share_text(&room.me.share));
+    if matches!(room.me.share, OwnShare::Sharing(_)) {
+        kv(
+            ui,
+            "Watched by",
+            name_list(&room.my_watchers(), "Nobody yet"),
+        );
+    }
+}
+
+/// Starts and stops sharing our own screen, across the width available.
+fn share_button(ui: &mut Ui, share: &OwnShare, actions: &mut Vec<Action>) {
+    let size = Vec2::new(ui.available_width(), BIG_BUTTON_HEIGHT);
+    match share {
+        OwnShare::NotSharing => {
+            let button = toggle(icon::MONITOR, "Share screen", false);
+            if ui.add_sized(size, button).clicked() {
+                actions.push(Action::ShareScreen);
+            }
+        }
+        OwnShare::Starting => {
+            let button = toggle(icon::MONITOR, "Choosing a screen…", false);
+            ui.add_enabled(false, |ui: &mut Ui| ui.add_sized(size, button));
+        }
+        OwnShare::Sharing(_) => {
+            let button = toggle(icon::MONITOR, "Stop sharing", true);
+            if ui.add_sized(size, button).clicked() {
+                actions.push(Action::StopSharing);
+            }
+        }
+    }
+}
+
+/// The small button that opens someone's shared screen.
+fn watch_button(ui: &mut Ui, peer: &PeerRow) -> egui::Response {
+    let text = strong("Watch").size(theme::SMALL).color(theme::ON_ACCENT);
+    let button = Button::new(text)
+        .fill(theme::ACCENT)
+        .min_size(Vec2::new(0.0, 24.0));
+    let response = ui.add(button);
+    response.widget_info(|| {
+        let label = format!("Watch {}'s screen", peer.name);
+        WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), label)
+    });
+    response
 }
 
 /// A button that turns orange while the state it controls is on.
@@ -897,6 +1493,7 @@ fn chat(
     actions: &mut Vec<Action>,
     titled: bool,
 ) {
+    state.messages_seen = message_count(room);
     Panel::bottom("chat-input")
         .resizable(false)
         .show_separator_line(false)
@@ -1112,10 +1709,105 @@ fn summary_line(peer: &PeerRow) -> String {
 fn headcount(room: &RoomModel) -> String {
     let total = room.peers.len() + 1;
     let connected = room.connected_count();
-    match room.peers.len() {
-        0 => "Only you so far".into(),
+    let people = match room.peers.len() {
+        0 => return "Only you so far".into(),
         others if others == connected => format!("{total} in the room"),
         others => format!("{total} in the room, {connected} of {others} connected"),
+    };
+    match room.sharing_count() {
+        0 => people,
+        sharing => format!("{people}, {sharing} sharing a screen"),
+    }
+}
+
+fn message_count(room: &RoomModel) -> usize {
+    room.timeline
+        .iter()
+        .filter(|entry| matches!(entry.kind, EntryKind::Message { .. }))
+        .count()
+}
+
+/// How many chat messages have arrived since the chat was last on screen.
+fn unread(room: &RoomModel, state: &UiState) -> usize {
+    message_count(room).saturating_sub(state.messages_seen)
+}
+
+fn own_share_text(share: &OwnShare) -> String {
+    match share {
+        OwnShare::NotSharing => "Not sharing".into(),
+        OwnShare::Starting => "Starting…".into(),
+        OwnShare::Sharing(sharing) => format!(
+            "{} · {} fps",
+            resolution(sharing.width, sharing.height),
+            sharing.fps
+        ),
+    }
+}
+
+/// Names in a row, or `nobody` when there are none.
+fn name_list(names: &[String], nobody: &str) -> String {
+    if names.is_empty() {
+        nobody.to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn resolution(width: u32, height: u32) -> String {
+    if width == 0 {
+        "–".into()
+    } else {
+        format!("{width} × {height}")
+    }
+}
+
+/// A video bitrate, in the unit that suits its size.
+fn bitrate(kbps: Option<f64>) -> String {
+    match kbps {
+        Some(kbps) if kbps >= 1000.0 => format!("{:.1} Mbps", kbps / 1000.0),
+        Some(kbps) => format!("{kbps:.0} kbps"),
+        None => "–".into(),
+    }
+}
+
+/// What the interface shows about a screen being watched.
+struct StreamFigures {
+    resolution: String,
+    frame_rate: String,
+    bitrate: String,
+    delay: String,
+    frames_dropped: String,
+    packets_lost: String,
+    route: String,
+}
+
+impl StreamFigures {
+    fn of(room: &RoomModel, watching: &Watching, state: &UiState) -> Self {
+        let stats = &watching.stats;
+        let peer = room.peer(watching.id);
+        let started = stats.width > 0;
+        // From the screen being captured to the frame being ready to show:
+        // encoding, half a round trip, the receive buffer and decoding.
+        // What the capture itself and the display add is not known.
+        let delay = peer.filter(|_| started).and_then(|peer| {
+            let sharing = peer.sharing.as_ref()?;
+            let network = peer.stats.round_trip_ms? / 2.0;
+            let buffer = f64::from(state.settings.receive_buffer_ms);
+            Some(sharing.encode_ms + network + buffer + stats.decode_ms)
+        });
+        Self {
+            resolution: resolution(stats.width, stats.height),
+            frame_rate: if started {
+                format!("{:.0} fps", stats.fps)
+            } else {
+                "–".into()
+            },
+            bitrate: bitrate(peer.and_then(|peer| peer.stats.video_receiving_kbps)),
+            delay: millis(delay),
+            frames_dropped: percent(started.then_some(stats.dropped_percent)),
+            packets_lost: percent(peer.and_then(|peer| peer.stats.video_loss_percent)),
+            route: peer.map_or_else(|| "–".into(), route),
+        }
     }
 }
 
@@ -1166,6 +1858,10 @@ mod tests {
         assert_eq!(millis(None), "–");
         assert_eq!(percent(Some(1.44)), "1.4%");
         assert_eq!(kbps(Some(57.8)), "58 kbps");
+        assert_eq!(bitrate(Some(8437.0)), "8.4 Mbps");
+        assert_eq!(bitrate(Some(684.0)), "684 kbps");
+        assert_eq!(resolution(1920, 1080), "1920 × 1080");
+        assert_eq!(resolution(0, 0), "–");
         assert_eq!(clock(Duration::from_secs(42 * 60 + 17)), "00:42:17");
     }
 }

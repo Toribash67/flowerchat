@@ -7,3 +7,4 @@ pub mod ice;
 pub mod latency;
 pub mod session;
 pub mod signaling;
+pub mod video;

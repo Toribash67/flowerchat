@@ -1,13 +1,15 @@
 //! Command-line client: joins a room and talks, with no window. Also hosts
 //! the test modes used for measuring latency.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use flowerchat_client::latency::Summary;
-use flowerchat_client::session::{self, AudioSettings, Command, Event, SessionConfig};
+use flowerchat_client::session::{
+    self, AudioSettings, Command, Event, ScreenSource, SessionConfig, ShareSettings, ShareSource,
+};
 use flowerchat_protocol::PeerId;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -54,6 +56,28 @@ struct Args {
     /// Send this chat message to each peer once connected to it.
     #[arg(long)]
     say: Option<String>,
+    /// Share a moving test picture of this size, such as 1920x1080, as if
+    /// it were a screen.
+    #[arg(long, value_name = "WIDTHxHEIGHT")]
+    share_test: Option<String>,
+    /// Share a PipeWire video stream that is open to everyone, by its node
+    /// id. Screens are not; the app asks the desktop for those.
+    #[arg(long, value_name = "ID", conflicts_with = "share_test")]
+    share_node: Option<u32>,
+    /// Scale the shared picture down to this height if it is taller.
+    #[arg(long)]
+    share_height: Option<u32>,
+    /// Frames per second to share at.
+    #[arg(long, default_value_t = 60)]
+    share_fps: u32,
+    /// Watch every screen that is shared, without showing it, and print how
+    /// it goes once a second.
+    #[arg(long)]
+    watch: bool,
+    /// For testing: lose this many percent of the packets that arrive, as
+    /// a poor network would.
+    #[arg(long, default_value_t = 0.0)]
+    lose: f64,
     /// Leave after this many seconds.
     #[arg(long)]
     duration: Option<u64>,
@@ -82,6 +106,23 @@ async fn main() -> Result<()> {
         audio
     };
 
+    let source = match (&args.share_test, args.share_node) {
+        (Some(size), _) => {
+            let (width, height) = flowerchat_client::video::parse_size(size)
+                .with_context(|| format!("{size:?} is not a size like 1920x1080"))?;
+            Some(ShareSource::TestPicture { width, height })
+        }
+        (None, Some(node)) => Some(ShareSource::Screen(ScreenSource { remote: None, node })),
+        (None, None) => None,
+    };
+    let share = source.map(|source| Command::StartShare {
+        source,
+        settings: ShareSettings {
+            max_height: args.share_height,
+            fps: args.share_fps,
+        },
+    });
+
     let (commands, command_rx) = unbounded_channel();
     let (event_tx, mut events) = unbounded_channel();
     let session = tokio::spawn(session::run(
@@ -93,6 +134,8 @@ async fn main() -> Result<()> {
             transmitting: true,
             test_tone: args.test_tone,
             measure: args.measure,
+            frames: None,
+            incoming_loss: args.lose / 100.0,
         },
         command_rx,
         event_tx,
@@ -103,6 +146,7 @@ async fn main() -> Result<()> {
 
     let mut names: HashMap<PeerId, String> = HashMap::new();
     let mut levels: HashMap<PeerId, f32> = HashMap::new();
+    let mut sharers: HashSet<PeerId> = HashSet::new();
     let mut mic_level = f32::NEG_INFINITY;
     let mut summary = Summary::default();
     let mut leaving = false;
@@ -114,6 +158,9 @@ async fn main() -> Result<()> {
                 match event {
                     Event::Joined { id } => {
                         println!("joined {} as {} (peer {id})", args.room, args.name);
+                        if let Some(share) = share.clone() {
+                            let _ = commands.send(share);
+                        }
                     }
                     Event::PeerJoined { id, name } => {
                         println!("{name} (peer {id}) is in the room");
@@ -148,6 +195,45 @@ async fn main() -> Result<()> {
                         println!("click delay {:.1} ms", delay_ns as f64 / 1e6);
                     }
                     Event::PeerStats { .. } => {}
+                    Event::OwnShare(Some(sharing)) => println!(
+                        "sharing {}x{} at {} fps, {} kbps: sent {:.1} fps, encoding takes {:.1} ms, watched by {:?}",
+                        sharing.width,
+                        sharing.height,
+                        sharing.fps,
+                        sharing.kbps,
+                        sharing.sent_fps,
+                        sharing.encode_ms,
+                        sharing.watchers
+                    ),
+                    Event::OwnShare(None) => println!("stopped sharing"),
+                    Event::ShareFailed(reason) => println!("sharing failed: {reason}"),
+                    Event::PeerSharing { id, sharing } => {
+                        let was_sharing = sharers.contains(&id);
+                        match sharing {
+                            Some(sharing) if !was_sharing => {
+                                println!(
+                                    "peer {id} shares {}x{} at {} fps, {} kbps",
+                                    sharing.width, sharing.height, sharing.fps, sharing.kbps
+                                );
+                                sharers.insert(id);
+                                if args.watch {
+                                    let _ = commands.send(Command::Watch { id, watch: true });
+                                }
+                            }
+                            None if was_sharing => {
+                                println!("peer {id} stopped sharing");
+                                sharers.remove(&id);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Event::Watching { id, stats } => println!(
+                        "watching peer {id}: {}x{} at {:.1} fps, {:.1}% dropped, ready in {:.1} ms",
+                        stats.width, stats.height, stats.fps, stats.dropped_percent, stats.decode_ms
+                    ),
+                    Event::WatchFailed { id, reason } => {
+                        println!("cannot watch peer {id}: {reason}");
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c(), if !leaving => {

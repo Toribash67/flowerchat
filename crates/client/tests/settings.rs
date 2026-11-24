@@ -30,6 +30,8 @@ fn join(url: &str, name: &str) -> Client {
         transmitting: true,
         test_tone: true,
         measure: true,
+        frames: None,
+        incoming_loss: 0.0,
     };
     let session = tokio::spawn(session::run(config, command_rx, event_tx));
     let delays = Delays::default();

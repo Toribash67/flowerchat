@@ -9,6 +9,8 @@ use egui::{
 };
 
 pub const BACKGROUND: Color32 = Color32::from_rgb(0x15, 0x17, 0x1B);
+/// Behind a shared screen.
+pub const STAGE: Color32 = Color32::from_rgb(0x0B, 0x0C, 0x0E);
 /// Side columns and bars.
 pub const PANEL: Color32 = Color32::from_rgb(0x1A, 0x1C, 0x21);
 /// Text fields.

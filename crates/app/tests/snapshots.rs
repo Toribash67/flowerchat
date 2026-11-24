@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use egui::Vec2;
 use egui_kittest::Harness;
-use flowerchat_app::model::{Entry, EntryKind, PeerRow, RoomModel};
+use flowerchat_app::model::{Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
 use flowerchat_app::settings::{DeviceChoice, SendMode};
 use flowerchat_app::talk::GlobalKey;
-use flowerchat_app::views::{self, Env, Screen, Tab, UiState};
+use flowerchat_app::views::{self, Env, Picture, Screen, Tab, UiState};
 use flowerchat_client::audio::{AudioDevice, AudioDevices};
-use flowerchat_client::session::{ConnectionState, PeerStats, Route};
+use flowerchat_client::session::{ConnectionState, PeerStats, Route, Sharing, WatchStats};
 
 const WIDE: Vec2 = Vec2::new(1280.0, 720.0);
 const NARROW: Vec2 = Vec2::new(360.0, 640.0);
@@ -25,6 +25,7 @@ fn peer(id: u64, name: &str, route: Route, rtt: f64, loss: f64, jitter: f64, kbp
         jitter_ms: Some(jitter),
         receiving_kbps: Some(kbps),
         sending_kbps: Some(64.0),
+        ..PeerStats::default()
     };
     peer
 }
@@ -109,7 +110,99 @@ fn env(devices: &AudioDevices) -> Env<'_> {
         devices,
         global_key: GlobalKey::Off,
         transmitting: true,
+        picture: None,
     }
+}
+
+fn sharing(watchers: &[u64]) -> Sharing {
+    Sharing {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        kbps: 8700,
+        sent_fps: 60.0,
+        encode_ms: 4.0,
+        watchers: watchers.to_vec(),
+    }
+}
+
+/// The room with alex sharing a screen that sam and jo watch.
+fn room_with_share() -> RoomModel {
+    let mut room = room();
+    room.peers[0].sharing = Some(sharing(&[3, 5]));
+    room.peers[0].stats.video_receiving_kbps = Some(8437.0);
+    room.peers[0].stats.video_loss_percent = Some(0.0);
+    room.timeline.push(Entry {
+        time: "21:04".into(),
+        kind: EntryKind::Event("alex started sharing a screen".into()),
+    });
+    room
+}
+
+/// The same with us watching too.
+fn room_watching() -> RoomModel {
+    let mut room = room_with_share();
+    room.watch(2, "21:05");
+    room.watching = Some(Watching {
+        id: 2,
+        stats: WatchStats {
+            width: 1920,
+            height: 1080,
+            fps: 59.8,
+            dropped_percent: 0.1,
+            decode_ms: 3.2,
+        },
+    });
+    room.timeline.push(Entry {
+        time: "21:06".into(),
+        kind: EntryKind::Message {
+            from: "jo".into(),
+            text: "looks sharp, text is readable".into(),
+        },
+    });
+    room
+}
+
+/// Something that reads as a desktop from a distance: a wallpaper, two
+/// windows and a bar along the bottom.
+fn fake_screen() -> egui::ColorImage {
+    let (width, height) = (960, 540);
+    let mut image = egui::ColorImage::filled([width, height], egui::Color32::from_rgb(38, 52, 74));
+    let mut fill = |x0: usize, y0: usize, x1: usize, y1: usize, color: [u8; 3]| {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                image.pixels[y * width + x] = egui::Color32::from_rgb(color[0], color[1], color[2]);
+            }
+        }
+    };
+    fill(60, 50, 560, 400, [236, 236, 232]);
+    fill(60, 50, 560, 78, [70, 78, 92]);
+    fill(90, 110, 430, 122, [150, 152, 156]);
+    fill(90, 140, 500, 152, [150, 152, 156]);
+    fill(90, 170, 380, 182, [150, 152, 156]);
+    fill(600, 120, 900, 460, [24, 26, 30]);
+    fill(600, 120, 900, 148, [70, 78, 92]);
+    fill(620, 170, 800, 180, [76, 195, 138]);
+    fill(620, 196, 860, 206, [110, 116, 126]);
+    fill(0, 510, 960, 540, [58, 66, 80]);
+    image
+}
+
+/// Draws a view that shows a shared screen, with [`fake_screen`] as the
+/// picture.
+fn snapshot_with_picture(name: &str, size: Vec2, mut draw: impl FnMut(&mut egui::Ui, Picture)) {
+    let mut texture = None;
+    snapshot(name, size, |ui| {
+        let texture = texture.get_or_insert_with(|| {
+            ui.ctx()
+                .load_texture("screen", fake_screen(), egui::TextureOptions::LINEAR)
+        });
+        let picture = Picture {
+            texture: texture.id(),
+            size: texture.size_vec2(),
+        };
+        draw(ui, picture);
+    });
 }
 
 fn snapshot(name: &str, size: Vec2, mut draw: impl FnMut(&mut egui::Ui)) {
@@ -213,6 +306,7 @@ fn room_wide_push_to_talk() {
             trigger: String::new(),
         },
         transmitting: false,
+        picture: None,
     };
     snapshot("room_wide_push_to_talk", WIDE, |ui| {
         views::draw(ui, Screen::Room(&room), &env, &mut state);
@@ -233,8 +327,91 @@ fn room_narrow_audio() {
                 .into(),
         ),
         transmitting: false,
+        picture: None,
     };
     snapshot("room_narrow_audio", NARROW, |ui| {
+        views::draw(ui, Screen::Room(&room), &env, &mut state);
+    });
+}
+
+#[test]
+fn room_wide_someone_sharing() {
+    let room = room_with_share();
+    let mut state = form();
+    let devices = devices();
+    snapshot("room_wide_someone_sharing", WIDE, |ui| {
+        views::draw(ui, Screen::Room(&room), &env(&devices), &mut state);
+    });
+}
+
+#[test]
+fn room_wide_sharing_our_screen() {
+    let mut room = room();
+    room.me.share = OwnShare::Sharing(sharing(&[3, 5]));
+    let mut state = form();
+    let devices = devices();
+    snapshot("room_wide_sharing_our_screen", WIDE, |ui| {
+        views::draw(ui, Screen::Room(&room), &env(&devices), &mut state);
+    });
+}
+
+#[test]
+fn room_stream() {
+    let room = room_watching();
+    let mut state = form();
+    let devices = devices();
+    snapshot_with_picture("room_stream", WIDE, |ui, picture| {
+        let env = Env {
+            picture: Some(picture),
+            ..env(&devices)
+        };
+        views::draw(ui, Screen::Room(&room), &env, &mut state);
+    });
+}
+
+#[test]
+fn room_stream_before_the_first_frame() {
+    let mut room = room_watching();
+    room.watching.as_mut().unwrap().stats = WatchStats::default();
+    room.peers[0].stats.video_receiving_kbps = None;
+    room.peers[0].stats.video_loss_percent = None;
+    let mut state = form();
+    state.beside_screen = views::Beside::Audio;
+    let devices = devices();
+    snapshot("room_stream_before_the_first_frame", WIDE, |ui| {
+        views::draw(ui, Screen::Room(&room), &env(&devices), &mut state);
+    });
+}
+
+#[test]
+fn room_maximized() {
+    let room = room_watching();
+    let mut state = form();
+    state.maximized = true;
+    // One message came in after the chat was last looked at.
+    state.messages_seen = 3;
+    let devices = devices();
+    snapshot_with_picture("room_maximized", WIDE, |ui, picture| {
+        let env = Env {
+            picture: Some(picture),
+            ..env(&devices)
+        };
+        views::draw(ui, Screen::Room(&room), &env, &mut state);
+    });
+}
+
+#[test]
+fn room_narrow_screens() {
+    let room = room_watching();
+    let mut state = form();
+    state.tab = Tab::Screens;
+    state.messages_seen = 3;
+    let devices = devices();
+    snapshot_with_picture("room_narrow_screens", NARROW, |ui, picture| {
+        let env = Env {
+            picture: Some(picture),
+            ..env(&devices)
+        };
         views::draw(ui, Screen::Room(&room), &env, &mut state);
     });
 }

@@ -21,7 +21,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.14.3", default-features = false, features = ["tokio", "global_shortcuts"] }
+ashpd = { version = "0.14.3", default-features = false, features = ["tokio", "global_shortcuts", "screencast"] }
 
 [dev-dependencies]
 axum = "0.8.9"

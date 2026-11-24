@@ -8,8 +8,8 @@ find each other.
 
 - `crates/protocol`: the signaling messages shared by server and clients.
 - `crates/server`: the signaling server. It also serves a browser test client.
-- `crates/client`: the client engine (signaling, calls, audio) and a
-  command-line client built on it.
+- `crates/client`: the client engine (signaling, calls, audio, screen
+  sharing) and a command-line client built on it.
 - `crates/app`: the desktop app, a window on top of the same engine.
 
 ## Running the server
@@ -37,7 +37,10 @@ join without clicking.
 ## Running the app
 
 The app and the command-line client need GStreamer 1.28 with the base, good
-and bad plugin sets, the PipeWire plugin and `gst-plugin-rsrtp`.
+and bad plugin sets, the PipeWire plugin and `gst-plugin-rsrtp`. Sharing a
+screen and watching one need an NVIDIA graphics card: the picture is encoded
+and decoded as H.264 on the card (NVENC and NVDEC), and nothing else is
+tried.
 
 ```sh
 cargo run -p flowerchat-app
@@ -65,6 +68,38 @@ audio settings are remembered between runs.
 `--name`, `--room` and `--server` prefill the form and `--autojoin` skips it.
 `--input`, `--output`, `--jitter-ms` and `--raw-mic` set the corresponding
 audio settings, as in the command-line client below.
+
+### Sharing a screen
+
+"Share screen" asks the desktop which screen or window to share, through the
+ScreenCast portal, and the desktop shows its own picker. Sharing sends
+nothing by itself: a share shows up for the others as a Watch button in the
+Screen column, and the picture goes only to those who press it. It is
+encoded once, however many watch.
+
+Watching opens the screen in the middle of the window, with the people on
+the left and the chat or the audio panel on the right. Under the picture
+are its resolution, frame rate and bitrate as they arrive, the delay from
+the sharer's screen to ours (encoding, half a round trip, the receive buffer
+and decoding; what the capture and the display add is not known), and the
+share of frames dropped here and of packets lost on the way. "Maximize"
+gives the picture the whole window and "Pop out" a window of its own. In a
+narrow window all of this is on the Screens tab.
+
+Packets that go missing are sent again, which keeps a stream whole through
+a few percent of loss. When that is not enough, the viewer asks for a frame
+to start over from, and the picture freezes for a moment.
+
+The size and frame rate of a share are set when starting the app, for now:
+`--share-height` is the tallest picture to send (1080 unless given, 0 for
+the size the screen has) and `--share-fps` the frames per second (60 unless
+given). A taller screen is scaled down, a smaller one is sent as it is, up
+to 4096 pixels a side. The bitrate follows from the two: about 8.7 Mbit/s
+for 1080p at 60 frames per second and about 35 Mbit/s for 4K.
+
+For trying things out without a second machine, `--share-test 1920x1080`
+makes "Share screen" share a moving test picture of that size without
+asking the desktop, and `--lose 2` loses 2% of the packets that arrive.
 
 ### Push-to-talk
 
@@ -113,6 +148,11 @@ ones that matter most:
 | `--raw-mic` | Skip echo cancellation, noise suppression and automatic gain. |
 | `--stats` | Print each connection's statistics and levels once a second. |
 | `--say` | Send a chat message to each peer once connected. |
+| `--share-test` | Share a moving test picture of this size, such as `1920x1080`. |
+| `--share-node` | Share a PipeWire video stream that is open to everyone, by its node id. |
+| `--share-height`, `--share-fps` | The tallest picture to send, and how many frames per second. |
+| `--watch` | Watch every screen that is shared, without showing it, and print how it goes. |
+| `--lose` | Lose this many percent of the packets that arrive, to see what a poor network does. |
 
 Set `RUST_LOG=flowerchat_client=debug` to see the SDP being exchanged.
 
@@ -153,8 +193,20 @@ A room holds at most 8 peers.
 
 Of two peers, the one with the lower id makes the offer. Each connection also
 carries a data channel named `control`, created by both sides with
-`negotiated: true` and id 0, for small JSON messages: `{"muted": true}` for
-status and `{"chat": "…"}` for a chat message.
+`negotiated: true` and id 0, for small JSON messages:
+
+| Message | Meaning |
+| --- | --- |
+| `{"muted": true}` | The sender muted or unmuted. |
+| `{"chat": "…"}` | A chat message. |
+| `{"sharing": {…}}` | What the sender shares of its screen: `width`, `height`, `fps` and `kbps` as set, `sentFps` and `encodeMs` as measured, and `watchers`, the ids of those it sends to. Repeated about once a second. |
+| `{"sharing": null}` | The sender stopped sharing. |
+| `{"watch": true}` | The sender wants the receiver's share, or with `false` no longer does. |
+
+Native clients offer and accept H.264 video on every connection from the
+start, with retransmission, so that sharing and watching need no new
+negotiation. Nothing is sent on it until a peer asks to watch. A browser
+that offers only audio gets only audio.
 
 ## Tests
 
@@ -165,6 +217,11 @@ cargo test --workspace
 The client's end-to-end tests start a server and two clients, check that
 they measure a plausible latency, and change settings in the middle of the
 call. They need a network interface other than loopback, but no audio device.
+The sharing tests, in the client and in the app, also need an NVIDIA
+graphics card: one client shares a test picture, others watch it, one of
+them through 2% packet loss, and the voice must stay as quick as it was. In
+the app's test, the app itself shares and watches through its buttons,
+without showing a window.
 
 One test is left out of that, and is run on request:
 

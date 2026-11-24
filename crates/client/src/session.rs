@@ -16,11 +16,14 @@ use crate::call::{Call, CallConfig, CallEvent};
 pub use crate::call::{ConnectionState, PeerStats, Route};
 use crate::ice::IceConfig;
 use crate::signaling;
+pub use crate::video::{
+    FrameSink, ScreenSource, ShareSettings, ShareSource, Sharing, VideoFrame, WatchStats,
+};
 
 /// How often connection statistics are refreshed.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionConfig {
     /// WebSocket address of the signaling server.
     pub server: String,
@@ -34,6 +37,12 @@ pub struct SessionConfig {
     pub test_tone: bool,
     /// Time incoming clicks instead of playing audio.
     pub measure: bool,
+    /// Where the frames of the screens being watched go. Without it they
+    /// are decoded and counted, but not shown.
+    pub frames: Option<FrameSink>,
+    /// For testing: the share, from 0 to 1, of arriving packets to lose, as
+    /// a poor network would.
+    pub incoming_loss: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +60,27 @@ pub enum Command {
         volume: f64,
     },
     SendChat(String),
+    /// Starts sharing a screen with whoever in the room asks to watch.
+    StartShare {
+        source: ShareSource,
+        settings: ShareSettings,
+    },
+    /// Changes the size or frame rate of what we share, without a break.
+    SetShareSettings(ShareSettings),
+    StopShare,
+    /// Starts or stops watching what a peer shares.
+    Watch {
+        id: PeerId,
+        watch: bool,
+    },
+    /// Says how tall, in pixels, a peer's shared screen is shown at most.
+    /// Its frames then come no larger than that, which saves the work of
+    /// preparing pixels that would not be seen. Zero, the default, asks
+    /// for the frames at the size they are sent.
+    SetViewHeight {
+        id: PeerId,
+        max_height: u32,
+    },
     Leave,
 }
 
@@ -94,6 +124,27 @@ pub enum Event {
     },
     /// A measurement click arrived this many nanoseconds after it was sent.
     ClickDelay(u64),
+    /// What we are sharing as of now, about once a second while we do, or
+    /// that we no longer are.
+    OwnShare(Option<Sharing>),
+    /// Our share could not start or broke down. It has stopped.
+    ShareFailed(String),
+    /// What a peer is sharing as of now, about once a second while it does,
+    /// or that it no longer is.
+    PeerSharing {
+        id: PeerId,
+        sharing: Option<Sharing>,
+    },
+    /// How watching a peer's screen has gone over the last second.
+    Watching {
+        id: PeerId,
+        stats: WatchStats,
+    },
+    /// A peer's screen could not be watched.
+    WatchFailed {
+        id: PeerId,
+        reason: String,
+    },
 }
 
 /// Joins the room and stays until told to leave. Returns an error if the
@@ -115,6 +166,8 @@ pub async fn run(
             test_tone: config.test_tone,
             measure: config.measure,
             ice: IceConfig::from_servers(&welcome.ice_servers),
+            frames: config.frames,
+            incoming_loss: config.incoming_loss,
         },
         call_events_tx,
     )?;
@@ -167,6 +220,29 @@ pub async fn run(
                     CallEvent::PeerStats { id, stats } => Event::PeerStats { id, stats },
                     CallEvent::Chat { from, text } => Event::Chat { from, text },
                     CallEvent::ClickDelay(delay) => Event::ClickDelay(delay),
+                    CallEvent::OwnShare(sharing) => Event::OwnShare(sharing),
+                    CallEvent::ShareFormat => {
+                        call.announce_share();
+                        continue;
+                    }
+                    CallEvent::ShareEnded(reason) => {
+                        call.stop_share();
+                        match reason {
+                            Some(reason) => Event::ShareFailed(reason),
+                            None => continue,
+                        }
+                    }
+                    CallEvent::WatchRequest { from, watch } => {
+                        call.set_watcher(from, watch);
+                        continue;
+                    }
+                    CallEvent::PeerSharing { id, sharing } => {
+                        if sharing.is_none() {
+                            call.peer_stopped_sharing(id);
+                        }
+                        Event::PeerSharing { id, sharing }
+                    }
+                    CallEvent::Watching { id, stats } => Event::Watching { id, stats },
                 };
                 let _ = events.send(event);
             }
@@ -187,6 +263,22 @@ pub async fn run(
                 }
                 Some(Command::SetPeerVolume { id, volume }) => call.set_peer_volume(id, volume),
                 Some(Command::SendChat(text)) => call.send_chat(&text),
+                Some(Command::StartShare { source, settings }) => {
+                    if let Err(err) = call.start_share(&source, settings) {
+                        let _ = events.send(Event::ShareFailed(format!("{err:#}")));
+                    }
+                }
+                Some(Command::SetShareSettings(settings)) => call.set_share_settings(settings),
+                Some(Command::StopShare) => call.stop_share(),
+                Some(Command::SetViewHeight { id, max_height }) => {
+                    call.set_view_height(id, max_height);
+                }
+                Some(Command::Watch { id, watch }) => {
+                    if let Err(err) = call.watch(id, watch) {
+                        let reason = format!("{err:#}");
+                        let _ = events.send(Event::WatchFailed { id, reason });
+                    }
+                }
                 // A dropped command channel means the interface is gone.
                 Some(Command::Leave) | None => break Ok(()),
             },

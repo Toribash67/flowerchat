@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use flowerchat_client::session::{ConnectionState, Event, PeerStats};
+use flowerchat_client::session::{ConnectionState, Event, PeerStats, Sharing, WatchStats};
 use flowerchat_protocol::PeerId;
 
 /// Louder than this counts as speaking.
@@ -26,6 +26,27 @@ pub struct RoomModel {
     pub peers: Vec<PeerRow>,
     /// Chat messages and room events, oldest first.
     pub timeline: Vec<Entry>,
+    /// The screen we are watching, if any.
+    pub watching: Option<Watching>,
+}
+
+/// Someone's shared screen, open on ours.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Watching {
+    pub id: PeerId,
+    /// How it has gone over the last second.
+    pub stats: WatchStats,
+}
+
+/// Where sharing our own screen stands.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum OwnShare {
+    #[default]
+    NotSharing,
+    /// Asked for, and not under way yet: the desktop may still be asking
+    /// which screen it is to be.
+    Starting,
+    Sharing(Sharing),
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +57,7 @@ pub struct Me {
     /// Microphone level from 0 (silent) to 1 (full scale).
     pub mic_level: f32,
     pub sending_kbps: Option<f64>,
+    pub share: OwnShare,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +68,8 @@ pub struct PeerRow {
     pub muted: bool,
     pub speaking: bool,
     pub stats: PeerStats,
+    /// What this peer shares of its screen, if anything.
+    pub sharing: Option<Sharing>,
     /// Playback gain, 1.0 being unchanged.
     pub volume: f32,
     /// When this peer was last loud enough to count as speaking.
@@ -64,6 +88,7 @@ impl PeerRow {
             muted: false,
             speaking: false,
             stats: PeerStats::default(),
+            sharing: None,
             volume: 1.0,
             last_loud: None,
             heard_status: false,
@@ -104,9 +129,76 @@ impl RoomModel {
                 deafened: false,
                 mic_level: 0.0,
                 sending_kbps: None,
+                share: OwnShare::NotSharing,
             },
             peers: Vec::new(),
             timeline: Vec::new(),
+            watching: None,
+        }
+    }
+
+    pub fn peer(&self, id: PeerId) -> Option<&PeerRow> {
+        self.peers.iter().find(|peer| peer.id == id)
+    }
+
+    /// How many of the others share a screen.
+    pub fn sharing_count(&self) -> usize {
+        self.peers
+            .iter()
+            .filter(|peer| peer.sharing.is_some())
+            .count()
+    }
+
+    /// The names of those in `ids`, with ourselves left out: the list
+    /// comes from someone who knows us by our id, which we do not show.
+    fn names(&self, ids: &[PeerId]) -> Vec<String> {
+        ids.iter()
+            .filter_map(|id| self.peer(*id))
+            .map(|peer| peer.name.clone())
+            .collect()
+    }
+
+    /// Who watches the screen that `id` shares, for display. We come first
+    /// if we are among them.
+    pub fn watchers_of(&self, id: PeerId) -> Vec<String> {
+        let Some(sharing) = self.peer(id).and_then(|peer| peer.sharing.as_ref()) else {
+            return Vec::new();
+        };
+        let others = self.names(&sharing.watchers);
+        let we_watch = self.watching.as_ref().is_some_and(|w| w.id == id);
+        we_watch
+            .then(|| "you".to_owned())
+            .into_iter()
+            .chain(others)
+            .collect()
+    }
+
+    /// Who watches our screen, for display.
+    pub fn my_watchers(&self) -> Vec<String> {
+        match &self.me.share {
+            OwnShare::Sharing(sharing) => self.names(&sharing.watchers),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Opens `id`'s screen. The caller tells the session.
+    pub fn watch(&mut self, id: PeerId, clock: &str) {
+        let Some(name) = self.peer(id).map(|peer| peer.name.clone()) else {
+            return;
+        };
+        self.watching = Some(Watching {
+            id,
+            stats: WatchStats::default(),
+        });
+        self.log(clock, format!("You started watching {name}'s screen"));
+    }
+
+    /// Closes the screen we are watching. The caller tells the session.
+    pub fn stop_watching(&mut self, clock: &str) {
+        if let Some(watching) = self.watching.take()
+            && let Some(name) = self.peer(watching.id).map(|peer| peer.name.clone())
+        {
+            self.log(clock, format!("You stopped watching {name}'s screen"));
         }
     }
 
@@ -130,6 +222,9 @@ impl RoomModel {
                 if let Some(index) = self.peers.iter().position(|peer| peer.id == id) {
                     let peer = self.peers.remove(index);
                     self.log(clock, format!("{} left", peer.name));
+                }
+                if self.watching.as_ref().is_some_and(|w| w.id == id) {
+                    self.watching = None;
                 }
             }
             Event::PeerState { id, state } => {
@@ -187,6 +282,70 @@ impl RoomModel {
                 self.say(clock, from, text);
             }
             Event::ClickDelay(_) => {}
+            Event::OwnShare(Some(sharing)) => {
+                let before = match &self.me.share {
+                    OwnShare::Sharing(before) => before.watchers.clone(),
+                    _ => {
+                        self.log(clock, "You started sharing your screen".into());
+                        Vec::new()
+                    }
+                };
+                for (ids, others, what) in [
+                    (&sharing.watchers, &before, "started watching your screen"),
+                    (&before, &sharing.watchers, "stopped watching your screen"),
+                ] {
+                    for id in ids.iter().filter(|id| !others.contains(id)) {
+                        // Someone who has left is not also reported to
+                        // have stopped watching.
+                        if let Some(name) = self.peer(*id).map(|peer| peer.name.clone()) {
+                            self.log(clock, format!("{name} {what}"));
+                        }
+                    }
+                }
+                self.me.share = OwnShare::Sharing(sharing);
+            }
+            Event::OwnShare(None) => {
+                if matches!(self.me.share, OwnShare::Sharing(_)) {
+                    self.log(clock, "You stopped sharing your screen".into());
+                }
+                self.me.share = OwnShare::NotSharing;
+            }
+            Event::ShareFailed(reason) => {
+                self.me.share = OwnShare::NotSharing;
+                self.log(clock, format!("Your screen could not be shared: {reason}"));
+            }
+            Event::PeerSharing { id, sharing } => {
+                let Some(peer) = self.peer_mut(id) else {
+                    return;
+                };
+                let (was, is) = (peer.sharing.is_some(), sharing.is_some());
+                peer.sharing = sharing;
+                let name = peer.name.clone();
+                if is && !was {
+                    self.log(clock, format!("{name} started sharing a screen"));
+                } else if was && !is {
+                    self.log(clock, format!("{name} stopped sharing"));
+                    if self.watching.as_ref().is_some_and(|w| w.id == id) {
+                        self.watching = None;
+                    }
+                }
+            }
+            Event::Watching { id, stats } => {
+                if let Some(watching) = &mut self.watching
+                    && watching.id == id
+                {
+                    watching.stats = stats;
+                }
+            }
+            Event::WatchFailed { id, reason } => {
+                if self.watching.as_ref().is_some_and(|w| w.id == id) {
+                    self.watching = None;
+                }
+                let name = self
+                    .peer(id)
+                    .map_or_else(|| format!("peer {id}"), |peer| peer.name.clone());
+                self.log(clock, format!("{name}'s screen cannot be shown: {reason}"));
+            }
         }
     }
 
@@ -306,6 +465,68 @@ mod tests {
         assert!(
             matches!(&last.kind, EntryKind::Message { from, text } if from == "alex" && text == "hi")
         );
+    }
+
+    fn sharing(watchers: &[PeerId]) -> Sharing {
+        Sharing {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            kbps: 8700,
+            sent_fps: 60.0,
+            encode_ms: 4.0,
+            watchers: watchers.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_share_is_logged_once_however_often_it_is_reported() {
+        let mut room = room();
+        let now = Instant::now();
+        let report = |watchers: &[PeerId]| Event::PeerSharing {
+            id: 2,
+            sharing: Some(sharing(watchers)),
+        };
+        room.apply(report(&[]), now, "21:04");
+        room.apply(report(&[3]), now, "21:04");
+        assert_eq!(events(&room)[2..], ["alex started sharing a screen"]);
+        assert_eq!(room.sharing_count(), 1);
+
+        room.watch(2, "21:05");
+        assert_eq!(room.watchers_of(2), ["you"]);
+        let stopped = Event::PeerSharing {
+            id: 2,
+            sharing: None,
+        };
+        room.apply(stopped, now, "21:06");
+        assert_eq!(room.watching, None, "nothing is left to watch");
+        assert_eq!(
+            events(&room)[3..],
+            ["You started watching alex's screen", "alex stopped sharing"]
+        );
+    }
+
+    #[test]
+    fn our_own_watchers_come_and_go_in_the_timeline() {
+        let mut room = room();
+        let now = Instant::now();
+        room.me.share = OwnShare::Starting;
+        room.apply(Event::OwnShare(Some(sharing(&[]))), now, "21:04");
+        room.apply(Event::OwnShare(Some(sharing(&[2]))), now, "21:05");
+        room.apply(Event::OwnShare(Some(sharing(&[2]))), now, "21:05");
+        assert_eq!(room.my_watchers(), ["alex"]);
+        room.apply(Event::OwnShare(Some(sharing(&[]))), now, "21:06");
+        room.apply(Event::OwnShare(None), now, "21:07");
+        assert_eq!(
+            events(&room)[2..],
+            [
+                "You started sharing your screen",
+                "alex started watching your screen",
+                "alex stopped watching your screen",
+                "You stopped sharing your screen"
+            ]
+        );
+        assert_eq!(room.me.share, OwnShare::NotSharing);
     }
 
     #[test]

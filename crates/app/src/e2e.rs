@@ -16,7 +16,9 @@ use egui::accesskit::Role;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use flowerchat_client::audio::{AudioSettings, MicCheck};
-use flowerchat_client::session::{self, Command, Event, SessionConfig};
+use flowerchat_client::session::{
+    self, Command, Event, FrameSink, SessionConfig, ShareSettings, ShareSource,
+};
 use flowerchat_server::Config;
 use gst::prelude::*;
 use gstreamer as gst;
@@ -152,6 +154,8 @@ fn audio_settings_work_through_the_interface() {
         transmitting: true,
         test_tone: true,
         measure: true,
+        frames: None,
+        incoming_loss: 0.0,
     };
     let other_session = runtime.spawn(session::run(config, other_commands, other_events));
     let us: Levels = Levels::default();
@@ -296,6 +300,239 @@ fn audio_settings_work_through_the_interface() {
     run(&mut harness, 5.0);
     assert!(harness.query_by_label("In room").is_some(), "joined again");
     assert!(hear_after_change(&mut harness, &us) > AUDIBLE_DB);
+
+    harness.get_by_role_and_label(button, "Leave").click();
+    run(&mut harness, 1.5);
+    assert_eq!(harness.state().error, None);
+    let _ = other.send(Command::Leave);
+    runtime.block_on(other_session).unwrap().unwrap();
+}
+
+/// Starts a signaling server on this machine and returns its address.
+fn serve(runtime: &tokio::runtime::Runtime) -> String {
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let config = Config {
+            ice_servers: vec![],
+        };
+        tokio::spawn(async move {
+            axum::serve(listener, flowerchat_server::app(config))
+                .await
+                .unwrap();
+        });
+        url
+    })
+}
+
+/// Saves what the window shows, for a person to look at, where
+/// `FLOWERCHAT_E2E_SHOTS` says. Does nothing without it.
+fn shot(harness: &mut Harness<'_, App>, name: &str) {
+    if let Some(folder) = std::env::var_os("FLOWERCHAT_E2E_SHOTS") {
+        let path = std::path::Path::new(&folder).join(format!("{name}.png"));
+        harness.render().unwrap().save(path).unwrap();
+    }
+}
+
+/// Shares a screen from the app and watches one in it, through the buttons
+/// a user would press, with a test picture standing in for both screens.
+/// Uses the GPU for encoding and decoding, but no screen and no sound device.
+#[test]
+fn screens_are_shared_and_watched_through_the_interface() {
+    gst::init().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let url = serve(&runtime);
+
+    // Someone else in the room, who watches what we share and then shares
+    // something too.
+    #[derive(Default)]
+    struct Seen {
+        frames: Vec<(u32, u32)>,
+        sharer: Option<u64>,
+        shares: usize,
+    }
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let frame_log = seen.clone();
+    let frames: FrameSink = Arc::new(move |_, frame| {
+        frame_log
+            .lock()
+            .unwrap()
+            .frames
+            .push((frame.width, frame.height));
+    });
+    let (other, other_commands) = unbounded_channel();
+    let (other_events, mut events) = unbounded_channel();
+    let config = SessionConfig {
+        server: url.clone(),
+        room: ROOM.into(),
+        name: "other".into(),
+        audio: AudioSettings::default(),
+        transmitting: true,
+        test_tone: true,
+        measure: true,
+        frames: Some(frames),
+        incoming_loss: 0.0,
+    };
+    let other_session = runtime.spawn(session::run(config, other_commands, other_events));
+    let log = seen.clone();
+    runtime.spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let Event::PeerSharing { id, sharing } = event {
+                let mut seen = log.lock().unwrap();
+                seen.sharer = sharing.is_some().then_some(id);
+                seen.shares += usize::from(sharing.is_some());
+            }
+        }
+    });
+
+    let args = Args::parse_from([
+        "flowerchat",
+        "--name",
+        "robin",
+        "--room",
+        ROOM,
+        "--server",
+        &url,
+        "--test-tone",
+        "--measure",
+        "--share-test",
+        "1280x720",
+        "--share-height",
+        "0",
+    ]);
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(1280.0, 720.0))
+        .build_eframe(|cc| App::new(cc, args).unwrap());
+    let button = Role::Button;
+    run(&mut harness, 0.5);
+    harness.get_by_role_and_label(button, "Join").click();
+    run(&mut harness, 5.0);
+    assert!(harness.query_by_label("In room").is_some(), "joined");
+
+    // We share, and the other one watches.
+    harness.get_by_label_contains("Share screen").click();
+    run(&mut harness, 3.0);
+    assert!(harness.query_by_label_contains("Stop sharing").is_some());
+    assert!(harness.query_by_label("1280 × 720 · 60 fps").is_some());
+    assert!(harness.query_by_label("Nobody yet").is_some());
+    let us = seen
+        .lock()
+        .unwrap()
+        .sharer
+        .expect("the other one hears of it");
+    other
+        .send(Command::Watch {
+            id: us,
+            watch: true,
+        })
+        .unwrap();
+    run(&mut harness, 3.0);
+    assert!(
+        harness.query_by_label("Nobody yet").is_none(),
+        "we see who watches"
+    );
+    assert!(
+        harness
+            .query_by_label_contains("other started watching your screen")
+            .is_some()
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert!(seen.frames.len() > 60, "our screen arrives over there");
+        assert_eq!(seen.frames.last(), Some(&(1280, 720)));
+    }
+    shot(&mut harness, "sharing");
+
+    // The other one shares, and we watch.
+    other
+        .send(Command::StartShare {
+            source: ShareSource::TestPicture {
+                width: 1920,
+                height: 1080,
+            },
+            settings: ShareSettings {
+                max_height: None,
+                fps: 30,
+            },
+        })
+        .unwrap();
+    run(&mut harness, 3.0);
+    assert!(
+        harness
+            .query_by_label_contains("1 sharing a screen")
+            .is_some()
+    );
+    harness.get_by_label("Watch other's screen").click();
+    run(&mut harness, 4.0);
+    assert!(harness.query_by_label("other's screen").is_some());
+    assert!(
+        harness.query_by_label("1920 × 1080").is_some(),
+        "frames arrive"
+    );
+    assert!(harness.query_by_label("1 watching: you").is_some());
+    // The frames come at about the size they are drawn at, and not at the
+    // size they are sent at, which would be wasted on this window.
+    let picture = harness
+        .state()
+        .picture
+        .as_ref()
+        .expect("a picture is shown");
+    assert_eq!(picture.size(), [960, 540]);
+    shot(&mut harness, "watching");
+
+    harness.get_by_label_contains("Maximize").click();
+    run(&mut harness, 1.5);
+    assert!(
+        harness
+            .query_by_label_contains("1920 × 1080 · 30 fps")
+            .is_some()
+    );
+    let picture = harness.state().picture.as_ref().unwrap();
+    assert_eq!(
+        picture.size(),
+        [1280, 720],
+        "a larger picture, larger frames"
+    );
+    shot(&mut harness, "maximized");
+    harness.get_by_label_contains("Restore").click();
+    run(&mut harness, 0.5);
+
+    // Looking away, and looking again.
+    harness
+        .get_by_role_and_label(button, "Stop watching")
+        .click();
+    run(&mut harness, 1.5);
+    assert!(harness.query_by_label("other's screen").is_none());
+    assert!(harness.state().picture.is_none());
+    harness.get_by_label("Watch other's screen").click();
+    run(&mut harness, 3.0);
+    assert!(
+        harness.query_by_label("1920 × 1080").is_some(),
+        "frames again"
+    );
+
+    // The share ending closes what we had open of it.
+    other.send(Command::StopShare).unwrap();
+    run(&mut harness, 2.0);
+    assert!(harness.query_by_label("other's screen").is_none());
+    assert!(
+        harness
+            .query_by_label_contains("other stopped sharing")
+            .is_some()
+    );
+
+    // We stop sharing, which the other one hears about.
+    harness.get_by_label_contains("Stop sharing").click();
+    run(&mut harness, 2.0);
+    assert!(harness.query_by_label("Not sharing").is_some());
+    assert_eq!(seen.lock().unwrap().sharer, None);
+    let before = seen.lock().unwrap().frames.len();
+    run(&mut harness, 1.0);
+    assert_eq!(
+        seen.lock().unwrap().frames.len(),
+        before,
+        "nothing more arrives"
+    );
 
     harness.get_by_role_and_label(button, "Leave").click();
     run(&mut harness, 1.5);
