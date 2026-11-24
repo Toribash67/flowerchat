@@ -6,6 +6,7 @@ use std::time::Duration;
 use egui::Vec2;
 use egui_kittest::Harness;
 use flowerchat_app::model::{Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
+use flowerchat_app::screen::{Choice, Choices};
 use flowerchat_app::settings::{DeviceChoice, SendMode};
 use flowerchat_app::talk::GlobalKey;
 use flowerchat_app::views::{self, Env, Picture, Screen, Tab, UiState};
@@ -294,6 +295,57 @@ fn room_narrow_chat() {
     let devices = devices();
     snapshot("room_narrow_chat", NARROW, |ui| {
         views::draw(ui, Screen::Room(&room), &env(&devices), &mut state);
+    });
+}
+
+/// What a machine with two screens and a few programs open has to share.
+fn share_choices() -> Choices {
+    let choice = |id, title: &str, detail: &str| Choice {
+        id,
+        title: title.into(),
+        detail: detail.into(),
+    };
+    Choices {
+        screens: vec![
+            choice(1, "Screen 1", "2560 × 1440 · main"),
+            choice(2, "Screen 2", "1920 × 1080"),
+        ],
+        windows: vec![
+            choice(10, "Rocket League (64-bit, DX11, Cooked)", "RocketLeague"),
+            choice(
+                11,
+                "video.rs - flowerchat - Visual Studio Code and a title that goes on for a while",
+                "Code",
+            ),
+            choice(12, "Inbox - Mozilla Firefox", "firefox"),
+            choice(13, "Windows PowerShell", "WindowsTerminal"),
+        ],
+    }
+}
+
+#[test]
+fn room_wide_choosing_what_to_share() {
+    let mut room = room();
+    room.me.share = OwnShare::Starting;
+    let mut state = form();
+    state.share_choices = Some(share_choices());
+    let devices = devices();
+    let env = env(&devices);
+    snapshot("room_wide_choosing_what_to_share", WIDE, |ui| {
+        views::draw(ui, Screen::Room(&room), &env, &mut state);
+    });
+}
+
+#[test]
+fn room_narrow_choosing_what_to_share() {
+    let mut room = room();
+    room.me.share = OwnShare::Starting;
+    let mut state = form();
+    state.share_choices = Some(share_choices());
+    let devices = devices();
+    let env = env(&devices);
+    snapshot("room_narrow_choosing_what_to_share", NARROW, |ui| {
+        views::draw(ui, Screen::Room(&room), &env, &mut state);
     });
 }
 

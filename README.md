@@ -80,8 +80,11 @@ nothing by itself: a share shows up for the others as a Watch button in the
 Screen column, and the picture goes only to those who press it. It is
 encoded once, however many watch.
 
-On Windows there is no picker yet, and "Share screen" shares the main
-monitor.
+On Windows, where any program may look at the screen, flowerchat asks
+itself: a panel over the window lists the screens with their sizes and the
+open windows with their programs, and a click on one starts the share.
+Escape or "Cancel" closes it. Minimized windows are not listed, because
+they have no picture to send.
 
 Watching opens the screen in the middle of the window, with the people on
 the left and the chat or the audio panel on the right. Under the picture

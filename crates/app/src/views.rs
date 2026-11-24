@@ -19,6 +19,7 @@ use flowerchat_client::session::{Codec, ConnectionState, Route};
 use flowerchat_protocol::PeerId;
 
 use crate::model::{Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
+use crate::screen::{Choice, Choices, Picked};
 use crate::settings::{DeviceChoice, MAX_RECEIVE_BUFFER_MS, SendMode, Settings};
 use crate::talk::GlobalKey;
 use crate::theme::{self, muted, strong};
@@ -32,6 +33,10 @@ const BAR_HEIGHT: f32 = 44.0;
 const AUDIO_WIDTH: f32 = 280.0;
 const BIG_BUTTON_HEIGHT: f32 = 30.0;
 const ICON_SIZE: f32 = 16.0;
+/// Width of the panel that asks what to share, where the window has room.
+const PICKER_WIDTH: f32 = 480.0;
+/// Height of a row in it.
+const CHOICE_HEIGHT: f32 = 28.0;
 
 pub enum Screen<'a> {
     /// Not in a room. `connecting` is set while a join is under way, and
@@ -98,6 +103,10 @@ pub struct UiState {
     /// How tall, in pixels of the display, the shared screen was last
     /// drawn. The caller asks for frames of about that size.
     pub picture_height: Option<u32>,
+    /// What there is to share, while the user is being asked which. The
+    /// caller puts it here and keeps it current, on systems that leave
+    /// the asking to us.
+    pub share_choices: Option<Choices>,
 }
 
 /// What the column beside a shared screen shows.
@@ -138,6 +147,10 @@ pub enum Action {
     TestSpeakers,
     /// Let the user pick a screen and share it.
     ShareScreen,
+    /// Share this one of [`UiState::share_choices`].
+    Share(Picked),
+    /// Share none of them after all.
+    ShareNothing,
     StopSharing,
     /// Open this peer's shared screen, in place of any other.
     Watch(PeerId),
@@ -221,6 +234,9 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState)
                 }
                 _ if wide => room_wide(ui, room, env, state, &mut actions),
                 _ => room_narrow(ui, room, env, state, &mut actions),
+            }
+            if let Some(choices) = &state.share_choices {
+                share_picker(ui, choices, &mut actions);
             }
         }
     }
@@ -1644,6 +1660,109 @@ fn share_button(ui: &mut Ui, share: &OwnShare, actions: &mut Vec<Action>) {
             }
         }
     }
+}
+
+/// Asks which screen or window to share, over the rest of the window.
+fn share_picker(ui: &mut Ui, choices: &Choices, actions: &mut Vec<Action>) {
+    let window = ui.ctx().content_rect();
+    let width = (window.width() - 48.0).min(PICKER_WIDTH);
+    // Everything but the list of windows has a fixed height.
+    let fixed = 150.0 + CHOICE_HEIGHT * choices.screens.len() as f32;
+    let room_for_windows = (window.height() - fixed).max(CHOICE_HEIGHT * 3.0);
+    let frame = Frame::new()
+        .fill(theme::PANEL)
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(CornerRadius::same(theme::RADIUS))
+        .inner_margin(Margin::symmetric(16, 14));
+    let modal = egui::Modal::new(egui::Id::new("share-picker"))
+        .frame(frame)
+        .show(ui.ctx(), |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            row(ui, theme::CONTROL_HEIGHT, |ui| {
+                ui.label(strong("Share what?"));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Cancel").clicked() {
+                        actions.push(Action::ShareNothing);
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.label(muted("Screens"));
+            for choice in &choices.screens {
+                if choice_row(ui, icon::MONITOR, choice).clicked() {
+                    actions.push(Action::Share(Picked::Screen(choice.id)));
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(muted("Windows"));
+            if choices.windows.is_empty() {
+                ui.label(muted("No window is open."));
+            }
+            ScrollArea::vertical()
+                .max_height(room_for_windows)
+                .show(ui, |ui| {
+                    for choice in &choices.windows {
+                        if choice_row(ui, icon::APP_WINDOW, choice).clicked() {
+                            actions.push(Action::Share(Picked::Window(choice.id)));
+                        }
+                    }
+                });
+        });
+    // Escape, or a click beside the panel.
+    if modal.should_close() {
+        actions.push(Action::ShareNothing);
+    }
+}
+
+/// One thing that could be shared: what it is on the left, and on the
+/// right its size or the program it belongs to.
+fn choice_row(ui: &mut Ui, glyph: &str, choice: &Choice) -> egui::Response {
+    const PAD: f32 = 8.0;
+    let size = Vec2::new(ui.available_width(), CHOICE_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &choice.title));
+    let painter = ui.painter();
+    if response.hovered() || response.has_focus() {
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(theme::RADIUS),
+            theme::CONTROL_HOVER,
+        );
+    }
+    // A line of text cut short with "…" where it would pass `width`.
+    let line = |text: &str, size: f32, color: egui::Color32, width: f32| {
+        let mut job =
+            LayoutJob::simple_singleline(text.to_owned(), FontId::proportional(size), color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(0.0));
+        painter.layout_job(job)
+    };
+    painter.text(
+        rect.left_center() + Vec2::new(PAD, 0.0),
+        Align2::LEFT_CENTER,
+        glyph,
+        FontId::proportional(ICON_SIZE),
+        theme::MUTED,
+    );
+    let inner = rect.width() - 2.0 * PAD - ICON_SIZE - 8.0;
+    let detail = line(&choice.detail, theme::SMALL, theme::MUTED, inner * 0.4);
+    let title = line(
+        &choice.title,
+        theme::BODY,
+        theme::TEXT,
+        inner - detail.size().x - 12.0,
+    );
+    let title_at = egui::pos2(
+        rect.left() + PAD + ICON_SIZE + 8.0,
+        rect.center().y - title.size().y / 2.0,
+    );
+    let detail_at = egui::pos2(
+        rect.right() - PAD - detail.size().x,
+        rect.center().y - detail.size().y / 2.0,
+    );
+    painter.galley(title_at, title, theme::TEXT);
+    painter.galley(detail_at, detail, theme::MUTED);
+    response
 }
 
 /// The small button that opens someone's shared screen.

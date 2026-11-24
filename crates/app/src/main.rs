@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use eframe::egui;
 use flowerchat_app::model::{OwnShare, RoomModel, meter_level};
-use flowerchat_app::screen::{self, Cast, Pick};
+use flowerchat_app::screen::{self, Cast, Pick, Picked};
 use flowerchat_app::settings::{DeviceChoice, SendMode, Settings};
 use flowerchat_app::talk::Talk;
 use flowerchat_app::theme;
@@ -139,7 +139,12 @@ struct App {
     share_settings: Option<ShareSettings>,
     /// The codecs this machine can share a screen in.
     codecs: Vec<Codec>,
+    /// When the list of what could be shared was last made.
+    choices_listed: Instant,
 }
+
+/// How long a list of what could be shared is shown before it is made anew.
+const CHOICES_LAST: Duration = Duration::from_secs(1);
 
 /// The heights at which frames of a watched screen are asked for. The
 /// smallest that is no smaller than the picture on the display is used, so
@@ -191,6 +196,7 @@ impl App {
             picture: None,
             view_height: None,
             share_settings: None,
+            choices_listed: Instant::now(),
             codecs: Codec::ALL
                 .into_iter()
                 .filter(|codec| codec.can_encode())
@@ -225,6 +231,8 @@ impl App {
             Action::Join => return self.join(),
             Action::TestSpeakers => return self.test_speakers(),
             Action::ShareScreen => return self.share_screen(),
+            Action::Share(picked) => return self.share_picked(Some(picked)),
+            Action::ShareNothing => return self.share_picked(None),
             _ => {}
         }
         let Some(active) = &self.active else {
@@ -234,7 +242,11 @@ impl App {
         let _runtime = self.runtime.enter();
         let room = &mut active.shared.lock().unwrap().room;
         let command = match action {
-            Action::Join | Action::TestSpeakers | Action::ShareScreen => return,
+            Action::Join
+            | Action::TestSpeakers
+            | Action::ShareScreen
+            | Action::Share(_)
+            | Action::ShareNothing => return,
             Action::StopSharing => {
                 active.cast.lock().unwrap().take();
                 Command::StopShare
@@ -316,6 +328,13 @@ impl App {
             return;
         }
 
+        // Where the system leaves the asking to us, the window asks.
+        if let Some(choices) = screen::choices() {
+            self.ui.share_choices = Some(choices);
+            self.choices_listed = Instant::now();
+            return;
+        }
+
         let (commands, shared) = (active.commands.clone(), active.shared.clone());
         let (cast_slot, ctx) = (active.cast.clone(), self.ctx.clone());
         self.runtime.spawn(async move {
@@ -336,6 +355,40 @@ impl App {
             }
             ctx.request_repaint();
         });
+    }
+
+    /// Carries out the answer to what to share: one of the choices, or
+    /// with `None` nothing after all.
+    fn share_picked(&mut self, picked: Option<Picked>) {
+        self.ui.share_choices = None;
+        let Some(active) = &self.active else {
+            return;
+        };
+        let chosen = picked.and_then(screen::listed);
+        let Some((Pick::Chosen { source, cast }, settings)) = chosen.zip(self.share_settings)
+        else {
+            active.shared.lock().unwrap().room.me.share = OwnShare::NotSharing;
+            return;
+        };
+        *active.cast.lock().unwrap() = Some(cast);
+        let source = ShareSource::Screen(source);
+        let _ = active
+            .commands
+            .send(Command::StartShare { source, settings });
+    }
+
+    /// Keeps the list of what could be shared current while it is shown:
+    /// windows open and close.
+    fn sync_choices(&mut self) {
+        if self.ui.share_choices.is_none() {
+            return;
+        }
+        if self.active.is_none() {
+            self.ui.share_choices = None;
+        } else if self.choices_listed.elapsed() >= CHOICES_LAST {
+            self.ui.share_choices = screen::choices();
+            self.choices_listed = Instant::now();
+        }
     }
 
     /// Brings the picture of the watched screen up to date, and says what
@@ -651,6 +704,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.reap();
         self.sync_audio(ui.ctx());
+        self.sync_choices();
         let picture = self.update_picture(ui.ctx());
         if self.ui.popped_out {
             self.popped_out_window(ui.ctx(), picture);

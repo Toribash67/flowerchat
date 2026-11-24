@@ -83,9 +83,16 @@ impl Drop for VirtualDevices {
 
 /// Draws frames for a while, as an open window would.
 fn run(harness: &mut Harness<'_, App>, seconds: f64) {
-    for _ in 0..(seconds / 0.05) as usize {
+    // Twenty frames a second by the clock, drawing included. How long
+    // drawing takes depends on what else the machine is doing, and what
+    // the tests count over this time, such as the frames of a shared
+    // screen, does not wait for it. The number of frames drawn stays the
+    // same either way: a menu needs a few to open before it can be clicked.
+    let started = std::time::Instant::now();
+    for frame in 1..=(seconds / 0.05) as u32 {
         harness.step();
-        std::thread::sleep(Duration::from_millis(50));
+        let due = started + Duration::from_millis(50) * frame;
+        std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
     }
 }
 
@@ -633,4 +640,79 @@ fn screens_are_shared_and_watched_through_the_interface() {
     assert_eq!(harness.state().error, None);
     let _ = other.send(Command::Leave);
     runtime.block_on(other_session).unwrap().unwrap();
+}
+
+/// On Windows, the window itself asks what to share, and then shares the
+/// real screen. Needs a monitor.
+#[cfg(windows)]
+#[test]
+fn what_to_share_is_chosen_in_the_window() {
+    gst::init().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let url = runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let config = Config {
+            ice_servers: vec![],
+        };
+        tokio::spawn(async move {
+            axum::serve(listener, flowerchat_server::app(config))
+                .await
+                .unwrap();
+        });
+        url
+    });
+    let args = Args::parse_from([
+        "flowerchat",
+        "--name",
+        "robin",
+        "--room",
+        ROOM,
+        "--server",
+        &url,
+        "--test-tone",
+        "--measure",
+        "--share-height",
+        "0",
+    ]);
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(1280.0, 720.0))
+        .build_eframe(|cc| App::new(cc, args).unwrap());
+    let button = Role::Button;
+    run(&mut harness, 0.5);
+    harness.get_by_role_and_label(button, "Join").click();
+    run(&mut harness, 5.0);
+    assert!(harness.query_by_label("In room").is_some(), "joined");
+
+    // Asked, and answered with nothing.
+    harness.get_by_label_contains("Share screen").click();
+    run(&mut harness, 0.5);
+    assert!(harness.query_by_label("Share what?").is_some());
+    assert!(
+        harness
+            .query_by_label_contains("Choosing a screen")
+            .is_some()
+    );
+    shot(&mut harness, "choosing");
+    harness.get_by_role_and_label(button, "Cancel").click();
+    run(&mut harness, 0.5);
+    assert!(harness.query_by_label("Share what?").is_none());
+    assert!(harness.query_by_label_contains("Share screen").is_some());
+
+    // Asked again, and answered with the first screen. The list is made
+    // anew every second, and the choice is still there after that.
+    harness.get_by_label_contains("Share screen").click();
+    run(&mut harness, 1.5);
+    harness.get_by_role_and_label(button, "Screen 1").click();
+    run(&mut harness, 4.0);
+    assert!(harness.query_by_label("Share what?").is_none());
+    assert!(harness.query_by_label_contains("Stop sharing").is_some());
+    assert!(
+        harness.query_by_label_contains("· 60 fps").is_some(),
+        "the screen is being sent"
+    );
+    harness.get_by_label_contains("Stop sharing").click();
+    run(&mut harness, 1.0);
+    assert!(harness.query_by_label_contains("Share screen").is_some());
+    assert_eq!(harness.state().error, None);
 }
