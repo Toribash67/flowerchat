@@ -81,6 +81,20 @@ Found on the way:
   confirmed on an HDR monitor yet; `WGPU_BACKEND=vulkan` brings the old
   behaviour back. The colours of a share are not part of this: colour
   bars come back from encoder and decoder within one step of 255.
+- Resizing the window stopped the whole desktop for about 240 ms, several
+  times in a few seconds of dragging. `DwmFlush` returns once per frame
+  Windows composes, so timing it from another program shows it: 2 to 7
+  such gaps in 6 seconds of resizing, in every one of 5 runs. In those
+  runs the desktop was also composed at flowerchat's pace (every 13 ms)
+  and not the monitor's (5.9 ms at 169 Hz) while the window was left
+  alone, which looks like Windows putting our frames on the screen
+  directly and the monitor following them; that part is a guess. Vulkan
+  did the same, OpenGL never. Now the window is drawn to a surface that
+  Windows composes (`Dx12SwapchainKind::DxgiFromVisual`) and declared
+  see-through (`COMPOSED` in `main.rs`), and neither happened in 5 runs.
+  Either one alone was not enough. Only tried in the lobby, not while
+  watching a screen. `WGPU_DX12_PRESENTATION_SYSTEM=hwnd` brings the old
+  way back.
 - A share that stands still, or moves little, arrives at a fraction of
   the bitrate set. That is the encoder not needing more: noise at a
   setting of 8.7 Mbit/s came out at 8.9, a ball on a plain background at

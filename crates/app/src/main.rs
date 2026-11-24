@@ -151,6 +151,17 @@ struct App {
 /// How long a list of what could be shared is shown before it is made anew.
 const CHOICES_LAST: Duration = Duration::from_secs(1);
 
+/// Whether our windows are declared see-through, which they never are: all
+/// of each is painted.
+///
+/// On Windows this, together with drawing to a surface that Windows
+/// composes, keeps Windows from putting our frames on the screen directly.
+/// When it did, the screen took its pace from our window, and every change
+/// of the window's size stopped the whole desktop for a quarter of a
+/// second: 3 to 6 times in 6 seconds of resizing, on an RTX 2070 SUPER at
+/// 169 Hz, and never since.
+const COMPOSED: bool = cfg!(windows);
+
 /// The heights at which frames of a watched screen are asked for. The
 /// smallest that is no smaller than the picture on the display is used, so
 /// that resizing the window does not mean a new size every moment.
@@ -488,7 +499,8 @@ impl App {
         let viewport = egui::ViewportBuilder::default()
             .with_title(format!("{name}'s screen · flowerchat"))
             .with_app_id("flowerchat")
-            .with_inner_size([1280.0, 720.0]);
+            .with_inner_size([1280.0, 720.0])
+            .with_transparent(COMPOSED);
         let id = egui::ViewportId::from_hash_of("shared-screen");
         let closed = ctx.show_viewport_immediate(id, viewport, |ui, _| {
             egui::CentralPanel::default()
@@ -845,7 +857,8 @@ fn main() -> anyhow::Result<()> {
             .with_title("flowerchat")
             .with_app_id("flowerchat")
             .with_inner_size([1280.0, 720.0])
-            .with_min_inner_size([340.0, 480.0]),
+            .with_min_inner_size([340.0, 480.0])
+            .with_transparent(COMPOSED),
         ..Default::default()
     };
     // On Windows the window is drawn through Direct3D, not Vulkan, which
@@ -853,10 +866,17 @@ fn main() -> anyhow::Result<()> {
     // windows to the brightness set for them; a window drawn through Vulkan
     // is left out of that, and the whole of it glares. `WGPU_BACKEND` still
     // overrides this.
+    //
+    // What is drawn is handed to Windows to put together with the rest of
+    // the desktop (see `COMPOSED`). `WGPU_DX12_PRESENTATION_SYSTEM=hwnd`
+    // brings the usual way back.
     #[cfg(windows)]
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
-        setup.instance_descriptor.backends =
-            eframe::wgpu::Backends::from_env().unwrap_or(eframe::wgpu::Backends::DX12);
+        use eframe::wgpu::{Backends, Dx12SwapchainKind};
+        let descriptor = &mut setup.instance_descriptor;
+        descriptor.backends = Backends::from_env().unwrap_or(Backends::DX12);
+        descriptor.backend_options.dx12.presentation_system =
+            Dx12SwapchainKind::from_env().unwrap_or(Dx12SwapchainKind::DxgiFromVisual);
     }
     eframe::run_native(
         "flowerchat",
