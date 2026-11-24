@@ -122,18 +122,27 @@ impl Codec {
         }
     }
 
-    /// The elements that turn frames into the encoded stream. The first is
-    /// named `encoder`.
+    /// The elements that turn frames into the encoded stream. The encoder
+    /// is named `encoder`.
     ///
     /// It sends a keyframe only when asked: a new viewer and a viewer that
     /// lost data both ask, and nobody else pays for it.
+    ///
+    /// Frames are copied to the graphics card ahead of the encoder, which
+    /// would otherwise do that itself and then hold on to the captured
+    /// frame until it has encoded it, on a thread of its own. A frame of a
+    /// screen belongs to PipeWire, and `pipewiresrc` (as of 1.6) locks up
+    /// for good when one thread hands a frame back at the moment the
+    /// capturing thread lets go of the frame it keeps for a still screen:
+    /// each then holds the lock the other waits for. With the copy made
+    /// here, on the capturing thread, no other thread ever holds one.
     fn encoder_description(self) -> String {
         let (profile, parser) = match self {
             Codec::H264 => ("video/x-h264,profile=high", "h264parse"),
             Codec::Hevc => ("video/x-h265,profile=main", "h265parse"),
         };
         format!(
-            "{} name=encoder preset=p4 tune=ultra-low-latency rc-mode=cbr                zerolatency=true bframes=0 gop-size=-1 repeat-sequence-header=true                min-force-key-unit-interval={KEYFRAME_SPACING_NS}              ! {profile} ! {parser} config-interval=-1 ! capsfilter caps={}",
+            "cudaupload ! {} name=encoder preset=p4 tune=ultra-low-latency rc-mode=cbr                zerolatency=true bframes=0 gop-size=-1 repeat-sequence-header=true                min-force-key-unit-interval={KEYFRAME_SPACING_NS}              ! {profile} ! {parser} config-interval=-1 ! capsfilter caps={}",
             self.encoder(),
             self.caps()
         )
@@ -747,6 +756,12 @@ impl EncoderState {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
+        // The screen goes first, so that its thread is gone by the time
+        // the other elements hand back the frames they still hold. See
+        // `Codec::encoder_description` for what happens otherwise.
+        if let Some(screen) = self.pipeline.by_name("screen") {
+            let _ = screen.set_state(gst::State::Null);
+        }
         let _ = self.pipeline.set_state(gst::State::Null);
         if let Some(bus) = self.pipeline.bus() {
             bus.unset_sync_handler();
