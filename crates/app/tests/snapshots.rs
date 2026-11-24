@@ -10,7 +10,7 @@ use flowerchat_app::settings::{DeviceChoice, SendMode};
 use flowerchat_app::talk::GlobalKey;
 use flowerchat_app::views::{self, Env, Picture, Screen, Tab, UiState};
 use flowerchat_client::audio::{AudioDevice, AudioDevices};
-use flowerchat_client::session::{ConnectionState, PeerStats, Route, Sharing, WatchStats};
+use flowerchat_client::session::{Codec, ConnectionState, PeerStats, Route, Sharing, WatchStats};
 
 const WIDE: Vec2 = Vec2::new(1280.0, 720.0);
 const NARROW: Vec2 = Vec2::new(360.0, 640.0);
@@ -111,6 +111,7 @@ fn env(devices: &AudioDevices) -> Env<'_> {
         global_key: GlobalKey::Off,
         transmitting: true,
         picture: None,
+        codecs: &Codec::ALL,
     }
 }
 
@@ -118,10 +119,14 @@ fn sharing(watchers: &[u64]) -> Sharing {
     Sharing {
         width: 1920,
         height: 1080,
+        source_width: 2560,
+        source_height: 1440,
         fps: 60,
+        codec: Codec::H264,
         kbps: 8700,
         sent_fps: 60.0,
         encode_ms: 4.0,
+        sound: true,
         watchers: watchers.to_vec(),
     }
 }
@@ -132,6 +137,8 @@ fn room_with_share() -> RoomModel {
     room.peers[0].sharing = Some(sharing(&[3, 5]));
     room.peers[0].stats.video_receiving_kbps = Some(8437.0);
     room.peers[0].stats.video_loss_percent = Some(0.0);
+    room.peers[0].stats.sound_receiving_kbps = Some(161.0);
+    room.peers[0].stream_volume = 0.8;
     room.timeline.push(Entry {
         time: "21:04".into(),
         kind: EntryKind::Event("alex started sharing a screen".into()),
@@ -307,6 +314,7 @@ fn room_wide_push_to_talk() {
         },
         transmitting: false,
         picture: None,
+        codecs: &Codec::ALL,
     };
     snapshot("room_wide_push_to_talk", WIDE, |ui| {
         views::draw(ui, Screen::Room(&room), &env, &mut state);
@@ -328,6 +336,7 @@ fn room_narrow_audio() {
         ),
         transmitting: false,
         picture: None,
+        codecs: &Codec::ALL,
     };
     snapshot("room_narrow_audio", NARROW, |ui| {
         views::draw(ui, Screen::Room(&room), &env, &mut state);
@@ -363,6 +372,7 @@ fn room_stream() {
     snapshot_with_picture("room_stream", WIDE, |ui, picture| {
         let env = Env {
             picture: Some(picture),
+            codecs: &Codec::ALL,
             ..env(&devices)
         };
         views::draw(ui, Screen::Room(&room), &env, &mut state);
@@ -375,6 +385,8 @@ fn room_stream_before_the_first_frame() {
     room.watching.as_mut().unwrap().stats = WatchStats::default();
     room.peers[0].stats.video_receiving_kbps = None;
     room.peers[0].stats.video_loss_percent = None;
+    room.peers[0].stats.sound_receiving_kbps = None;
+    room.peers[0].sharing.as_mut().unwrap().sound = false;
     let mut state = form();
     state.beside_screen = views::Beside::Audio;
     let devices = devices();
@@ -394,6 +406,7 @@ fn room_maximized() {
     snapshot_with_picture("room_maximized", WIDE, |ui, picture| {
         let env = Env {
             picture: Some(picture),
+            codecs: &Codec::ALL,
             ..env(&devices)
         };
         views::draw(ui, Screen::Room(&room), &env, &mut state);
@@ -410,6 +423,7 @@ fn room_narrow_screens() {
     snapshot_with_picture("room_narrow_screens", NARROW, |ui, picture| {
         let env = Env {
             picture: Some(picture),
+            codecs: &Codec::ALL,
             ..env(&devices)
         };
         views::draw(ui, Screen::Room(&room), &env, &mut state);

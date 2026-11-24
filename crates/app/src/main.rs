@@ -14,8 +14,8 @@ use flowerchat_app::theme;
 use flowerchat_app::views::{self, Action, Env, Picture, Screen, UiState};
 use flowerchat_client::audio::{self, AudioDevice, AudioDevices, DeviceWatch, MicCheck};
 use flowerchat_client::session::{
-    self, AudioSettings, Command, Event, FrameSink, SessionConfig, ShareSettings, ShareSource,
-    VideoFrame,
+    self, AudioSettings, Codec, Command, Event, FrameSink, SessionConfig, ShareSettings,
+    ShareSource, VideoFrame,
 };
 use flowerchat_client::video::parse_size;
 use flowerchat_protocol::PeerId;
@@ -68,13 +68,14 @@ struct Args {
     /// For testing: play nothing, and print how long clicks took to arrive.
     #[arg(long)]
     measure: bool,
-    /// Scale a shared screen down to this height if it is taller. 0 sends
-    /// it at the size it has.
-    #[arg(long, default_value_t = 1080)]
-    share_height: u32,
-    /// Frames per second to share a screen at.
-    #[arg(long, default_value_t = 60)]
-    share_fps: u32,
+    /// Scale a shared screen down to this height if it is taller, instead
+    /// of what was chosen last time. 0 sends it at the size it has.
+    #[arg(long)]
+    share_height: Option<u32>,
+    /// Frames per second to share a screen at, instead of what was chosen
+    /// last time.
+    #[arg(long)]
+    share_fps: Option<u32>,
     /// For testing: share a moving test picture of this size, such as
     /// 1920x1080, instead of asking which screen to share.
     #[arg(long, value_name = "WIDTHxHEIGHT", value_parser = size)]
@@ -134,6 +135,10 @@ struct App {
     picture: Option<egui::TextureHandle>,
     /// Whose screen the session was last told a size for, and the size.
     view_height: Option<(PeerId, u32)>,
+    /// The size and rate the session was last told to share at.
+    share_settings: Option<ShareSettings>,
+    /// The codecs this machine can share a screen in.
+    codecs: Vec<Codec>,
 }
 
 /// The heights at which frames of a watched screen are asked for. The
@@ -185,6 +190,11 @@ impl App {
             talk: Arc::default(),
             picture: None,
             view_height: None,
+            share_settings: None,
+            codecs: Codec::ALL
+                .into_iter()
+                .filter(|codec| codec.can_encode())
+                .collect(),
             args,
         };
         app.list_devices();
@@ -272,6 +282,15 @@ impl App {
                     volume: f64::from(volume),
                 }
             }
+            Action::SetStreamVolume { id, volume } => {
+                if let Some(peer) = room.peers.iter_mut().find(|peer| peer.id == id) {
+                    peer.stream_volume = volume;
+                }
+                Command::SetStreamVolume {
+                    id,
+                    volume: f64::from(volume),
+                }
+            }
             Action::SendChat(text) => {
                 let me = room.me.name.clone();
                 room.say(&clock(), me, text.clone());
@@ -286,10 +305,8 @@ impl App {
         let Some(active) = &self.active else {
             return;
         };
-        let settings = ShareSettings {
-            max_height: (self.args.share_height > 0).then_some(self.args.share_height),
-            fps: self.args.share_fps,
-        };
+        let settings = self.ui.settings.share();
+        self.share_settings = Some(settings);
         active.shared.lock().unwrap().room.me.share = OwnShare::Starting;
         if let Some((width, height)) = self.args.share_test {
             let source = ShareSource::TestPicture { width, height };
@@ -353,6 +370,22 @@ impl App {
             texture: texture.id(),
             size: texture.size_vec2(),
         })
+    }
+
+    /// Brings a share under way in line with the size and rate chosen.
+    fn sync_share(&mut self) {
+        let Some(active) = &self.active else {
+            return;
+        };
+        let sharing = matches!(
+            active.shared.lock().unwrap().room.me.share,
+            OwnShare::Sharing(_)
+        );
+        let settings = self.ui.settings.share();
+        if sharing && self.share_settings != Some(settings) {
+            self.share_settings = Some(settings);
+            let _ = active.commands.send(Command::SetShareSettings(settings));
+        }
     }
 
     /// Asks for the frames of the watched screen at about the size they are
@@ -623,6 +656,7 @@ impl eframe::App for App {
             global_key: self.talk.global_key(),
             transmitting: self.talk.transmitting(),
             picture,
+            codecs: &self.codecs,
         };
         let mic_level = f32::from_bits(self.lobby_level.load(Ordering::Relaxed));
         let actions = match &self.active {
@@ -651,6 +685,7 @@ impl eframe::App for App {
             }
         };
         self.sync_view_height();
+        self.sync_share();
         for action in actions {
             self.perform(action);
         }
@@ -697,6 +732,12 @@ fn settings_with(mut settings: Settings, args: &Args) -> Settings {
         settings.echo_cancellation = false;
         settings.noise_suppression = false;
         settings.automatic_volume = false;
+    }
+    if let Some(height) = args.share_height {
+        settings.share_height = (height > 0).then_some(height);
+    }
+    if let Some(fps) = args.share_fps {
+        settings.share_fps = fps;
     }
     settings
 }

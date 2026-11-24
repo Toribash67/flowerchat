@@ -72,6 +72,8 @@ pub struct PeerRow {
     pub sharing: Option<Sharing>,
     /// Playback gain, 1.0 being unchanged.
     pub volume: f32,
+    /// The same for the sound of this peer's shared screen.
+    pub stream_volume: f32,
     /// When this peer was last loud enough to count as speaking.
     last_loud: Option<Instant>,
     /// Whether we have had a mute status from this peer yet. The first one
@@ -90,6 +92,7 @@ impl PeerRow {
             stats: PeerStats::default(),
             sharing: None,
             volume: 1.0,
+            stream_volume: 1.0,
             last_loud: None,
             heard_status: false,
         }
@@ -330,6 +333,7 @@ impl RoomModel {
                     }
                 }
             }
+            Event::StreamLevel { .. } => {}
             Event::Watching { id, stats } => {
                 if let Some(watching) = &mut self.watching
                     && watching.id == id
@@ -387,6 +391,8 @@ pub fn meter_level(db: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use flowerchat_client::session::Codec;
+
     use super::*;
 
     fn room() -> RoomModel {
@@ -471,10 +477,14 @@ mod tests {
         Sharing {
             width: 1920,
             height: 1080,
+            source_width: 2560,
+            source_height: 1440,
             fps: 60,
+            codec: Codec::H264,
             kbps: 8700,
             sent_fps: 60.0,
             encode_ms: 4.0,
+            sound: true,
             watchers: watchers.to_vec(),
         }
     }

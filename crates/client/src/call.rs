@@ -27,11 +27,15 @@
 //! Every connection is set up to carry video in both directions from the
 //! start, so that sharing and watching need no new negotiation. A gate lets
 //! the stream through to a peer only while that peer watches.
+//!
+//! All of this exists once per [`Codec`], each with a stream of its own in
+//! every connection. Only the one the sharer has picked carries anything,
+//! and picking another moves the frames over to its stream.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use flowerchat_protocol::PeerId;
@@ -51,16 +55,29 @@ use crate::audio::{
 };
 use crate::ice::IceConfig;
 use crate::latency::{ClickDetector, write_clicks};
+use crate::sound::{STEREO, SoundSource, StreamSound};
 use crate::video::{
-    Decoder, Encoder, EncoderEvent, FrameSink, H264, ShareSettings, ShareSource, Sharing,
+    Codec, Decoder, Encoder, EncoderEvent, FrameSink, ShareSettings, ShareSource, Sharing,
     WatchStats,
 };
 
 /// Payload type we propose for Opus when we make the offer. An answer has to
 /// reuse whatever the offer picked instead.
 const OPUS_PAYLOAD_TYPE: i32 = 111;
-/// The same for H.264 video.
-const H264_PAYLOAD_TYPE: i32 = 96;
+/// The same for video in each codec. The numbers between are left for the
+/// streams that carry lost packets again.
+const fn video_payload_type(codec: Codec) -> i32 {
+    match codec {
+        Codec::H264 => 96,
+        Codec::Hevc => 98,
+    }
+}
+/// Least time between two keyframes asked for because frames arrive in a
+/// codec the viewer is not decoding.
+const KEYFRAME_REQUEST_SPACING: Duration = Duration::from_millis(500);
+/// The same for the sound that goes with a shared screen, which is Opus
+/// like the voice and told apart from it by this.
+const STREAM_SOUND_PAYLOAD_TYPE: i32 = 112;
 /// Ticks per second of video timestamps in RTP.
 const VIDEO_CLOCK_RATE: i32 = 90_000;
 /// The bitrate each connection is told it carries, which sets how soon it
@@ -86,6 +103,8 @@ const SPEAKER_SWAP_WAIT: Duration = Duration::from_millis(500);
 const MIC_LEVEL: &str = "mic_level";
 /// Prefix of the level element in a peer's receive branch; the id follows.
 const PEER_LEVEL_PREFIX: &str = "level-peer-";
+/// The same for the sound of a peer's shared screen.
+const STREAM_LEVEL_PREFIX: &str = "level-stream-";
 
 /// States of the gate between our share and one peer.
 const GATE_CLOSED: u8 = 0;
@@ -170,6 +189,12 @@ pub enum CallEvent {
         id: PeerId,
         stats: WatchStats,
     },
+    /// Loudness of the sound of a peer's shared screen, in dB below full
+    /// scale.
+    StreamLevel {
+        id: PeerId,
+        db: f32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +233,9 @@ pub struct PeerStats {
     pub video_receiving_kbps: Option<f64>,
     /// Bitrate of our shared screen towards this peer, while it watches.
     pub video_sending_kbps: Option<f64>,
+    /// Bitrate of the sound of the peer's shared screen, and of ours.
+    pub sound_receiving_kbps: Option<f64>,
+    pub sound_sending_kbps: Option<f64>,
 }
 
 pub struct Call {
@@ -233,9 +261,15 @@ pub struct Call {
     muted: Arc<AtomicBool>,
     /// Whether push-to-talk, if in use, currently lets the microphone out.
     transmitting: AtomicBool,
-    /// Where the encoded frames of our share enter the pipeline.
-    video_src: gst_app::AppSrc,
-    video_tee: gst::Element,
+    /// Where the encoded frames of our share enter the pipeline and are
+    /// handed out, for each codec.
+    video: Vec<VideoEntry>,
+    /// Where the sound of our share, already encoded, enters the pipeline
+    /// and is handed out.
+    sound_src: gst_app::AppSrc,
+    sound_tee: gst::Element,
+    /// Whether incoming sound is timed and not played.
+    measure: bool,
     /// Our share, while there is one.
     share: Arc<Mutex<Option<Share>>>,
     /// What we last told the peers about our share. Shared with the control
@@ -245,11 +279,23 @@ pub struct Call {
     incoming_loss: f64,
 }
 
+/// The way into the pipeline for our share in one codec.
+#[derive(Clone)]
+struct VideoEntry {
+    codec: Codec,
+    src: gst_app::AppSrc,
+    tee: gst::Element,
+}
+
 struct Share {
     encoder: Encoder,
     /// Frame rate and encoding time as last measured.
     sent_fps: f64,
     encode_ms: f64,
+    /// Whether the share is a test picture, whose sound is a test tone.
+    test: bool,
+    /// The sound that goes with it, if any is sent.
+    sound: Option<StreamSound>,
 }
 
 struct Peer {
@@ -267,17 +313,36 @@ struct Peer {
     volume: Mutex<f64>,
     /// Counters from the previous stats report, for rates.
     counters: Mutex<StatsHistory>,
-    video_send: Mutex<Option<SendBranch>>,
+    /// One per codec the connection carries.
+    video_send: Mutex<Vec<(Codec, SendBranch)>>,
     /// Whether our share goes out to this peer: one of the `GATE_` states.
     gate: Arc<AtomicU8>,
-    video_recv: Mutex<Option<gst::Bin>>,
+    video_recv: Mutex<Vec<gst::Bin>>,
     /// Decodes this peer's share while we watch it.
     viewer: Arc<Mutex<Option<Decoder>>>,
-    /// The payload type this connection uses for video, or -1 while that
-    /// is not settled.
-    video_payload: Arc<AtomicI32>,
+    /// The codec this peer last said it shares in.
+    shared_codec: Arc<Mutex<Codec>>,
+    /// The payload type this connection uses for video in each codec, as
+    /// far as that is settled.
+    video_payloads: Arc<Mutex<Vec<(Codec, i32)>>>,
     /// The tallest this peer's share is shown, or zero for any size.
     view_height: AtomicU32,
+    sound_send: Mutex<Option<SendBranch>>,
+    sound_recv: Mutex<Option<SoundRecv>>,
+    /// The payload type this connection uses for the sound of shared
+    /// screens, or -1 if it carries none.
+    sound_payload: Arc<AtomicI32>,
+    /// Playback gain for the sound of this peer's share.
+    sound_volume: Mutex<f64>,
+}
+
+/// What plays the sound of a peer's shared screen.
+struct SoundRecv {
+    bin: gst::Bin,
+    /// Where it enters the mix, and its volume control. Absent when the
+    /// sound is only measured.
+    mixer_pad: Option<gst::Pad>,
+    volume: Option<gst::Element>,
 }
 
 /// The counters of the previous stats report, per kind of media.
@@ -285,6 +350,10 @@ struct Peer {
 struct StatsHistory {
     audio: Option<Counters>,
     video: Option<Counters>,
+    /// When the video we watch and the video we send were last counted, in
+    /// milliseconds, and how many bytes they had come to.
+    video_in: Option<(f64, f64)>,
+    video_out: Option<(f64, f64)>,
 }
 
 /// Cumulative counters at the time of a stats report.
@@ -292,6 +361,15 @@ struct StatsHistory {
 struct Counters {
     packets_received: f64,
     packets_lost: f64,
+}
+
+impl Peer {
+    fn video_payload(&self, codec: Codec) -> Option<i32> {
+        let payloads = self.video_payloads.lock().unwrap();
+        payloads
+            .iter()
+            .find_map(|(known, payload)| (*known == codec).then_some(*payload))
+    }
 }
 
 struct SendBranch {
@@ -335,6 +413,21 @@ impl Call {
             )
         };
         let jitter_ns = u64::from(audio.jitter_ms) * 1_000_000;
+        // Voices are mono, but the sound of a shared screen is not, and
+        // both are played through the same mix. The click detector takes
+        // one channel.
+        let mixed = if measure { RAW_AUDIO } else { STEREO };
+        let video_entries: String = Codec::ALL
+            .iter()
+            .map(|codec| {
+                format!(
+                    "appsrc name=video_src_{id} is-live=true format=time caps={} \
+                     ! tee name=video_tee_{id} allow-not-linked=true ",
+                    codec.caps(),
+                    id = codec.id()
+                )
+            })
+            .collect();
         let description = format!(
             "volume name=mic_gate \
              ! level name={MIC_LEVEL} interval={LEVEL_INTERVAL_NS} post-messages=true \
@@ -343,9 +436,10 @@ impl Call {
              ! tee name=mic_tee allow-not-linked=true \
              audiomixer name=mixer force-live=true latency={MIXER_SLACK_NS} \
                min-upstream-latency={jitter_ns} \
-             ! {RAW_AUDIO} ! volume name=out_gate ! {playback} \
-             appsrc name=video_src is-live=true format=time caps={H264} \
-             ! tee name=video_tee allow-not-linked=true"
+             ! {mixed} ! volume name=out_gate ! {playback} \
+             {video_entries} \
+             appsrc name=sound_src is-live=true format=time \
+             ! tee name=sound_tee allow-not-linked=true"
         );
         debug!(%description, "building pipeline");
 
@@ -393,31 +487,43 @@ impl Call {
             Some((speakers, feed))
         };
 
-        let video_src = by_name("video_src")?
-            .downcast::<gst_app::AppSrc>()
-            .map_err(|_| anyhow!("the video entry is not an appsrc"))?;
         let share: Arc<Mutex<Option<Share>>> = Arc::default();
-        // A viewer that has lost data asks for a frame it can start over
-        // from. The request travels up the pipeline as an event and ends at
-        // the entry, from where the encoder has to be told by hand.
-        let weak_share = Arc::downgrade(&share);
-        video_src
-            .static_pad("src")
-            .ok_or_else(|| anyhow!("the video entry has no src pad"))?
-            .add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
-                if let Some(event) = info.event()
-                    && gst_video::ForceKeyUnitEvent::is(event)
-                    && let Some(share) = weak_share.upgrade()
-                    && let Some(share) = &*share.lock().unwrap()
-                {
-                    share.encoder.force_keyframe();
-                }
-                gst::PadProbeReturn::Ok
+        let mut video = Vec::new();
+        for codec in Codec::ALL {
+            let src = by_name(&format!("video_src_{}", codec.id()))?
+                .downcast::<gst_app::AppSrc>()
+                .map_err(|_| anyhow!("the video entry is not an appsrc"))?;
+            // A viewer that has lost data asks for a frame it can start
+            // over from. The request travels up the pipeline as an event
+            // and ends at the entry, from where the encoder has to be told
+            // by hand.
+            let weak_share = Arc::downgrade(&share);
+            src.static_pad("src")
+                .ok_or_else(|| anyhow!("the video entry has no src pad"))?
+                .add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+                    if let Some(event) = info.event()
+                        && gst_video::ForceKeyUnitEvent::is(event)
+                        && let Some(share) = weak_share.upgrade()
+                        && let Some(share) = &*share.lock().unwrap()
+                    {
+                        share.encoder.force_keyframe();
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            video.push(VideoEntry {
+                codec,
+                src,
+                tee: by_name(&format!("video_tee_{}", codec.id()))?,
             });
+        }
 
         let call = Self {
-            video_src,
-            video_tee: by_name("video_tee")?,
+            video,
+            sound_src: by_name("sound_src")?
+                .downcast::<gst_app::AppSrc>()
+                .map_err(|_| anyhow!("the sound entry is not an appsrc"))?,
+            sound_tee: by_name("sound_tee")?,
+            measure,
             share,
             announced: Arc::default(),
             frames: frames.unwrap_or_else(|| Arc::new(|_, _| {})),
@@ -475,6 +581,11 @@ impl Call {
                         .and_then(|id| id.parse().ok())
                     {
                         let _ = self.events.send(CallEvent::PeerLevel { id, db });
+                    } else if let Some(id) = source
+                        .strip_prefix(STREAM_LEVEL_PREFIX)
+                        .and_then(|id| id.parse().ok())
+                    {
+                        let _ = self.events.send(CallEvent::StreamLevel { id, db });
                     }
                 }
             }
@@ -599,6 +710,20 @@ impl Call {
         }
     }
 
+    /// Sets how loud the sound of one peer's shared screen is played, 1.0
+    /// being unchanged.
+    pub fn set_stream_volume(&self, id: PeerId, volume: f64) {
+        let Some(peer) = self.peers.lock().unwrap().get(&id).cloned() else {
+            return;
+        };
+        *peer.sound_volume.lock().unwrap() = volume;
+        if let Some(recv) = &*peer.sound_recv.lock().unwrap()
+            && let Some(control) = &recv.volume
+        {
+            control.set_property("volume", volume);
+        }
+    }
+
     /// Sends a chat message to everyone we are connected to.
     pub fn send_chat(&self, text: &str) {
         self.broadcast(&json!({ "chat": text }));
@@ -614,7 +739,7 @@ impl Call {
         else {
             bail!("the call has not started yet");
         };
-        let video_src = self.video_src.clone();
+        let entries = self.video.clone();
         let events = self.events.clone();
         let encoder = Encoder::start(
             source,
@@ -622,8 +747,10 @@ impl Call {
             &clock,
             base_time,
             move |event| match event {
-                EncoderEvent::Frame(buffer) => {
-                    let _ = video_src.push_buffer(buffer);
+                EncoderEvent::Frame(codec, buffer) => {
+                    if let Some(entry) = entries.iter().find(|entry| entry.codec == codec) {
+                        let _ = entry.src.push_buffer(buffer);
+                    }
                 }
                 EncoderEvent::Format => {
                     let _ = events.send(CallEvent::ShareFormat);
@@ -633,18 +760,45 @@ impl Call {
                 }
             },
         )?;
+        let test = matches!(source, ShareSource::TestPicture { .. });
+        let sound = settings.sound.then(|| self.attach_sound(test)).flatten();
         *self.share.lock().unwrap() = Some(Share {
             encoder,
             sent_fps: 0.0,
             encode_ms: 0.0,
+            test,
+            sound,
         });
         Ok(())
     }
 
-    /// Changes the size or rate of what we share, without a break.
+    /// Starts capturing the sound that goes with our share. A share is
+    /// worth having without it, so failing is noted and not passed on.
+    fn attach_sound(&self, test: bool) -> Option<StreamSound> {
+        let source = if test {
+            SoundSource::Tone
+        } else {
+            SoundSource::Programs
+        };
+        let (clock, base_time) = (self.pipeline.clock()?, self.pipeline.base_time()?);
+        let sound_src = self.sound_src.clone();
+        StreamSound::start(source, &clock, base_time, move |packet| {
+            let _ = sound_src.push_sample(&packet);
+        })
+        .inspect_err(|err| warn!("sharing without sound: {err:#}"))
+        .ok()
+    }
+
+    /// Changes the size, rate, bitrate or codec of what we share, or
+    /// whether sound goes with it, without a break.
     pub fn set_share_settings(&self, settings: ShareSettings) {
-        if let Some(share) = &*self.share.lock().unwrap() {
+        if let Some(share) = &mut *self.share.lock().unwrap() {
             share.encoder.set_settings(settings);
+            if settings.sound && share.sound.is_none() {
+                share.sound = self.attach_sound(share.test);
+            } else if !settings.sound {
+                share.sound = None;
+            }
         }
         self.announce_share();
     }
@@ -657,6 +811,7 @@ impl Call {
         for peer in self.peers.lock().unwrap().values() {
             peer.gate.store(GATE_CLOSED, Ordering::SeqCst);
         }
+
         // Stopping the encoder waits for its threads, so it happens with no
         // lock held that they might want.
         drop(share);
@@ -690,13 +845,18 @@ impl Call {
     pub fn announce_share(&self) {
         let format = self.share.lock().unwrap().as_ref().and_then(|share| {
             let (width, height, kbps) = share.encoder.format()?;
+            let (source_width, source_height) = share.encoder.source()?;
             Some(Sharing {
                 width,
                 height,
+                source_width,
+                source_height,
                 fps: share.encoder.settings().fps,
+                codec: share.encoder.settings().codec,
                 kbps,
                 sent_fps: share.sent_fps,
                 encode_ms: share.encode_ms,
+                sound: share.sound.is_some(),
                 watchers: Vec::new(),
             })
         });
@@ -743,7 +903,8 @@ impl Call {
         };
         let previous = if watch {
             let max_height = peer.view_height.load(Ordering::SeqCst);
-            let decoder = Decoder::start(id, self.frames.clone(), max_height)?;
+            let codec = *peer.shared_codec.lock().unwrap();
+            let decoder = Decoder::start(id, self.frames.clone(), max_height, codec)?;
             peer.viewer.lock().unwrap().replace(decoder)
         } else {
             peer.viewer.lock().unwrap().take()
@@ -788,6 +949,12 @@ impl Call {
     /// Asks every connection for its statistics; they arrive as events.
     pub fn request_stats(&self) {
         self.measure_video();
+        let sharing_in = self
+            .share
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|share| share.encoder.settings().codec);
         for peer in self.peers.lock().unwrap().values() {
             let events = self.events.clone();
             let weak_peer = Arc::downgrade(peer);
@@ -796,7 +963,13 @@ impl Call {
                     return;
                 };
                 trace!(peer = peer.id, "raw stats: {reply:?}");
-                let stats = read_stats(reply, &mut peer.counters.lock().unwrap());
+                let watching_in = peer.viewer.lock().unwrap().as_ref().map(Decoder::codec);
+                let payloads = StreamPayloads {
+                    sound: peer.sound_payload.load(Ordering::SeqCst),
+                    video_out: sharing_in.and_then(|codec| peer.video_payload(codec)),
+                    video_in: watching_in.and_then(|codec| peer.video_payload(codec)),
+                };
+                let stats = read_stats(reply, &mut peer.counters.lock().unwrap(), payloads);
                 let _ = events.send(CallEvent::PeerStats { id: peer.id, stats });
             });
             peer.webrtc
@@ -837,12 +1010,17 @@ impl Call {
             control: Mutex::new(None),
             volume: Mutex::new(1.0),
             counters: Mutex::default(),
-            video_send: Mutex::new(None),
+            video_send: Mutex::default(),
             gate: Arc::new(AtomicU8::new(GATE_CLOSED)),
-            video_recv: Mutex::new(None),
+            video_recv: Mutex::default(),
             viewer: Arc::default(),
-            video_payload: Arc::new(AtomicI32::new(-1)),
+            shared_codec: Arc::default(),
+            video_payloads: Arc::default(),
             view_height: AtomicU32::new(0),
+            sound_send: Mutex::new(None),
+            sound_recv: Mutex::new(None),
+            sound_payload: Arc::new(AtomicI32::new(-1)),
+            sound_volume: Mutex::new(1.0),
         });
 
         let events = self.events.clone();
@@ -869,6 +1047,7 @@ impl Call {
 
         let pipeline = self.pipeline.downgrade();
         let mixer = self.mixer.clone();
+        let measure = self.measure;
         let weak_peer = Arc::downgrade(&peer);
         webrtc.connect_pad_added(move |_, pad| {
             let (Some(pipeline), Some(peer)) = (pipeline.upgrade(), weak_peer.upgrade()) else {
@@ -881,16 +1060,29 @@ impl Call {
             let media = caps
                 .structure(0)
                 .and_then(|s| s.get::<String>("media").ok());
+            let payload = caps.structure(0).and_then(|s| s.get::<i32>("payload").ok());
             if media.as_deref() == Some("video") {
-                if let Err(err) = attach_video_recv_branch(&pipeline, &peer, pad) {
+                let codec = caps
+                    .structure(0)
+                    .and_then(|s| s.get::<&str>("encoding-name").ok())
+                    .and_then(Codec::from_rtp_name);
+                let attached = match codec {
+                    Some(codec) => attach_video_recv_branch(&pipeline, &peer, pad, codec),
+                    None => Err(anyhow!("it is in no codec we know: {caps}")),
+                };
+                if let Err(err) = attached {
                     warn!(peer = peer.id, "cannot take in incoming video: {err:#}");
+                }
+            } else if payload == Some(peer.sound_payload.load(Ordering::SeqCst)) {
+                if let Err(err) = attach_sound_recv_branch(&pipeline, &mixer, &peer, pad, measure) {
+                    warn!(peer = peer.id, "cannot play a stream's sound: {err:#}");
                 }
             } else if let Err(err) = attach_recv_branch(&pipeline, &mixer, &peer, pad) {
                 warn!(peer = peer.id, "cannot play incoming audio: {err:#}");
             }
         });
 
-        tune_feedback(&webrtc, peer.video_payload.clone());
+        tune_feedback(&webrtc, peer.video_payloads.clone());
         if self.incoming_loss > 0.0 {
             lose_incoming_packets(&webrtc, self.incoming_loss);
         }
@@ -899,7 +1091,11 @@ impl Call {
             // As the offerer we pick the payload types. As the answerer we
             // have to wait for the offer to learn them.
             self.attach_send_branch(&peer, OPUS_PAYLOAD_TYPE)?;
-            self.attach_video_send_branch(&peer, H264_PAYLOAD_TYPE)?;
+            for entry in &self.video {
+                let payload_type = video_payload_type(entry.codec);
+                self.attach_video_send_branch(&peer, entry, payload_type)?;
+            }
+            self.attach_sound_send_branch(&peer, STREAM_SOUND_PAYLOAD_TYPE)?;
         }
 
         // Data channels can only be created once the element has left NULL.
@@ -967,12 +1163,14 @@ impl Call {
         let was_watching = peer.gate.swap(GATE_CLOSED, Ordering::SeqCst) != GATE_CLOSED;
         let pipeline = self.pipeline.clone();
         let mixer = self.mixer.clone();
+        let video = std::mem::take(&mut *peer.video_send.lock().unwrap());
         let branches: Vec<SendBranch> = [
             peer.send.lock().unwrap().take(),
-            peer.video_send.lock().unwrap().take(),
+            peer.sound_send.lock().unwrap().take(),
         ]
         .into_iter()
         .flatten()
+        .chain(video.into_iter().map(|(_, branch)| branch))
         .collect();
         let tee_pads = branches.iter().map(|b| b.tee_pad.clone()).collect();
         // Stopping elements can block, so it happens off the thread that
@@ -997,16 +1195,30 @@ impl Call {
             debug!(peer = peer.id, "ignoring an offer that collided with ours");
             return Ok(());
         }
+        // The first audio in an offer is the voice. A second, if there is
+        // one, is the sound of shared screens.
+        let audio = payload_types(&sdp, "audio", "opus");
         if peer.send.lock().unwrap().is_none() {
-            let payload_type = payload_type(&sdp, "audio", "opus")
+            let payload_type = *audio
+                .first()
                 .ok_or_else(|| anyhow!("the offer does not include Opus audio"))?;
             self.attach_send_branch(peer, payload_type)?;
         }
-        // Not everyone offers video: the browser test page does not.
-        if peer.video_send.lock().unwrap().is_none()
-            && let Some(payload_type) = payload_type(&sdp, "video", "h264")
+        // Not everyone offers video: the browser test page does not. Nor
+        // need an offer have every codec.
+        for entry in &self.video {
+            let attached = peer.video_payload(entry.codec).is_some();
+            if !attached
+                && let Some(payload_type) =
+                    payload_types(&sdp, "video", entry.codec.rtp_name()).first()
+            {
+                self.attach_video_send_branch(peer, entry, *payload_type)?;
+            }
+        }
+        if peer.sound_send.lock().unwrap().is_none()
+            && let Some(payload_type) = audio.get(1)
         {
-            self.attach_video_send_branch(peer, payload_type)?;
+            self.attach_sound_send_branch(peer, *payload_type)?;
         }
 
         let offer =
@@ -1092,18 +1304,93 @@ impl Call {
         Ok(())
     }
 
-    /// Prepares this peer's connection for our share. Nothing is sent until
-    /// the peer asks to watch.
-    fn attach_video_send_branch(&self, peer: &Peer, payload_type: i32) -> Result<()> {
+    /// Prepares this peer's connection for the sound of our share. Nothing
+    /// is sent until the peer asks to watch.
+    fn attach_sound_send_branch(&self, peer: &Peer, payload_type: i32) -> Result<()> {
+        peer.sound_payload.store(payload_type, Ordering::SeqCst);
+        let ssrc = gst::glib::random_int();
+        let caps = gst::Caps::builder("application/x-rtp")
+            .field("media", "audio")
+            .field("encoding-name", "OPUS")
+            .field("clock-rate", 48_000i32)
+            .field("encoding-params", "2")
+            .field("sprop-stereo", "1")
+            .field("payload", payload_type)
+            .field("ssrc", ssrc)
+            .build();
+        let bin = gst::parse::bin_from_description(
+            &format!(
+                "queue leaky=downstream max-size-buffers=20 max-size-time=0 max-size-bytes=0 \
+                 ! rtpopuspay pt={payload_type} ssrc={ssrc} ! capsfilter caps=\"{caps}\""
+            ),
+            true,
+        )?;
+        self.pipeline.add(&bin)?;
+
+        let template = peer
+            .webrtc
+            .pad_template("sink_%u")
+            .ok_or_else(|| anyhow!("webrtcbin has no sink pad template"))?;
+        let webrtc_sink = peer
+            .webrtc
+            .request_pad(&template, None, Some(&caps))
+            .ok_or_else(|| anyhow!("webrtcbin refused a sink pad"))?;
+        bin.static_pad("src")
+            .ok_or_else(|| anyhow!("sound send branch has no src pad"))?
+            .link(&webrtc_sink)?;
+
+        bin.sync_state_with_parent()?;
+        let tee_pad = self
+            .sound_tee
+            .request_pad_simple("src_%u")
+            .ok_or_else(|| anyhow!("tee refused a src pad"))?;
+        // The sound goes to those the picture goes to.
+        let gate = peer.gate.clone();
+        tee_pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            if gate.load(Ordering::SeqCst) == GATE_CLOSED {
+                gst::PadProbeReturn::Drop
+            } else {
+                gst::PadProbeReturn::Ok
+            }
+        });
+        tee_pad.link(
+            &bin.static_pad("sink")
+                .ok_or_else(|| anyhow!("sound send branch has no sink pad"))?,
+        )?;
+
+        *peer.sound_send.lock().unwrap() = Some(SendBranch {
+            bin,
+            tee: self.sound_tee.clone(),
+            tee_pad,
+        });
+        Ok(())
+    }
+
+    /// Prepares this peer's connection for our share in one codec. Nothing
+    /// is sent until the peer asks to watch.
+    fn attach_video_send_branch(
+        &self,
+        peer: &Peer,
+        entry: &VideoEntry,
+        payload_type: i32,
+    ) -> Result<()> {
         // The stream is given its identifier here and not when the first
         // frame is sent, so that it is part of what gets negotiated. The
         // other side needs it to tell which stream to ask again for packets
         // that went missing.
-        peer.video_payload.store(payload_type, Ordering::SeqCst);
+        let codec = entry.codec;
+        peer.video_payloads
+            .lock()
+            .unwrap()
+            .push((codec, payload_type));
+        let payloader = match codec {
+            Codec::H264 => "rtph264pay",
+            Codec::Hevc => "rtph265pay",
+        };
         let ssrc = gst::glib::random_int();
         let caps = gst::Caps::builder("application/x-rtp")
             .field("media", "video")
-            .field("encoding-name", "H264")
+            .field("encoding-name", codec.rtp_name())
             .field("clock-rate", VIDEO_CLOCK_RATE)
             .field("payload", payload_type)
             .field("ssrc", ssrc)
@@ -1114,7 +1401,7 @@ impl Call {
         // other end, which then asks for a fresh start.
         let bin = gst::parse::bin_from_description(
             &format!(
-                "rtph264pay pt={payload_type} ssrc={ssrc} mtu={VIDEO_MTU} config-interval=-1 \
+                "{payloader} pt={payload_type} ssrc={ssrc} mtu={VIDEO_MTU} config-interval=-1 \
                    aggregate-mode=zero-latency \
                  ! queue leaky=downstream max-size-bytes={VIDEO_BACKLOG_BYTES} \
                    max-size-buffers=0 max-size-time=0 \
@@ -1142,8 +1429,8 @@ impl Call {
             .link(&webrtc_sink)?;
 
         bin.sync_state_with_parent()?;
-        let tee_pad = self
-            .video_tee
+        let tee_pad = entry
+            .tee
             .request_pad_simple("src_%u")
             .ok_or_else(|| anyhow!("tee refused a src pad"))?;
         let gate = peer.gate.clone();
@@ -1166,11 +1453,12 @@ impl Call {
                 .ok_or_else(|| anyhow!("video send branch has no sink pad"))?,
         )?;
 
-        *peer.video_send.lock().unwrap() = Some(SendBranch {
+        let branch = SendBranch {
             bin,
-            tee: self.video_tee.clone(),
+            tee: entry.tee.clone(),
             tee_pad,
-        });
+        };
+        peer.video_send.lock().unwrap().push((codec, branch));
         Ok(())
     }
 
@@ -1200,6 +1488,7 @@ impl Call {
         });
         let events = self.events.clone();
         let id = peer.id;
+        let shared_codec = peer.shared_codec.clone();
         channel.connect_on_message_string(move |_, message| {
             let Some(msg) = message.and_then(|text| serde_json::from_str::<Value>(text).ok())
             else {
@@ -1217,6 +1506,9 @@ impl Call {
             }
             if let Some(sharing) = msg.get("sharing") {
                 let sharing = Sharing::from_json(sharing);
+                if let Some(sharing) = &sharing {
+                    *shared_codec.lock().unwrap() = sharing.codec;
+                }
                 let _ = events.send(CallEvent::PeerSharing { id, sharing });
             }
         });
@@ -1280,23 +1572,86 @@ fn attach_recv_branch(
     Ok(())
 }
 
-/// Decodes nothing: takes a peer's shared screen out of the pipeline, still
-/// encoded, and hands it to whatever decoder is watching.
+/// Decodes the sound of a peer's shared screen and feeds it to the mixer,
+/// or with `measure`, which plays nothing, only reports how loud it is.
+fn attach_sound_recv_branch(
+    pipeline: &gst::Pipeline,
+    mixer: &gst::Element,
+    peer: &Peer,
+    webrtc_src: &gst::Pad,
+    measure: bool,
+) -> Result<()> {
+    let level = format!(
+        "level name={STREAM_LEVEL_PREFIX}{} interval={LEVEL_INTERVAL_NS} post-messages=true",
+        peer.id
+    );
+    let description = if measure {
+        format!(
+            "rtpopusdepay ! opusdec plc=true ! audioconvert ! {level} \
+             ! fakesink sync=false async=false"
+        )
+    } else {
+        format!(
+            "rtpopusdepay ! opusdec plc=true \
+             ! audioconvert ! audioresample ! capsfilter caps={STEREO} \
+             ! {level} ! volume name=volume"
+        )
+    };
+    let bin = gst::parse::bin_from_description(&description, true)?;
+    let volume = bin.by_name("volume");
+    if let Some(volume) = &volume {
+        volume.set_property("volume", *peer.sound_volume.lock().unwrap());
+    }
+    pipeline.add(&bin)?;
+    let mixer_pad = match bin.static_pad("src") {
+        Some(src) => {
+            let mixer_pad = mixer
+                .request_pad_simple("sink_%u")
+                .ok_or_else(|| anyhow!("mixer refused a sink pad"))?;
+            src.link(&mixer_pad)?;
+            Some(mixer_pad)
+        }
+        None => None,
+    };
+    bin.sync_state_with_parent()?;
+    webrtc_src.link(
+        &bin.static_pad("sink")
+            .ok_or_else(|| anyhow!("sound receive branch has no sink pad"))?,
+    )?;
+    debug!(peer = peer.id, name = %peer.name, "receiving a stream's sound");
+    *peer.sound_recv.lock().unwrap() = Some(SoundRecv {
+        bin,
+        mixer_pad,
+        volume,
+    });
+    Ok(())
+}
+
+/// Decodes nothing: takes a peer's shared screen in one codec out of the
+/// pipeline, still encoded, and hands it to whatever decoder is watching.
 fn attach_video_recv_branch(
     pipeline: &gst::Pipeline,
     peer: &Peer,
     webrtc_src: &gst::Pad,
+    codec: Codec,
 ) -> Result<()> {
+    let depayloader = match codec {
+        Codec::H264 => "rtph264depay",
+        Codec::Hevc => "rtph265depay",
+    };
     // After a loss, frames are held back until one arrives that can be
     // decoded on its own, and the sharer is asked for it.
     let bin = gst::parse::bin_from_description(
         &format!(
-            "rtph264depay request-keyframe=true wait-for-keyframe=true ! {H264} \
-             ! appsink name=out sync=false async=false"
+            "{depayloader} request-keyframe=true wait-for-keyframe=true ! {} \
+             ! appsink name=out sync=false async=false",
+            codec.caps()
         ),
         true,
     )?;
     let viewer = peer.viewer.clone();
+    let id = peer.id;
+    let mut last_request: Option<Instant> = None;
     bin.by_name("out")
         .and_then(|out| out.downcast::<gst_app::AppSink>().ok())
         .ok_or_else(|| anyhow!("video receive branch has no exit"))?
@@ -1304,11 +1659,41 @@ fn attach_video_recv_branch(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    if let Some(buffer) = sample.buffer_owned()
-                        && let Some(viewer) = &*viewer.lock().unwrap()
-                    {
-                        viewer.push(buffer);
+                    let Some(buffer) = sample.buffer_owned() else {
+                        return Ok(gst::FlowSuccess::Ok);
+                    };
+                    let mut viewer = viewer.lock().unwrap();
+                    let Some(decoder) = &mut *viewer else {
+                        return Ok(gst::FlowSuccess::Ok);
+                    };
+                    if decoder.codec() != codec {
+                        // The sharer has changed codec, and this is the
+                        // stream it changed to or the one it changed from.
+                        // A keyframe settles it: a stream that has ended
+                        // sends none. Should the new stream's first have
+                        // been taken for the old one's last, asking for
+                        // another puts it right.
+                        if buffer.flags().contains(gst::BufferFlags::DELTA_UNIT) {
+                            let due = last_request
+                                .is_none_or(|at| at.elapsed() >= KEYFRAME_REQUEST_SPACING);
+                            if due && let Some(pad) = sink.static_pad("sink") {
+                                last_request = Some(Instant::now());
+                                let request = gst_video::UpstreamForceKeyUnitEvent::builder()
+                                    .all_headers(true)
+                                    .build();
+                                pad.push_event(request);
+                            }
+                            return Ok(gst::FlowSuccess::Ok);
+                        }
+                        match decoder.for_codec(codec) {
+                            Ok(new) => *decoder = new,
+                            Err(err) => {
+                                warn!(peer = id, "cannot follow the change of codec: {err:#}");
+                                return Ok(gst::FlowSuccess::Ok);
+                            }
+                        }
                     }
+                    decoder.push(buffer);
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -1319,17 +1704,17 @@ fn attach_video_recv_branch(
         &bin.static_pad("sink")
             .ok_or_else(|| anyhow!("video receive branch has no sink pad"))?,
     )?;
-    debug!(peer = peer.id, name = %peer.name, "receiving video");
-    *peer.video_recv.lock().unwrap() = Some(bin);
+    debug!(peer = peer.id, name = %peer.name, codec = codec.label(), "receiving video");
+    peer.video_recv.lock().unwrap().push(bin);
     Ok(())
 }
 
 /// Sees to it that a connection can ask for lost video packets again, and
 /// can do so at once.
 ///
-/// `video_payload` holds the payload type the connection uses for video,
-/// once that is settled.
-fn tune_feedback(webrtc: &gst::Element, video_payload: Arc<AtomicI32>) {
+/// `video_payloads` holds the payload types the connection uses for video,
+/// once they are settled.
+fn tune_feedback(webrtc: &gst::Element, video_payloads: Arc<Mutex<Vec<(Codec, i32)>>>) {
     let Some(bin) = webrtc.downcast_ref::<gst::Bin>() else {
         return;
     };
@@ -1346,13 +1731,24 @@ fn tune_feedback(webrtc: &gst::Element, video_payload: Arc<AtomicI32>) {
             // then most requests for lost packets come too late. Routine
             // reports are not sent any more often for this.
             "rtpsession" => element.set_property("bandwidth", FEEDBACK_BANDWIDTH),
-            // webrtcbin turns retransmission on for everything a connection
-            // receives once one of its streams wants it. Voice is not set
-            // up for it, so asking would only use up the feedback that the
-            // video needs. A stream shows what it is by its first packet.
+            // webrtcbin turns retransmission on or off for everything a
+            // connection receives at once, by what the last of its streams
+            // wants. Here it is the video that wants it. Voice and stream
+            // sound are not set up for it, and asking for them would only
+            // use up the feedback that the video needs. So each stream is
+            // set on its own, by what its first packet shows it to be.
             "rtpjitterbuffer" => {
+                // Left alone, the buffer works out when the next packet
+                // is due and gives it up for lost when it does not come.
+                // A share that nobody watches, or that has moved to
+                // another codec, sends nothing for a while; the first
+                // packet after that would then be thrown away as too
+                // late, and with it what a decoder needs to start. Packets
+                // are still missed, and asked for again, as soon as a
+                // later one shows the gap.
+                element.set_property("rtx-next-seqnum", false);
                 let weak = element.downgrade();
-                let video_payload = video_payload.clone();
+                let video_payloads = video_payloads.clone();
                 let Some(pad) = element.static_pad("sink") else {
                     return;
                 };
@@ -1361,10 +1757,12 @@ fn tune_feedback(webrtc: &gst::Element, video_payload: Arc<AtomicI32>) {
                         .buffer()
                         .and_then(|buffer| buffer.map_readable().ok())
                         .and_then(|packet| packet.get(1).map(|byte| i32::from(byte & 0x7f)));
-                    if payload_type != Some(video_payload.load(Ordering::SeqCst))
-                        && let Some(jitterbuffer) = weak.upgrade()
-                    {
-                        jitterbuffer.set_property("do-retransmission", false);
+                    if let Some(jitterbuffer) = weak.upgrade() {
+                        let payloads = video_payloads.lock().unwrap();
+                        let is_video = payloads
+                            .iter()
+                            .any(|(_, payload)| Some(*payload) == payload_type);
+                        jitterbuffer.set_property("do-retransmission", is_video);
                     }
                     gst::PadProbeReturn::Remove
                 });
@@ -1441,12 +1839,32 @@ fn loss_since(object: &gst::StructureRef, previous: &mut Option<Counters>) -> Op
     (expected > 0.0).then(|| 100.0 * lost / expected)
 }
 
+/// The payload types of the streams of a connection that statistics are
+/// read for.
+struct StreamPayloads {
+    /// The sound of shared screens, which is audio like the voice and must
+    /// not be taken for it.
+    sound: i32,
+    /// The video we send and the video we watch, in the codec each is in
+    /// at the moment. The streams of the other codecs carry nothing, or
+    /// figures from before a change of codec.
+    video_out: Option<i32>,
+    video_in: Option<i32>,
+}
+
 /// Turns webrtcbin's statistics into the figures we show. `previous` holds
 /// the counters from the last report and is updated for the next one.
 ///
 /// The report is a structure with one nested structure per statistics
 /// object, named after its kind (`inbound-rtp`, `candidate-pair`, ...).
-fn read_stats(stats: &gst::StructureRef, previous: &mut StatsHistory) -> PeerStats {
+///
+/// `payloads` says which of the connection's streams the figures are
+/// wanted for.
+fn read_stats(
+    stats: &gst::StructureRef,
+    previous: &mut StatsHistory,
+    payloads: StreamPayloads,
+) -> PeerStats {
     let mut out = PeerStats::default();
     let entry = |id: &str| stats.get::<gst::Structure>(id).ok();
     let text = |s: &gst::StructureRef, field: &str| s.get::<String>(field).ok();
@@ -1457,9 +1875,13 @@ fn read_stats(stats: &gst::StructureRef, previous: &mut StatsHistory) -> PeerSta
         };
         // webrtcbin's own `kind` field says "audio" for incoming video, so
         // the codec is asked instead.
-        let mime_type = text(&object, "codec-id")
-            .and_then(|id| entry(&id))
-            .and_then(|codec| text(&codec, "mime-type"));
+        let codec = text(&object, "codec-id").and_then(|id| entry(&id));
+        let mime_type = codec.as_ref().and_then(|codec| text(codec, "mime-type"));
+        let payload_type = codec
+            .as_ref()
+            .and_then(|codec| number(codec, "payload-type"));
+        let carries = |payload: Option<i32>| payload.map(f64::from) == payload_type;
+        let is_sound = carries(Some(payloads.sound));
         let kind = match &mime_type {
             Some(mime_type) => mime_type.split('/').next().map(str::to_owned),
             None => text(&object, "kind"),
@@ -1469,17 +1891,23 @@ fn read_stats(stats: &gst::StructureRef, previous: &mut StatsHistory) -> PeerSta
             kind.as_deref() == Some("video"),
         );
         match object.name().as_str() {
+            "inbound-rtp" if is_sound => out.sound_receiving_kbps = source_kbps(&object),
+            "outbound-rtp" if is_sound => out.sound_sending_kbps = source_kbps(&object),
+            "remote-inbound-rtp" if is_sound => {}
             "inbound-rtp" if is_audio => {
                 out.jitter_ms = number(&object, "jitter").map(|seconds| seconds * 1000.0);
                 out.receiving_kbps = source_kbps(&object);
                 out.loss_percent = loss_since(&object, &mut previous.audio);
             }
-            "inbound-rtp" if is_video => {
-                out.video_receiving_kbps = source_kbps(&object);
+            "inbound-rtp" if is_video && carries(payloads.video_in) => {
+                out.video_receiving_kbps =
+                    kbps_since(&object, "bytes-received", &mut previous.video_in);
                 out.video_loss_percent = loss_since(&object, &mut previous.video);
             }
             "outbound-rtp" if is_audio => out.sending_kbps = source_kbps(&object),
-            "outbound-rtp" if is_video => out.video_sending_kbps = source_kbps(&object),
+            "outbound-rtp" if is_video && carries(payloads.video_out) => {
+                out.video_sending_kbps = kbps_since(&object, "bytes-sent", &mut previous.video_out);
+            }
             "remote-inbound-rtp" if is_audio => {
                 out.round_trip_ms =
                     number(&object, "round-trip-time").map(|seconds| seconds * 1000.0);
@@ -1526,6 +1954,26 @@ fn source_kbps(rtp: &gst::StructureRef) -> Option<f64> {
     number(&source, "bitrate").map(|bits_per_second| bits_per_second / 1000.0)
 }
 
+/// The bitrate of a stream's contents since the previous report, by the
+/// count of bytes in `field`. `previous` holds that report's count and is
+/// updated for the next one.
+///
+/// The RTP session's own figure is an average over many seconds, which
+/// suits a voice. A shared screen changes its bitrate when the sharer says
+/// so, and the figure should follow.
+fn kbps_since(
+    object: &gst::StructureRef,
+    field: &str,
+    previous: &mut Option<(f64, f64)>,
+) -> Option<f64> {
+    let now = (number(object, "timestamp")?, number(object, field)?);
+    let before = previous.replace(now)?;
+    let (milliseconds, bytes) = (now.0 - before.0, now.1 - before.1);
+    // A count that has gone down is that of another stream: the sharer
+    // has changed codec.
+    (milliseconds > 0.0 && bytes >= 0.0).then(|| bytes * 8.0 / milliseconds)
+}
+
 /// Cuts each of `tee_pads` off from what it feeds, at a moment when nothing
 /// is passing through it, and calls `done` after the last.
 ///
@@ -1567,9 +2015,16 @@ fn teardown(pipeline: &gst::Pipeline, mixer: &gst::Element, peer: &Peer, send: V
         let _ = pipeline.remove(&recv.bin);
         mixer.release_request_pad(&recv.mixer_pad);
     }
-    if let Some(bin) = peer.video_recv.lock().unwrap().take() {
+    for bin in peer.video_recv.lock().unwrap().drain(..) {
         let _ = bin.set_state(gst::State::Null);
         let _ = pipeline.remove(&bin);
+    }
+    if let Some(recv) = peer.sound_recv.lock().unwrap().take() {
+        let _ = recv.bin.set_state(gst::State::Null);
+        let _ = pipeline.remove(&recv.bin);
+        if let Some(mixer_pad) = &recv.mixer_pad {
+            mixer.release_request_pad(mixer_pad);
+        }
     }
     let _ = pipeline.remove(&peer.webrtc);
     debug!(peer = peer.id, "removed");
@@ -1610,28 +2065,21 @@ fn apply_and_send(
     let _ = events.send(CallEvent::Signal { to, data });
 }
 
-/// The payload type an offer assigns to `encoding` in its `kind` media
-/// ("audio" or "video"), if it offers that at all.
-fn payload_type(sdp: &gst_sdp::SDPMessageRef, kind: &str, encoding: &str) -> Option<i32> {
-    for media in sdp.medias() {
-        if media.media() != Some(kind) {
-            continue;
-        }
-        for format in media.formats() {
-            let Ok(payload_type) = format.parse::<i32>() else {
-                continue;
-            };
-            let matches = media.caps_from_media(payload_type).is_some_and(|caps| {
-                caps.structure(0)
-                    .and_then(|s| s.get::<&str>("encoding-name").ok())
-                    .is_some_and(|name| name.eq_ignore_ascii_case(encoding))
-            });
-            if matches {
-                return Some(payload_type);
-            }
-        }
-    }
-    None
+/// The payload type an offer assigns to `encoding` in each of its `kind`
+/// media ("audio" or "video") that has it, in the order of the offer.
+fn payload_types(sdp: &gst_sdp::SDPMessageRef, kind: &str, encoding: &str) -> Vec<i32> {
+    let in_media = |media: &gst_sdp::SDPMediaRef| {
+        media.formats().find_map(|format| {
+            let payload_type = format.parse::<i32>().ok()?;
+            let caps = media.caps_from_media(payload_type)?;
+            let name = caps.structure(0)?.get::<&str>("encoding-name").ok()?;
+            name.eq_ignore_ascii_case(encoding).then_some(payload_type)
+        })
+    };
+    sdp.medias()
+        .filter(|media| media.media() == Some(kind))
+        .filter_map(in_media)
+        .collect()
 }
 
 /// Nanoseconds to add to a time on `clock` to get monotonic system time.

@@ -1,6 +1,7 @@
 //! What the user has chosen on the audio panel, as it is saved between runs.
 
 use flowerchat_client::audio::{AudioDevice, AudioDevices, AudioSettings};
+use flowerchat_client::session::{Codec, ShareSettings};
 use serde::{Deserialize, Serialize};
 
 /// The top of the receive buffer slider.
@@ -20,6 +21,18 @@ pub struct Settings {
     /// The key that sends voice while this window has focus, by the name
     /// egui gives it.
     pub talk_key: Option<String>,
+    /// The tallest picture to send of a shared screen, or the size the
+    /// screen has.
+    pub share_height: Option<u32>,
+    /// Frames per second to share a screen at.
+    pub share_fps: u32,
+    /// Whether what the machine plays goes with a shared screen.
+    pub share_sound: bool,
+    /// The codec to share a screen in, by the name the engine gives it.
+    pub share_codec: String,
+    /// The bitrate to share a screen at, in kbit/s, or whatever suits the
+    /// size and frame rate of the picture.
+    pub share_kbps: Option<u32>,
 }
 
 /// A device the user picked. The label is kept so that the device can still
@@ -51,6 +64,7 @@ pub enum SendMode {
 impl Default for Settings {
     fn default() -> Self {
         let audio = AudioSettings::default();
+        let share = ShareSettings::default();
         Self {
             microphone: None,
             speakers: None,
@@ -60,6 +74,11 @@ impl Default for Settings {
             receive_buffer_ms: audio.jitter_ms,
             send: SendMode::Always,
             talk_key: None,
+            share_height: share.max_height,
+            share_fps: share.fps,
+            share_sound: share.sound,
+            share_codec: share.codec.id().into(),
+            share_kbps: share.kbps,
         }
     }
 }
@@ -76,6 +95,23 @@ impl Settings {
             automatic_volume: self.automatic_volume,
             jitter_ms: self.receive_buffer_ms,
         }
+    }
+
+    /// What the engine should make of a shared screen.
+    pub fn share(&self) -> ShareSettings {
+        ShareSettings {
+            max_height: self.share_height,
+            fps: self.share_fps.max(1),
+            sound: self.share_sound,
+            codec: self.share_codec(),
+            kbps: self.share_kbps,
+        }
+    }
+
+    /// The codec chosen for sharing a screen. A name that means nothing,
+    /// as a later version might have saved, gives way to the default.
+    pub fn share_codec(&self) -> Codec {
+        Codec::from_id(&self.share_codec).unwrap_or_default()
     }
 
     pub fn talk_key(&self) -> Option<egui::Key> {
@@ -128,6 +164,22 @@ mod tests {
         };
         let audio = settings.audio(&AudioDevices::default());
         assert_eq!(audio.output.as_deref(), Some("hdmi"));
+    }
+
+    #[test]
+    fn the_codec_survives_being_saved_by_name() {
+        let settings = Settings {
+            share_codec: Codec::Hevc.id().into(),
+            share_kbps: Some(6000),
+            ..Settings::default()
+        };
+        let share = settings.share();
+        assert_eq!((share.codec, share.kbps), (Codec::Hevc, Some(6000)));
+        let unknown = Settings {
+            share_codec: "vp12".into(),
+            ..Settings::default()
+        };
+        assert_eq!(unknown.share().codec, Codec::H264);
     }
 
     #[test]

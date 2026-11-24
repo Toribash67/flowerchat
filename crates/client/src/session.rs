@@ -17,7 +17,7 @@ pub use crate::call::{ConnectionState, PeerStats, Route};
 use crate::ice::IceConfig;
 use crate::signaling;
 pub use crate::video::{
-    FrameSink, ScreenSource, ShareSettings, ShareSource, Sharing, VideoFrame, WatchStats,
+    Codec, FrameSink, ScreenSource, ShareSettings, ShareSource, Sharing, VideoFrame, WatchStats,
 };
 
 /// How often connection statistics are refreshed.
@@ -59,13 +59,19 @@ pub enum Command {
         id: PeerId,
         volume: f64,
     },
+    /// Playback gain for the sound of one peer's shared screen.
+    SetStreamVolume {
+        id: PeerId,
+        volume: f64,
+    },
     SendChat(String),
     /// Starts sharing a screen with whoever in the room asks to watch.
     StartShare {
         source: ShareSource,
         settings: ShareSettings,
     },
-    /// Changes the size or frame rate of what we share, without a break.
+    /// Changes the size, frame rate, bitrate or codec of what we share, or
+    /// whether sound goes with it, without a break.
     SetShareSettings(ShareSettings),
     StopShare,
     /// Starts or stops watching what a peer shares.
@@ -139,6 +145,12 @@ pub enum Event {
     Watching {
         id: PeerId,
         stats: WatchStats,
+    },
+    /// Loudness of the sound of a peer's shared screen, in dB below full
+    /// scale, about twenty times a second while there is any.
+    StreamLevel {
+        id: PeerId,
+        db: f32,
     },
     /// A peer's screen could not be watched.
     WatchFailed {
@@ -243,6 +255,7 @@ pub async fn run(
                         Event::PeerSharing { id, sharing }
                     }
                     CallEvent::Watching { id, stats } => Event::Watching { id, stats },
+                    CallEvent::StreamLevel { id, db } => Event::StreamLevel { id, db },
                 };
                 let _ = events.send(event);
             }
@@ -262,6 +275,9 @@ pub async fn run(
                     }
                 }
                 Some(Command::SetPeerVolume { id, volume }) => call.set_peer_volume(id, volume),
+                Some(Command::SetStreamVolume { id, volume }) => {
+                    call.set_stream_volume(id, volume);
+                }
                 Some(Command::SendChat(text)) => call.send_chat(&text),
                 Some(Command::StartShare { source, settings }) => {
                     if let Err(err) = call.start_share(&source, settings) {

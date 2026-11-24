@@ -15,7 +15,7 @@ use egui::{
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use flowerchat_client::audio::{AudioDevice, AudioDevices};
-use flowerchat_client::session::{ConnectionState, Route};
+use flowerchat_client::session::{Codec, ConnectionState, Route};
 use flowerchat_protocol::PeerId;
 
 use crate::model::{Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
@@ -56,6 +56,8 @@ pub struct Env<'a> {
     pub transmitting: bool,
     /// The latest frame of the screen being watched, once there is one.
     pub picture: Option<Picture>,
+    /// The codecs this machine can share a screen in.
+    pub codecs: &'a [Codec],
 }
 
 /// A frame of a shared screen, ready to draw.
@@ -123,6 +125,11 @@ pub enum Action {
     SetMuted(bool),
     SetDeafened(bool),
     SetPeerVolume {
+        id: PeerId,
+        volume: f32,
+    },
+    /// The same for the sound of a peer's shared screen.
+    SetStreamVolume {
         id: PeerId,
         volume: f32,
     },
@@ -288,7 +295,10 @@ fn room_wide(
                 top: 12,
                 ..Margin::ZERO
             }))
-            .show(ui, |ui| me_block(ui, room, mode, true, actions));
+            .show(ui, |ui| {
+                let screen = Some((&mut state.settings, env.codecs));
+                me_block(ui, room, mode, screen, actions);
+            });
         CentralPanel::no_frame().show(ui, |ui| {
             app_name(ui);
             ui.add_space(10.0);
@@ -476,7 +486,7 @@ fn room_narrow(
         .resizable(false)
         .frame(bar(Margin::symmetric(12, 10)))
         // The Screens tab has what a wider window shows here about sharing.
-        .show(ui, |ui| me_block(ui, room, mode, false, actions));
+        .show(ui, |ui| me_block(ui, room, mode, None, actions));
 
     CentralPanel::default()
         .frame(
@@ -564,7 +574,10 @@ fn room_stream(
                     top: 10,
                     ..Margin::ZERO
                 }))
-                .show(ui, |ui| me_block(ui, room, mode, true, actions));
+                .show(ui, |ui| {
+                    let screen = Some((&mut state.settings, env.codecs));
+                    me_block(ui, room, mode, screen, actions);
+                });
             CentralPanel::no_frame().show(ui, |ui| {
                 row(ui, 36.0, |ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -672,16 +685,17 @@ fn room_stream(
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 24.0;
                     ui.columns(3, |columns| {
-                        let [picture, delivery, _] = columns else {
+                        let [picture, delivery, sound] = columns else {
                             return;
                         };
+                        stream_sound(sound, room, watching, &figures, actions);
                         figure_group(
                             picture,
                             "Picture",
                             &[
                                 ("Resolution", &figures.resolution),
                                 ("Frame rate", &figures.frame_rate),
-                                ("Codec", "H.264"),
+                                ("Codec", figures.codec),
                                 ("Bitrate", &figures.bitrate),
                             ],
                         );
@@ -733,13 +747,21 @@ fn room_maximized(
                         state.maximized = false;
                     }
                     pop_out_button(ui, state);
+                    if figures.sound
+                        && let Some(peer) = room.peer(watching.id)
+                    {
+                        stream_volume_rtl(ui, peer, 90.0, actions);
+                        ui.label(muted("Stream sound"));
+                        ui.add_space(4.0);
+                    }
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
                         ui.label(strong(format!("{name}'s screen")));
                         let line = format!(
-                            "{} · {} · H.264 · {} · delay {} · {} frames dropped",
+                            "{} · {} · {} · {} · delay {} · {} frames dropped",
                             figures.resolution,
                             figures.frame_rate,
+                            figures.codec,
                             figures.bitrate,
                             figures.delay,
                             figures.frames_dropped
@@ -846,6 +868,16 @@ fn screens_tab(
             ] {
                 kv(ui, key, value.as_str());
             }
+            if figures.sound
+                && let Some(peer) = room.peer(watching.id)
+            {
+                row(ui, 20.0, |ui| {
+                    ui.label(muted("Stream sound"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        stream_volume_rtl(ui, peer, 110.0, actions);
+                    });
+                });
+            }
             ui.add_space(8.0);
         }
 
@@ -886,6 +918,7 @@ fn screens_tab(
         ui.label(muted("Your screen"));
         own_share_figures(ui, room);
         ui.add_space(2.0);
+        share_pickers(ui, room, &mut state.settings, env.codecs);
         share_button(ui, &room.me.share, actions);
     });
 }
@@ -956,6 +989,59 @@ fn fit(within: Rect, shape: Vec2) -> Rect {
 /// A length of the interface in pixels of the display.
 fn display_pixels(ui: &Ui, length: f32) -> u32 {
     (length * ui.ctx().pixels_per_point()).ceil().max(0.0) as u32
+}
+
+/// The sound that comes with a shared screen: how loud to play it, and
+/// what arrives.
+fn stream_sound(
+    ui: &mut Ui,
+    room: &RoomModel,
+    watching: &Watching,
+    figures: &StreamFigures,
+    actions: &mut Vec<Action>,
+) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(8.0, 2.0);
+        ui.label(
+            strong("Stream sound")
+                .size(theme::SMALL)
+                .color(theme::MUTED),
+        );
+        ui.add_space(4.0);
+        let Some(peer) = room.peer(watching.id) else {
+            return;
+        };
+        if !figures.sound {
+            ui.label(muted(format!("{} shares without sound", peer.name)));
+            return;
+        }
+        row(ui, 18.0, |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let width = ui.available_width() - 34.0 - ui.spacing().item_spacing.x;
+                stream_volume_rtl(ui, peer, width, actions);
+            });
+        });
+        kv(ui, "Codec", "Opus, stereo");
+        kv(ui, "Bitrate", figures.sound_bitrate.as_str());
+    });
+}
+
+/// The volume of a shared screen's sound, for layouts that place widgets
+/// from the right: the percentage, and the slider left of it.
+fn stream_volume_rtl(ui: &mut Ui, peer: &PeerRow, width: f32, actions: &mut Vec<Action>) {
+    let text = format!("{:.0}%", peer.stream_volume * 100.0);
+    ui.add_sized([34.0, 16.0], egui::Label::new(muted(text)));
+    let mut volume = peer.stream_volume;
+    ui.spacing_mut().slider_width = width.max(20.0);
+    // The handle's size follows this height.
+    ui.spacing_mut().interact_size.y = 18.0;
+    let slider = egui::Slider::new(&mut volume, 0.0..=2.0).show_value(false);
+    if ui.add(slider).changed() {
+        actions.push(Action::SetStreamVolume {
+            id: peer.id,
+            volume,
+        });
+    }
 }
 
 /// A heading with labelled figures under it.
@@ -1353,8 +1439,15 @@ fn app_name(ui: &mut Ui) {
 }
 
 /// Your own status and controls: what you are sending, mute and deafen,
-/// and with `screen` also what you share of your screen.
-fn me_block(ui: &mut Ui, room: &RoomModel, mode: &str, screen: bool, actions: &mut Vec<Action>) {
+/// and with `screen`, which holds the choices for it and the codecs there
+/// are to choose from, also what you share of your screen.
+fn me_block(
+    ui: &mut Ui,
+    room: &RoomModel,
+    mode: &str,
+    screen: Option<(&mut Settings, &[Codec])>,
+    actions: &mut Vec<Action>,
+) {
     let me = &room.me;
     row(ui, 20.0, |ui| {
         ui.label(strong(&me.name));
@@ -1371,7 +1464,7 @@ fn me_block(ui: &mut Ui, room: &RoomModel, mode: &str, screen: bool, actions: &m
     kv(ui, "Sending", kbps(me.sending_kbps));
     kv(ui, "Codec", "Opus, 48 kHz");
     kv(ui, "Mode", mode);
-    if screen {
+    if screen.is_some() {
         own_share_figures(ui, room);
     }
     ui.add_space(4.0);
@@ -1401,7 +1494,8 @@ fn me_block(ui: &mut Ui, room: &RoomModel, mode: &str, screen: bool, actions: &m
             actions.push(Action::SetDeafened(!me.deafened));
         }
     });
-    if screen {
+    if let Some((settings, codecs)) = screen {
+        share_pickers(ui, room, settings, codecs);
         share_button(ui, &me.share, actions);
     }
 }
@@ -1409,13 +1503,121 @@ fn me_block(ui: &mut Ui, room: &RoomModel, mode: &str, screen: bool, actions: &m
 /// What we share of our screen, and with whom.
 fn own_share_figures(ui: &mut Ui, room: &RoomModel) {
     kv(ui, "Screen", own_share_text(&room.me.share));
-    if matches!(room.me.share, OwnShare::Sharing(_)) {
+    if let OwnShare::Sharing(sharing) = &room.me.share {
+        let video = format!(
+            "{} · {}",
+            sharing.codec.label(),
+            bitrate(Some(f64::from(sharing.kbps)))
+        );
+        kv(ui, "Video", video);
+        kv(ui, "Encoded in", format!("{:.0} ms", sharing.encode_ms));
         kv(
             ui,
             "Watched by",
             name_list(&room.my_watchers(), "Nobody yet"),
         );
     }
+}
+
+/// The heights a shared screen can be limited to. `None` sends it at the
+/// size it has.
+const SHARE_HEIGHTS: [Option<u32>; 5] = [None, Some(2160), Some(1440), Some(1080), Some(720)];
+const SHARE_RATES: [u32; 2] = [30, 60];
+/// The bitrates a shared screen can be held to, in Mbit/s.
+const SHARE_MBPS: [u32; 12] = [1, 2, 3, 4, 6, 8, 10, 15, 20, 30, 40, 50];
+
+/// The size, frame rate, bitrate and codec to share a screen at, the last
+/// from among `codecs`. All can be changed while sharing.
+fn share_pickers(ui: &mut Ui, room: &RoomModel, settings: &mut Settings, codecs: &[Codec]) {
+    // What the machine plays, with the call itself left out.
+    if option(ui, settings.share_sound, Mark::Check, "With sound").clicked() {
+        settings.share_sound = !settings.share_sound;
+    }
+    let source = match &room.me.share {
+        OwnShare::Sharing(sharing) => Some((sharing.source_width, sharing.source_height)),
+        _ => None,
+    };
+    let height_label = |choice: Option<u32>| match (choice, source) {
+        (None, Some((width, height))) => format!("As it is ({})", resolution(width, height)),
+        (None, None) => "As it is".to_owned(),
+        (Some(height), _) => format!("Up to {height}p"),
+    };
+    row(ui, theme::CONTROL_HEIGHT, |ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let width = ui.available_width() - 6.0;
+        ComboBox::from_id_salt("share-height")
+            .width((width * 0.6).floor())
+            .selected_text(height_label(settings.share_height))
+            .truncate()
+            .show_ui(ui, |ui| {
+                for choice in SHARE_HEIGHTS {
+                    let chosen = settings.share_height == choice;
+                    if ui.selectable_label(chosen, height_label(choice)).clicked() {
+                        settings.share_height = choice;
+                    }
+                }
+            });
+        ComboBox::from_id_salt("share-fps")
+            .width(ui.available_width())
+            .selected_text(format!("{} fps", settings.share_fps))
+            .truncate()
+            .show_ui(ui, |ui| {
+                for fps in SHARE_RATES {
+                    let chosen = settings.share_fps == fps;
+                    if ui.selectable_label(chosen, format!("{fps} fps")).clicked() {
+                        settings.share_fps = fps;
+                    }
+                }
+            });
+    });
+
+    // A codec chosen on another machine may not be one this one has.
+    let mut codec = settings.share_codec();
+    if !codecs.contains(&codec)
+        && let Some(first) = codecs.first()
+    {
+        codec = *first;
+        settings.share_codec = codec.id().into();
+    }
+    // Left to itself, the bitrate follows the size and frame rate. What it
+    // comes to is among the figures above while sharing.
+    let automatic = || "Auto bitrate".to_owned();
+    let set_bitrate = |kbps: u32| match kbps % 1000 {
+        0 => format!("{} Mbps", kbps / 1000),
+        _ => bitrate(Some(f64::from(kbps))),
+    };
+    row(ui, theme::CONTROL_HEIGHT, |ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let width = ui.available_width() - 6.0;
+        ComboBox::from_id_salt("share-bitrate")
+            .width((width * 0.6).floor())
+            .selected_text(settings.share_kbps.map_or_else(automatic, set_bitrate))
+            .truncate()
+            .show_ui(ui, |ui| {
+                let chosen = settings.share_kbps.is_none();
+                if ui.selectable_label(chosen, "Automatic bitrate").clicked() {
+                    settings.share_kbps = None;
+                }
+                for kbps in SHARE_MBPS.map(|mbps| mbps * 1000) {
+                    let chosen = settings.share_kbps == Some(kbps);
+                    if ui.selectable_label(chosen, set_bitrate(kbps)).clicked() {
+                        settings.share_kbps = Some(kbps);
+                    }
+                }
+            });
+        ComboBox::from_id_salt("share-codec")
+            .width(ui.available_width())
+            .selected_text(codec.label())
+            .truncate()
+            .show_ui(ui, |ui| {
+                for choice in codecs {
+                    let chosen = codec == *choice;
+                    if ui.selectable_label(chosen, choice.label()).clicked() {
+                        settings.share_codec = choice.id().into();
+                    }
+                }
+            });
+    });
 }
 
 /// Starts and stops sharing our own screen, across the width available.
@@ -1774,11 +1976,15 @@ fn bitrate(kbps: Option<f64>) -> String {
 struct StreamFigures {
     resolution: String,
     frame_rate: String,
+    codec: &'static str,
     bitrate: String,
     delay: String,
     frames_dropped: String,
     packets_lost: String,
     route: String,
+    /// Whether sound comes with the picture, and its bitrate.
+    sound: bool,
+    sound_bitrate: String,
 }
 
 impl StreamFigures {
@@ -1802,11 +2008,18 @@ impl StreamFigures {
             } else {
                 "–".into()
             },
+            codec: peer
+                .and_then(|peer| peer.sharing.as_ref())
+                .map_or("–", |sharing| sharing.codec.label()),
             bitrate: bitrate(peer.and_then(|peer| peer.stats.video_receiving_kbps)),
             delay: millis(delay),
             frames_dropped: percent(started.then_some(stats.dropped_percent)),
             packets_lost: percent(peer.and_then(|peer| peer.stats.video_loss_percent)),
             route: peer.map_or_else(|| "–".into(), route),
+            sound: peer
+                .and_then(|peer| peer.sharing.as_ref())
+                .is_some_and(|sharing| sharing.sound),
+            sound_bitrate: kbps(peer.and_then(|peer| peer.stats.sound_receiving_kbps)),
         }
     }
 }

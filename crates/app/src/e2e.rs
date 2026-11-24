@@ -17,7 +17,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use flowerchat_client::audio::{AudioSettings, MicCheck};
 use flowerchat_client::session::{
-    self, Command, Event, FrameSink, SessionConfig, ShareSettings, ShareSource,
+    self, Codec, Command, Event, FrameSink, SessionConfig, ShareSettings, ShareSource, Sharing,
 };
 use flowerchat_server::Config;
 use gst::prelude::*;
@@ -252,8 +252,11 @@ fn audio_settings_work_through_the_interface() {
     harness.step();
     assert!(hear_after_change(&mut harness, &us) > AUDIBLE_DB);
 
-    // Other speakers.
-    let pickers: Vec<_> = harness.get_all_by_role(Role::ComboBox).collect();
+    // Other speakers. The pickers further left are for sharing a screen.
+    let pickers: Vec<_> = harness
+        .get_all_by_role(Role::ComboBox)
+        .filter(|picker| picker.rect().left() > 240.0)
+        .collect();
     assert_eq!(pickers.len(), 2, "one for the microphone, one for speakers");
     pickers[1].click();
     drop(pickers);
@@ -348,8 +351,12 @@ fn screens_are_shared_and_watched_through_the_interface() {
     #[derive(Default)]
     struct Seen {
         frames: Vec<(u32, u32)>,
+        /// How many loudness reports of our share's sound have come in.
+        sound: usize,
         sharer: Option<u64>,
         shares: usize,
+        /// The last we heard of what is shared.
+        share: Option<Sharing>,
     }
     let seen = Arc::new(Mutex::new(Seen::default()));
     let frame_log = seen.clone();
@@ -377,10 +384,15 @@ fn screens_are_shared_and_watched_through_the_interface() {
     let log = seen.clone();
     runtime.spawn(async move {
         while let Some(event) = events.recv().await {
-            if let Event::PeerSharing { id, sharing } = event {
-                let mut seen = log.lock().unwrap();
-                seen.sharer = sharing.is_some().then_some(id);
-                seen.shares += usize::from(sharing.is_some());
+            let mut seen = log.lock().unwrap();
+            match event {
+                Event::PeerSharing { id, sharing } => {
+                    seen.sharer = sharing.is_some().then_some(id);
+                    seen.shares += usize::from(sharing.is_some());
+                    seen.share = sharing;
+                }
+                Event::StreamLevel { .. } => seen.sound += 1,
+                _ => {}
             }
         }
     });
@@ -396,7 +408,7 @@ fn screens_are_shared_and_watched_through_the_interface() {
         "--test-tone",
         "--measure",
         "--share-test",
-        "1280x720",
+        "1920x1080",
         "--share-height",
         "0",
     ]);
@@ -413,7 +425,7 @@ fn screens_are_shared_and_watched_through_the_interface() {
     harness.get_by_label_contains("Share screen").click();
     run(&mut harness, 3.0);
     assert!(harness.query_by_label_contains("Stop sharing").is_some());
-    assert!(harness.query_by_label("1280 × 720 · 60 fps").is_some());
+    assert!(harness.query_by_label("1920 × 1080 · 60 fps").is_some());
     assert!(harness.query_by_label("Nobody yet").is_some());
     let us = seen
         .lock()
@@ -439,9 +451,83 @@ fn screens_are_shared_and_watched_through_the_interface() {
     {
         let seen = seen.lock().unwrap();
         assert!(seen.frames.len() > 60, "our screen arrives over there");
-        assert_eq!(seen.frames.last(), Some(&(1280, 720)));
+        assert_eq!(seen.frames.last(), Some(&(1920, 1080)));
+        assert!(seen.sound > 0, "and its sound with it");
+    }
+
+    // Without sound, and with it again.
+    harness.get_by_label("With sound").click();
+    run(&mut harness, 1.5);
+    seen.lock().unwrap().sound = 0;
+    run(&mut harness, 1.5);
+    assert_eq!(seen.lock().unwrap().sound, 0, "the picture goes on alone");
+    harness.get_by_label("With sound").click();
+    run(&mut harness, 2.0);
+    assert!(seen.lock().unwrap().sound > 0, "the sound is back");
+
+    // A smaller picture and fewer frames, chosen while sharing. The
+    // pickers for the share are the four on the left, in two rows; the
+    // others are for sound.
+    let pick = |harness: &mut Harness<'_, App>, picker: usize, choice: &str| {
+        let mut pickers: Vec<_> = harness
+            .get_all_by_role(Role::ComboBox)
+            .filter(|picker| picker.rect().left() < 240.0)
+            .collect();
+        pickers.sort_by(|a, b| {
+            let place = |rect: egui::Rect| (rect.top().round() as i32, rect.left().round() as i32);
+            place(a.rect()).cmp(&place(b.rect()))
+        });
+        assert_eq!(pickers.len(), 4, "size and rate, bitrate and codec");
+        pickers[picker].click();
+        drop(pickers);
+        run(harness, 0.1);
+        harness.get_by_label(choice).click();
+        run(harness, 0.5);
+    };
+    pick(&mut harness, 0, "Up to 720p");
+    pick(&mut harness, 1, "30 fps");
+    run(&mut harness, 2.0);
+    assert!(harness.query_by_label("1280 × 720 · 30 fps").is_some());
+    seen.lock().unwrap().frames.clear();
+    run(&mut harness, 2.0);
+    {
+        let seen = seen.lock().unwrap();
+        assert!(seen.frames.iter().all(|size| *size == (1280, 720)));
+        assert!(
+            (50..70).contains(&seen.frames.len()),
+            "{} frames in two seconds at 30 a second",
+            seen.frames.len()
+        );
     }
     shot(&mut harness, "sharing");
+
+    // Another codec and a bitrate of our choosing, also while sharing. The
+    // other one keeps watching through both.
+    assert!(
+        harness
+            .query_by_label_contains("H.264 · 2.7 Mbps")
+            .is_some()
+    );
+    pick(&mut harness, 3, "HEVC");
+    pick(&mut harness, 2, "2 Mbps");
+    run(&mut harness, 2.0);
+    assert!(harness.query_by_label_contains("HEVC · 2.0 Mbps").is_some());
+    seen.lock().unwrap().frames.clear();
+    run(&mut harness, 2.0);
+    {
+        let seen = seen.lock().unwrap();
+        let share = seen.share.as_ref().expect("we are still sharing");
+        assert_eq!((share.codec, share.kbps), (Codec::Hevc, 2000));
+        assert!(
+            (50..70).contains(&seen.frames.len()),
+            "{} frames in two seconds of HEVC",
+            seen.frames.len()
+        );
+    }
+    shot(&mut harness, "sharing-hevc");
+    pick(&mut harness, 2, "Automatic bitrate");
+    run(&mut harness, 2.0);
+    assert!(harness.query_by_label_contains("HEVC · 2.1 Mbps").is_some());
 
     // The other one shares, and we watch.
     other
@@ -453,6 +539,9 @@ fn screens_are_shared_and_watched_through_the_interface() {
             settings: ShareSettings {
                 max_height: None,
                 fps: 30,
+                sound: true,
+                codec: Codec::Hevc,
+                kbps: Some(4000),
             },
         })
         .unwrap();
@@ -470,6 +559,10 @@ fn screens_are_shared_and_watched_through_the_interface() {
         "frames arrive"
     );
     assert!(harness.query_by_label("1 watching: you").is_some());
+    assert!(
+        harness.query_by_label("Opus, stereo").is_some(),
+        "its sound has its own controls"
+    );
     // The frames come at about the size they are drawn at, and not at the
     // size they are sent at, which would be wasted on this window.
     let picture = harness
@@ -484,7 +577,8 @@ fn screens_are_shared_and_watched_through_the_interface() {
     run(&mut harness, 1.5);
     assert!(
         harness
-            .query_by_label_contains("1920 × 1080 · 30 fps")
+            // The frame rate shown is measured, and may read a frame off.
+            .query_by_label_contains("1920 × 1080 · ")
             .is_some()
     );
     let picture = harness.state().picture.as_ref().unwrap();

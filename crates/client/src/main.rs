@@ -8,7 +8,8 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use flowerchat_client::latency::Summary;
 use flowerchat_client::session::{
-    self, AudioSettings, Command, Event, ScreenSource, SessionConfig, ShareSettings, ShareSource,
+    self, AudioSettings, Codec, Command, Event, ScreenSource, SessionConfig, ShareSettings,
+    ShareSource,
 };
 use flowerchat_protocol::PeerId;
 use tokio::sync::mpsc::unbounded_channel;
@@ -70,6 +71,16 @@ struct Args {
     /// Frames per second to share at.
     #[arg(long, default_value_t = 60)]
     share_fps: u32,
+    /// Share the picture without the sound that goes with it.
+    #[arg(long)]
+    share_silent: bool,
+    /// Codec to share in: h264 or hevc.
+    #[arg(long, default_value = "h264", value_parser = parse_codec)]
+    share_codec: Codec,
+    /// Bitrate to share at, in kbit/s. Without it, the bitrate follows the
+    /// size and frame rate of the picture.
+    #[arg(long)]
+    share_kbps: Option<u32>,
     /// Watch every screen that is shared, without showing it, and print how
     /// it goes once a second.
     #[arg(long)]
@@ -81,6 +92,10 @@ struct Args {
     /// Leave after this many seconds.
     #[arg(long)]
     duration: Option<u64>,
+}
+
+fn parse_codec(id: &str) -> Result<Codec, String> {
+    Codec::from_id(id).ok_or_else(|| format!("{id:?} is not one of h264 and hevc"))
 }
 
 #[tokio::main]
@@ -120,6 +135,9 @@ async fn main() -> Result<()> {
         settings: ShareSettings {
             max_height: args.share_height,
             fps: args.share_fps,
+            sound: !args.share_silent,
+            codec: args.share_codec,
+            kbps: args.share_kbps,
         },
     });
 
@@ -147,6 +165,9 @@ async fn main() -> Result<()> {
     let mut names: HashMap<PeerId, String> = HashMap::new();
     let mut levels: HashMap<PeerId, f32> = HashMap::new();
     let mut sharers: HashSet<PeerId> = HashSet::new();
+    // The loudest the sound of each watched screen has been since it was
+    // last printed.
+    let mut stream_levels: HashMap<PeerId, f32> = HashMap::new();
     let mut mic_level = f32::NEG_INFINITY;
     let mut summary = Summary::default();
     let mut leaving = false;
@@ -196,10 +217,11 @@ async fn main() -> Result<()> {
                     }
                     Event::PeerStats { .. } => {}
                     Event::OwnShare(Some(sharing)) => println!(
-                        "sharing {}x{} at {} fps, {} kbps: sent {:.1} fps, encoding takes {:.1} ms, watched by {:?}",
+                        "sharing {}x{} at {} fps, {} at {} kbps: sent {:.1} fps, encoding takes {:.1} ms, watched by {:?}",
                         sharing.width,
                         sharing.height,
                         sharing.fps,
+                        sharing.codec.label(),
                         sharing.kbps,
                         sharing.sent_fps,
                         sharing.encode_ms,
@@ -212,8 +234,12 @@ async fn main() -> Result<()> {
                         match sharing {
                             Some(sharing) if !was_sharing => {
                                 println!(
-                                    "peer {id} shares {}x{} at {} fps, {} kbps",
-                                    sharing.width, sharing.height, sharing.fps, sharing.kbps
+                                    "peer {id} shares {}x{} at {} fps, {} at {} kbps",
+                                    sharing.width,
+                                    sharing.height,
+                                    sharing.fps,
+                                    sharing.codec.label(),
+                                    sharing.kbps
                                 );
                                 sharers.insert(id);
                                 if args.watch {
@@ -227,10 +253,21 @@ async fn main() -> Result<()> {
                             _ => {}
                         }
                     }
-                    Event::Watching { id, stats } => println!(
-                        "watching peer {id}: {}x{} at {:.1} fps, {:.1}% dropped, ready in {:.1} ms",
-                        stats.width, stats.height, stats.fps, stats.dropped_percent, stats.decode_ms
-                    ),
+                    Event::Watching { id, stats } => {
+                        let sound = stream_levels.remove(&id).unwrap_or(f32::NEG_INFINITY);
+                        println!(
+                            "watching peer {id}: {}x{} at {:.1} fps, {:.1}% dropped, ready in {:.1} ms, sound {sound:.0} dB",
+                            stats.width,
+                            stats.height,
+                            stats.fps,
+                            stats.dropped_percent,
+                            stats.decode_ms
+                        );
+                    }
+                    Event::StreamLevel { id, db } => {
+                        let loudest = stream_levels.entry(id).or_insert(f32::NEG_INFINITY);
+                        *loudest = loudest.max(db);
+                    }
                     Event::WatchFailed { id, reason } => {
                         println!("cannot watch peer {id}: {reason}");
                     }

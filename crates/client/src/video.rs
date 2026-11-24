@@ -1,8 +1,8 @@
-//! Screen sharing: turning a picture source into one H.264 stream for all
+//! Screen sharing: turning a picture source into one encoded stream for all
 //! viewers, and a received stream back into frames.
 //!
 //! ```text
-//! source -> videorate -> videoscale -> nvh264enc -> h264parse -> [Encoder output]
+//! source -> videorate -> videoscale -> {nvh264enc -> h264parse} -> [Encoder output]
 //!
 //! [Decoder input] -> h264parse -> nvh264dec -> videoconvert -> [frames]
 //! ```
@@ -10,6 +10,9 @@
 //! Both run in pipelines of their own, apart from the call's. A pipeline has
 //! one latency for everything in it, so an encoder or a decoder inside the
 //! call's pipeline would delay the voice as well.
+//!
+//! The part in braces is replaced when the sharer picks another [`Codec`],
+//! and the decoder with it at the other end.
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -26,14 +29,12 @@ use gstreamer_video as gst_video;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-/// The encoded video as it travels between the pipelines: whole frames with
-/// start codes.
-pub(crate) const H264: &str = "video/x-h264,stream-format=byte-stream,alignment=au";
-/// The widest and tallest picture the H.264 encoder takes.
-const MAX_SIDE: u32 = 4096;
-/// Bits spent per pixel at 60 frames per second. 1080p60 comes to about
-/// 8.7 Mbit/s and 4K60 to about 35.
+/// Bits H.264 spends per pixel at 60 frames per second, unless the sharer
+/// sets a bitrate. 1080p60 comes to about 8.7 Mbit/s and 4K60 to about 35.
 const BITS_PER_PIXEL_AT_60: f64 = 0.07;
+/// The least and the most a sharer can set the bitrate to, in kbit/s.
+pub const MIN_KBPS: u32 = 300;
+pub const MAX_KBPS: u32 = 100_000;
 /// How many frames' worth of bits the encoder may spend on one frame. Low
 /// keeps the stream even, so a large frame does not arrive late.
 const FRAMES_OF_BURST: f64 = 2.0;
@@ -45,6 +46,125 @@ const TEST_PICTURE_FPS: u32 = 60;
 /// who starts watching needs a frame to start from.
 const STILL_SCREEN_REFRESH_MS: i32 = 100;
 
+/// How the picture is compressed on its way to the viewers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Codec {
+    /// Understood by everything, and the lightest to encode and decode.
+    #[default]
+    H264,
+    /// The same picture in fewer bits, or a better one in as many.
+    Hevc,
+}
+
+impl Codec {
+    pub const ALL: [Codec; 2] = [Codec::H264, Codec::Hevc];
+
+    /// The name people know it by.
+    pub fn label(self) -> &'static str {
+        match self {
+            Codec::H264 => "H.264",
+            Codec::Hevc => "HEVC",
+        }
+    }
+
+    /// The name it has in messages between clients, in saved settings and
+    /// on the command line.
+    pub fn id(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264",
+            Codec::Hevc => "hevc",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|codec| codec.id() == id)
+    }
+
+    /// Whether this machine can encode it.
+    pub fn can_encode(self) -> bool {
+        gst::ElementFactory::find(self.encoder()).is_some()
+    }
+
+    /// The name it has in RTP.
+    pub(crate) fn rtp_name(self) -> &'static str {
+        match self {
+            Codec::H264 => "H264",
+            Codec::Hevc => "H265",
+        }
+    }
+
+    pub(crate) fn from_rtp_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|codec| codec.rtp_name().eq_ignore_ascii_case(name))
+    }
+
+    /// The encoded video as it travels between the pipelines: whole frames
+    /// with start codes.
+    pub(crate) fn caps(self) -> &'static str {
+        match self {
+            Codec::H264 => "video/x-h264,stream-format=byte-stream,alignment=au",
+            Codec::Hevc => "video/x-h265,stream-format=byte-stream,alignment=au",
+        }
+    }
+
+    fn of_caps(caps: &gst::CapsRef) -> Option<Self> {
+        let name = caps.structure(0)?.name();
+        Self::ALL
+            .into_iter()
+            .find(|codec| codec.caps().starts_with(name.as_str()))
+    }
+
+    fn encoder(self) -> &'static str {
+        match self {
+            Codec::H264 => "nvh264enc",
+            Codec::Hevc => "nvh265enc",
+        }
+    }
+
+    /// The elements that turn frames into the encoded stream. The first is
+    /// named `encoder`.
+    ///
+    /// It sends a keyframe only when asked: a new viewer and a viewer that
+    /// lost data both ask, and nobody else pays for it.
+    fn encoder_description(self) -> String {
+        let (profile, parser) = match self {
+            Codec::H264 => ("video/x-h264,profile=high", "h264parse"),
+            Codec::Hevc => ("video/x-h265,profile=main", "h265parse"),
+        };
+        format!(
+            "{} name=encoder preset=p4 tune=ultra-low-latency rc-mode=cbr                zerolatency=true bframes=0 gop-size=-1 repeat-sequence-header=true                min-force-key-unit-interval={KEYFRAME_SPACING_NS}              ! {profile} ! {parser} config-interval=-1 ! capsfilter caps={}",
+            self.encoder(),
+            self.caps()
+        )
+    }
+
+    /// The elements that turn the encoded stream into frames. The last is
+    /// named `decoder`.
+    fn decoder_description(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264parse ! nvh264dec name=decoder",
+            Codec::Hevc => "h265parse ! nvh265dec name=decoder",
+        }
+    }
+
+    /// The widest and tallest picture its encoder takes.
+    fn max_side(self) -> u32 {
+        match self {
+            Codec::H264 => 4096,
+            Codec::Hevc => 8192,
+        }
+    }
+
+    /// The share of H.264's bits it needs for a picture as good.
+    fn bits_needed(self) -> f64 {
+        match self {
+            Codec::H264 => 1.0,
+            Codec::Hevc => 0.75,
+        }
+    }
+}
+
 /// What the person sharing chooses about the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShareSettings {
@@ -53,6 +173,12 @@ pub struct ShareSettings {
     pub max_height: Option<u32>,
     /// Most frames to send per second.
     pub fps: u32,
+    /// Whether to send along what the machine plays, the call left out.
+    pub sound: bool,
+    pub codec: Codec,
+    /// The bitrate to aim for, in kbit/s. `None` follows the size and
+    /// frame rate of the picture, as [`bitrate_kbps`] has it.
+    pub kbps: Option<u32>,
 }
 
 impl Default for ShareSettings {
@@ -60,6 +186,9 @@ impl Default for ShareSettings {
         Self {
             max_height: Some(1080),
             fps: 60,
+            sound: true,
+            codec: Codec::default(),
+            kbps: None,
         }
     }
 }
@@ -91,14 +220,21 @@ pub struct Sharing {
     /// Size of the picture being sent.
     pub width: u32,
     pub height: u32,
+    /// Size of the screen it is taken from, which is larger if the sharer
+    /// has it scaled down.
+    pub source_width: u32,
+    pub source_height: u32,
     /// Frames per second the sharer asked for.
     pub fps: u32,
+    pub codec: Codec,
     /// Bitrate the encoder aims for.
     pub kbps: u32,
     /// Frames per second actually sent of late.
     pub sent_fps: f64,
     /// Time from a frame being captured to it being encoded.
     pub encode_ms: f64,
+    /// Whether sound comes with the picture.
+    pub sound: bool,
     /// Who the stream is being sent to.
     pub watchers: Vec<PeerId>,
 }
@@ -109,9 +245,13 @@ impl Sharing {
             "width": self.width,
             "height": self.height,
             "fps": self.fps,
+            "codec": self.codec.id(),
             "kbps": self.kbps,
             "sentFps": self.sent_fps,
+            "sourceWidth": self.source_width,
+            "sourceHeight": self.source_height,
             "encodeMs": self.encode_ms,
+            "sound": self.sound,
             "watchers": self.watchers,
         })
     }
@@ -122,9 +262,17 @@ impl Sharing {
             width: number("width")?,
             height: number("height")?,
             fps: number("fps")?,
+            // Clients from before there was a choice sent H.264.
+            codec: match value["codec"].as_str() {
+                Some(id) => Codec::from_id(id)?,
+                None => Codec::H264,
+            },
             kbps: number("kbps")?,
             sent_fps: value["sentFps"].as_f64().unwrap_or(0.0),
+            source_width: number("sourceWidth").or(number("width"))?,
+            source_height: number("sourceHeight").or(number("height"))?,
             encode_ms: value["encodeMs"].as_f64().unwrap_or(0.0),
+            sound: value["sound"].as_bool().unwrap_or(false),
             watchers: value["watchers"]
                 .as_array()
                 .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
@@ -140,15 +288,16 @@ pub fn parse_size(text: &str) -> Option<(u32, u32)> {
 }
 
 /// The size to send a `source`-sized picture at.
-pub fn fit(source: (u32, u32), max_height: Option<u32>) -> (u32, u32) {
+pub fn fit(source: (u32, u32), max_height: Option<u32>, codec: Codec) -> (u32, u32) {
     let (width, height) = (source.0.max(2), source.1.max(2));
     let mut scale = 1.0_f64;
     if let Some(max) = max_height {
         scale = scale.min(f64::from(max) / f64::from(height));
     }
+    let max_side = f64::from(codec.max_side());
     scale = scale
-        .min(f64::from(MAX_SIDE) / f64::from(width))
-        .min(f64::from(MAX_SIDE) / f64::from(height));
+        .min(max_side / f64::from(width))
+        .min(max_side / f64::from(height));
     // The encoder works on even sizes only.
     if scale >= 1.0 {
         return (width & !1, height & !1);
@@ -157,14 +306,14 @@ pub fn fit(source: (u32, u32), max_height: Option<u32>) -> (u32, u32) {
     (even(width), even(height))
 }
 
-/// The bitrate for a picture of this size and rate. Half the frames do not
-/// halve the bits: with more time between frames, more changes from one to
-/// the next.
-pub fn bitrate_kbps(width: u32, height: u32, fps: u32) -> u32 {
+/// The bitrate for a picture of this size and rate, when the sharer has not
+/// set one. Half the frames do not halve the bits: with more time between
+/// frames, more changes from one to the next.
+pub fn bitrate_kbps(width: u32, height: u32, fps: u32, codec: Codec) -> u32 {
     let fps = f64::from(fps.max(1));
-    let bits_per_pixel = BITS_PER_PIXEL_AT_60 * (60.0 / fps).sqrt();
+    let bits_per_pixel = BITS_PER_PIXEL_AT_60 * (60.0 / fps).sqrt() * codec.bits_needed();
     let kbps = f64::from(width) * f64::from(height) * fps * bits_per_pixel / 1000.0;
-    ((kbps / 100.0).round() as u32 * 100).max(300)
+    ((kbps / 100.0).round() as u32 * 100).max(MIN_KBPS)
 }
 
 // --- Sending ----------------------------------------------------------------
@@ -173,7 +322,7 @@ pub fn bitrate_kbps(width: u32, height: u32, fps: u32) -> u32 {
 pub(crate) enum EncoderEvent {
     /// An encoded frame, with the time it was captured as running time of
     /// the call's pipeline.
-    Frame(gst::Buffer),
+    Frame(Codec, gst::Buffer),
     /// The size or rate of what is sent has changed.
     Format,
     /// The source has ended (`None`) or something broke.
@@ -185,13 +334,15 @@ pub(crate) struct Encoder {
     pipeline: gst::Pipeline,
     rate: gst::Element,
     size: gst::Element,
-    encoder: gst::Element,
+    /// Where the encoded frames leave the pipeline.
+    out: gst::Element,
     /// Tells the encoder how many frames per second to expect.
     pace: gst::Element,
     state: Arc<Mutex<EncoderState>>,
     counters: Arc<EncoderCounters>,
     /// When the counters were last read.
     last_read: Mutex<Instant>,
+    events: Arc<dyn Fn(EncoderEvent) + Send + Sync>,
     /// Kept open for as long as the screen is being read through it.
     _remote: Option<Arc<OwnedFd>>,
 }
@@ -202,6 +353,42 @@ struct EncoderState {
     source: Option<(u32, u32)>,
     /// Size and bitrate being sent.
     format: Option<(u32, u32, u32)>,
+    /// The part of the pipeline that belongs to the codec in use.
+    stage: EncodingStage,
+}
+
+/// The elements that encode with one codec, between the sized frames and
+/// the pipeline's exit.
+#[derive(Clone)]
+struct EncodingStage {
+    bin: gst::Bin,
+    encoder: gst::Element,
+}
+
+impl EncodingStage {
+    fn new(codec: Codec) -> Result<Self> {
+        let description = codec.encoder_description();
+        debug!(%description, "building the encoding stage");
+        let bin = gst::parse::bin_from_description(&description, true)
+            .with_context(|| format!("cannot encode {} on this machine", codec.label()))?;
+        let encoder = bin
+            .by_name("encoder")
+            .ok_or_else(|| anyhow!("the encoding stage has no encoder"))?;
+        Ok(Self { bin, encoder })
+    }
+
+    /// Puts the stage in place between `size` and `out`.
+    fn place(
+        &self,
+        pipeline: &gst::Pipeline,
+        size: &gst::Element,
+        out: &gst::Element,
+    ) -> Result<()> {
+        pipeline.add(&self.bin)?;
+        size.link(&self.bin)?;
+        self.bin.link(out)?;
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -240,9 +427,6 @@ impl Encoder {
                    keepalive-time={STILL_SCREEN_REFRESH_MS}"
             ),
         };
-        // The encoder sends a keyframe only when asked: a new viewer and a
-        // viewer that lost data both ask, and nobody else pays for it.
-        //
         // A screen delivers frames at no fixed rate, and says so. The
         // encoder shares out its bitrate by the rate it expects, so it is
         // told the most it can get.
@@ -252,11 +436,7 @@ impl Encoder {
              ! capssetter name=pace join=true replace=false caps=\"{}\" \
              ! videoconvert n-threads=2 ! videoscale add-borders=false n-threads=4 \
              ! capsfilter name=size \
-             ! nvh264enc name=encoder preset=p4 tune=ultra-low-latency rc-mode=cbr \
-               zerolatency=true bframes=0 gop-size=-1 repeat-sequence-header=true \
-               min-force-key-unit-interval={KEYFRAME_SPACING_NS} \
-             ! video/x-h264,profile=high ! h264parse config-interval=-1 ! {H264} \
-             ! appsink name=out sync=false",
+             appsink name=out sync=false",
             settings.fps,
             pace_caps(settings.fps)
         );
@@ -270,8 +450,10 @@ impl Encoder {
                 .by_name(name)
                 .ok_or_else(|| anyhow!("encoder element {name} is missing"))
         };
-        let (rate, size, encoder) = (by_name("rate")?, by_name("size")?, by_name("encoder")?);
+        let (rate, size, out) = (by_name("rate")?, by_name("size")?, by_name("out")?);
         let pace = by_name("pace")?;
+        let stage = EncodingStage::new(settings.codec)?;
+        stage.place(&pipeline, &size, &out)?;
         let remote = match source {
             ShareSource::Screen(screen) => {
                 let pipewire = by_name("screen")?;
@@ -287,13 +469,14 @@ impl Encoder {
             settings,
             source: None,
             format: None,
+            stage,
         }));
         let counters = Arc::new(EncoderCounters::default());
-        let events = Arc::new(events);
+        let events: Arc<dyn Fn(EncoderEvent) + Send + Sync> = Arc::new(events);
 
         // The source says how large its picture is, also when that changes
         // later. Everything after it follows.
-        let (weak_size, weak_encoder) = (size.downgrade(), encoder.downgrade());
+        let weak_size = size.downgrade();
         let (probe_state, probe_events) = (state.clone(), events.clone());
         rate.static_pad("sink")
             .ok_or_else(|| anyhow!("the frame rate limiter has no sink pad"))?
@@ -305,10 +488,10 @@ impl Encoder {
                 let Ok(video) = gst_video::VideoInfo::from_caps(caps.caps()) else {
                     return gst::PadProbeReturn::Ok;
                 };
-                if let (Some(size), Some(encoder)) = (weak_size.upgrade(), weak_encoder.upgrade()) {
+                if let Some(size) = weak_size.upgrade() {
                     let mut state = probe_state.lock().unwrap();
                     state.source = Some((video.width(), video.height()));
-                    state.configure(&size, &encoder);
+                    state.configure(&size);
                     drop(state);
                     probe_events(EncoderEvent::Format);
                 }
@@ -318,7 +501,8 @@ impl Encoder {
         // Both pipelines count time on the same clock, but from different
         // starting points.
         pipeline.use_clock(Some(clock));
-        let sink = by_name("out")?
+        let sink = out
+            .clone()
             .downcast::<gst_app::AppSink>()
             .map_err(|_| anyhow!("the encoder's output is not an appsink"))?;
         let (sink_counters, sink_events) = (counters.clone(), events.clone());
@@ -328,6 +512,12 @@ impl Encoder {
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let mut buffer = sample.buffer_owned().ok_or(gst::FlowError::Error)?;
+                    // The frame itself says which codec made it: around a
+                    // change of codec, the settings may be a frame ahead.
+                    let codec = sample
+                        .caps()
+                        .and_then(Codec::of_caps)
+                        .ok_or(gst::FlowError::NotNegotiated)?;
                     let own_base = weak_pipeline.upgrade().and_then(|p| p.base_time());
                     let captured = sample
                         .segment()
@@ -347,14 +537,16 @@ impl Encoder {
                     let buffer_mut = buffer.make_mut();
                     buffer_mut.set_pts(captured_at.saturating_sub(base_time));
                     buffer_mut.set_dts(gst::ClockTime::NONE);
-                    sink_events(EncoderEvent::Frame(buffer));
+                    sink_events(EncoderEvent::Frame(codec, buffer));
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
         );
 
         let bus = pipeline.bus().expect("pipelines always have a bus");
+        let bus_events = events.clone();
         bus.set_sync_handler(move |_, message| {
+            let events = &bus_events;
             match message.view() {
                 gst::MessageView::Error(err) => {
                     let source = err.src().map(|s| s.path_string()).unwrap_or_default();
@@ -374,11 +566,12 @@ impl Encoder {
             pipeline,
             rate,
             size,
-            encoder,
+            out,
             pace,
             state,
             counters,
             last_read: Mutex::new(Instant::now()),
+            events,
             _remote: remote,
         };
         this.pipeline
@@ -387,12 +580,23 @@ impl Encoder {
         Ok(this)
     }
 
-    /// Changes the size or rate of what is sent, without a break.
-    pub fn set_settings(&self, settings: ShareSettings) {
+    /// Changes the size, rate, bitrate or codec of what is sent, without a
+    /// break. A codec this machine cannot encode leaves the codec as it is.
+    pub fn set_settings(&self, mut settings: ShareSettings) {
         let mut state = self.state.lock().unwrap();
         if state.settings == settings {
             return;
         }
+        let new_stage = if state.settings.codec == settings.codec {
+            None
+        } else {
+            EncodingStage::new(settings.codec)
+                .inspect_err(|err| {
+                    warn!("staying with {}: {err:#}", state.settings.codec.label());
+                    settings.codec = state.settings.codec;
+                })
+                .ok()
+        };
         state.settings = settings;
         self.rate.set_property("max-rate", settings.fps as i32);
         self.pace.set_property("caps", pace_caps(settings.fps));
@@ -401,13 +605,71 @@ impl Encoder {
         if let Some(pad) = self.pace.static_pad("src") {
             pad.send_event(gst::event::Reconfigure::new());
         }
-        state.configure(&self.size, &self.encoder);
+        match new_stage {
+            // The new encoder is set up once it is in place.
+            Some(stage) => {
+                drop(state);
+                self.replace_stage(stage);
+            }
+            None => state.configure(&self.size),
+        }
+    }
+
+    /// Swaps the encoding stage for `new` between two frames. The first
+    /// frame of the new one is a keyframe, so viewers carry straight on.
+    fn replace_stage(&self, new: EncodingStage) {
+        let Some(pad) = self.size.static_pad("src") else {
+            return;
+        };
+        let pending = Mutex::new(Some(new));
+        let (pipeline, size, out) = (
+            self.pipeline.downgrade(),
+            self.size.downgrade(),
+            self.out.downgrade(),
+        );
+        let (state, events) = (self.state.clone(), self.events.clone());
+        // Runs when no frame is on its way through the pad: at once, on
+        // this thread, or after the frame that is.
+        pad.add_probe(gst::PadProbeType::IDLE, move |_, _| {
+            let (Some(new), Some(pipeline), Some(size), Some(out)) = (
+                pending.lock().unwrap().take(),
+                pipeline.upgrade(),
+                size.upgrade(),
+                out.upgrade(),
+            ) else {
+                return gst::PadProbeReturn::Remove;
+            };
+            let old = std::mem::replace(&mut state.lock().unwrap().stage, new.clone());
+            size.unlink(&old.bin);
+            old.bin.unlink(&out);
+            let _ = pipeline.remove(&old.bin);
+            // Whatever the old encoder still held is not sent.
+            let _ = old.bin.set_state(gst::State::Null);
+            let placed = new
+                .place(&pipeline, &size, &out)
+                .and_then(|()| Ok(new.bin.sync_state_with_parent()?));
+            match placed {
+                Ok(()) => {
+                    state.lock().unwrap().configure(&size);
+                    events(EncoderEvent::Format);
+                }
+                Err(err) => events(EncoderEvent::Ended(Some(format!(
+                    "cannot change the codec of the shared screen: {err:#}"
+                )))),
+            }
+            gst::PadProbeReturn::Remove
+        });
     }
 
     /// The size of the picture being sent and the bitrate aimed for, once
     /// the source has said what it delivers.
     pub fn format(&self) -> Option<(u32, u32, u32)> {
         self.state.lock().unwrap().format
+    }
+
+    /// The size of what the source delivers, once it has said.
+    pub fn source(&self) -> Option<(u32, u32)> {
+        self.state.lock().unwrap().source
     }
 
     pub fn settings(&self) -> ShareSettings {
@@ -419,7 +681,8 @@ impl Encoder {
         let event = gst_video::UpstreamForceKeyUnitEvent::builder()
             .all_headers(true)
             .build();
-        if let Some(pad) = self.encoder.static_pad("src") {
+        let encoder = self.state.lock().unwrap().stage.encoder.clone();
+        if let Some(pad) = encoder.static_pad("src") {
             pad.send_event(event);
         }
     }
@@ -451,12 +714,23 @@ fn pace_caps(fps: u32) -> gst::Caps {
 
 impl EncoderState {
     /// Sets the pipeline up for the source and settings at hand.
-    fn configure(&mut self, size: &gst::Element, encoder: &gst::Element) {
+    fn configure(&mut self, size: &gst::Element) {
         let Some(source) = self.source else {
             return;
         };
-        let (width, height) = fit(source, self.settings.max_height);
-        let kbps = bitrate_kbps(width, height, self.settings.fps);
+        let ShareSettings {
+            max_height,
+            fps,
+            codec,
+            kbps,
+            ..
+        } = self.settings;
+        let (width, height) = fit(source, max_height, codec);
+        let kbps = match kbps {
+            Some(kbps) => kbps.clamp(MIN_KBPS, MAX_KBPS),
+            None => bitrate_kbps(width, height, fps, codec),
+        };
+        let encoder = &self.stage.encoder;
         let caps = gst::Caps::builder("video/x-raw")
             .field("width", width as i32)
             .field("height", height as i32)
@@ -464,9 +738,9 @@ impl EncoderState {
             .build();
         size.set_property("caps", &caps);
         encoder.set_property("bitrate", kbps);
-        let burst = f64::from(kbps) * FRAMES_OF_BURST / f64::from(self.settings.fps.max(1));
+        let burst = f64::from(kbps) * FRAMES_OF_BURST / f64::from(fps.max(1));
         encoder.set_property("vbv-buffer-size", burst.round() as u32);
-        debug!(?source, width, height, kbps, "encoder configured");
+        debug!(?source, width, height, kbps, ?codec, "encoder configured");
         self.format = Some((width, height, kbps));
     }
 }
@@ -517,6 +791,9 @@ pub struct WatchStats {
 
 /// Decodes one sharer's stream into frames.
 pub(crate) struct Decoder {
+    from: PeerId,
+    codec: Codec,
+    frames: FrameSink,
     pipeline: gst::Pipeline,
     input: gst_app::AppSrc,
     /// Sets the size frames are delivered at.
@@ -604,7 +881,7 @@ const ARRIVALS_KEPT: usize = 64;
 impl Decoder {
     /// `max_height` is the tallest the frames are wanted, or zero for the
     /// size the sharer sends.
-    pub fn start(from: PeerId, frames: FrameSink, max_height: u32) -> Result<Self> {
+    pub fn start(from: PeerId, frames: FrameSink, max_height: u32, codec: Codec) -> Result<Self> {
         // Turning what the decoder puts out into pixels for display, at the
         // size they are shown at, is quick on the graphics card and slow
         // on the processor.
@@ -619,14 +896,16 @@ impl Decoder {
         // build on them. Decoded ones can, so when preparing frames for
         // display falls behind, frames are dropped ahead of that step.
         let description = format!(
-            "appsrc name=in is-live=true format=time caps={H264} \
-             ! h264parse ! nvh264dec name=decoder \
+            "appsrc name=in is-live=true format=time caps={} \
+             ! {} \
              ! queue leaky=downstream max-size-buffers=2 max-size-time=0 max-size-bytes=0 \
              ! {prepare} \
-             ! appsink name=out sync=false max-buffers=2 drop=true"
+             ! appsink name=out sync=false max-buffers=2 drop=true",
+            codec.caps(),
+            codec.decoder_description()
         );
         let pipeline = gst::parse::launch(&description)
-            .context("cannot build the video decoder")?
+            .with_context(|| format!("cannot decode {} on this machine", codec.label()))?
             .downcast::<gst::Pipeline>()
             .map_err(|_| anyhow!("the video decoder is not a pipeline"))?;
         let by_name = |name: &str| {
@@ -671,6 +950,7 @@ impl Decoder {
             );
 
         let shown = counters.clone();
+        let sink_frames = frames.clone();
         by_name("out")?
             .downcast::<gst_app::AppSink>()
             .map_err(|_| anyhow!("the decoder's output is not an appsink"))?
@@ -689,7 +969,7 @@ impl Decoder {
                             .into_mapped_buffer_readable()
                             .map_err(|_| gst::FlowError::Error)?;
                         if pixels.len() == width as usize * height as usize * 4 {
-                            frames(
+                            sink_frames(
                                 from,
                                 VideoFrame {
                                     width,
@@ -719,6 +999,9 @@ impl Decoder {
             .set_state(gst::State::Playing)
             .context("cannot start the video decoder")?;
         Ok(Self {
+            from,
+            codec,
+            frames,
             pipeline,
             input,
             size,
@@ -727,6 +1010,17 @@ impl Decoder {
             counters,
             last_read: Mutex::new(Instant::now()),
         })
+    }
+
+    /// The codec of the stream it decodes.
+    pub fn codec(&self) -> Codec {
+        self.codec
+    }
+
+    /// A decoder like this one for a stream in another codec.
+    pub fn for_codec(&self, codec: Codec) -> Result<Self> {
+        let max_height = self.state.lock().unwrap().max_height;
+        Self::start(self.from, self.frames.clone(), max_height, codec)
     }
 
     /// Changes the tallest the frames are wanted, or with zero asks for
@@ -827,17 +1121,18 @@ mod tests {
 
     #[test]
     fn pictures_are_only_ever_scaled_down() {
-        assert_eq!(fit((2560, 1440), Some(1080)), (1920, 1080));
-        assert_eq!(fit((2560, 1440), Some(2160)), (2560, 1440));
-        assert_eq!(fit((2560, 1440), None), (2560, 1440));
-        assert_eq!(fit((3440, 1440), Some(720)), (1720, 720));
+        assert_eq!(fit((2560, 1440), Some(1080), Codec::H264), (1920, 1080));
+        assert_eq!(fit((2560, 1440), Some(2160), Codec::H264), (2560, 1440));
+        assert_eq!(fit((2560, 1440), None, Codec::H264), (2560, 1440));
+        assert_eq!(fit((3440, 1440), Some(720), Codec::Hevc), (1720, 720));
     }
 
     #[test]
     fn sizes_stay_within_what_the_encoder_takes() {
-        assert_eq!(fit((5120, 1440), None), (4096, 1152));
-        assert_eq!(fit((1281, 721), None), (1280, 720));
-        let (width, height) = fit((1366, 768), Some(720));
+        assert_eq!(fit((5120, 1440), None, Codec::H264), (4096, 1152));
+        assert_eq!(fit((5120, 1440), None, Codec::Hevc), (5120, 1440));
+        assert_eq!(fit((1281, 721), None, Codec::H264), (1280, 720));
+        let (width, height) = fit((1366, 768), Some(720), Codec::H264);
         assert_eq!((width % 2, height), (0, 720));
     }
 
@@ -849,9 +1144,22 @@ mod tests {
 
     #[test]
     fn bitrate_follows_size_and_rate() {
-        assert_eq!(bitrate_kbps(1920, 1080, 60), 8700);
-        assert_eq!(bitrate_kbps(3840, 2160, 60), 34800);
-        assert_eq!(bitrate_kbps(1920, 1080, 30), 6200);
+        assert_eq!(bitrate_kbps(1920, 1080, 60, Codec::H264), 8700);
+        assert_eq!(bitrate_kbps(3840, 2160, 60, Codec::H264), 34800);
+        assert_eq!(bitrate_kbps(1920, 1080, 30, Codec::H264), 6200);
+        assert_eq!(bitrate_kbps(1920, 1080, 60, Codec::Hevc), 6500);
+    }
+
+    #[test]
+    fn codecs_go_by_the_names_they_are_given() {
+        gst::init().unwrap();
+        for codec in Codec::ALL {
+            assert_eq!(Codec::from_id(codec.id()), Some(codec));
+            assert_eq!(Codec::from_rtp_name(codec.rtp_name()), Some(codec));
+            let caps = codec.caps().parse::<gst::Caps>().unwrap();
+            assert_eq!(Codec::of_caps(&caps), Some(codec));
+        }
+        assert_eq!(Codec::from_id("av1"), None);
     }
 
     #[test]
@@ -859,10 +1167,14 @@ mod tests {
         let sharing = Sharing {
             width: 1920,
             height: 1080,
+            source_width: 2560,
+            source_height: 1440,
             fps: 60,
+            codec: Codec::Hevc,
             kbps: 8700,
             sent_fps: 59.5,
             encode_ms: 4.25,
+            sound: true,
             watchers: vec![2, 5],
         };
         assert_eq!(Sharing::from_json(&sharing.to_json()), Some(sharing));

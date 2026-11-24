@@ -39,8 +39,8 @@ join without clicking.
 The app and the command-line client need GStreamer 1.28 with the base, good
 and bad plugin sets, the PipeWire plugin and `gst-plugin-rsrtp`. Sharing a
 screen and watching one need an NVIDIA graphics card: the picture is encoded
-and decoded as H.264 on the card (NVENC and NVDEC), and nothing else is
-tried.
+and decoded as H.264 or HEVC on the card (NVENC and NVDEC), and nothing else
+is tried.
 
 ```sh
 cargo run -p flowerchat-app
@@ -90,16 +90,38 @@ Packets that go missing are sent again, which keeps a stream whole through
 a few percent of loss. When that is not enough, the viewer asks for a frame
 to start over from, and the picture freezes for a moment.
 
-The size and frame rate of a share are set when starting the app, for now:
-`--share-height` is the tallest picture to send (1080 unless given, 0 for
-the size the screen has) and `--share-fps` the frames per second (60 unless
-given). A taller screen is scaled down, a smaller one is sent as it is, up
-to 4096 pixels a side. The bitrate follows from the two: about 8.7 Mbit/s
-for 1080p at 60 frames per second and about 35 Mbit/s for 4K.
+The first two pickers above the button set the tallest picture to send and
+the frames per second, also in the middle of a share, where the picture
+changes over without a break. A screen taller than the limit is scaled down;
+a smaller one is sent as it is, up to 4096 pixels a side in H.264 and 8192
+in HEVC.
+
+The two below them set the bitrate and the codec, and can be changed in the
+middle of a share as well: viewers carry on watching without doing anything.
+Left on "Auto bitrate", the bitrate follows from size and frame rate: about
+8.7 Mbit/s for 1080p at 60 frames per second and about 35 Mbit/s for 4K in
+H.264, and three quarters of that in HEVC, which needs fewer bits for the
+same picture and takes somewhat longer to encode. Otherwise it is held to
+the figure picked, from 1 to 50 Mbit/s. Every viewer gets the whole stream,
+so what leaves the machine is the bitrate times the number of viewers.
+
+While sharing, the block about yourself shows what is being sent, the codec
+and the bitrate aimed for, how long encoding a frame takes, and who watches.
+`--share-height` (0 for the size the screen has) and `--share-fps` set the
+first two pickers when starting the app.
+
+With "With sound" ticked, viewers also hear what the machine plays: games,
+videos, music, whatever starts while sharing. What flowerchat itself plays
+is left out, so nobody gets the call back, and the microphone is not part
+of it either. The sound travels as a stream of its own, in stereo, and each
+viewer sets its volume apart from the voices, under the picture. For this,
+flowerchat opens a recording stream in PipeWire and connects every other
+program's playback to it, with PipeWire's own `pw-dump` and `pw-link`. Of a
+surround mix, only the front channels are taken.
 
 For trying things out without a second machine, `--share-test 1920x1080`
-makes "Share screen" share a moving test picture of that size without
-asking the desktop, and `--lose 2` loses 2% of the packets that arrive.
+makes "Share screen" share a moving test picture of that size, with a tone
+for its sound, without asking the desktop, and `--lose 2` loses 2% of the packets that arrive.
 
 ### Push-to-talk
 
@@ -151,6 +173,9 @@ ones that matter most:
 | `--share-test` | Share a moving test picture of this size, such as `1920x1080`. |
 | `--share-node` | Share a PipeWire video stream that is open to everyone, by its node id. |
 | `--share-height`, `--share-fps` | The tallest picture to send, and how many frames per second. |
+| `--share-silent` | Share the picture without the sound that goes with it. |
+| `--share-codec` | Codec to share in: `h264` (the default) or `hevc`. |
+| `--share-kbps` | Bitrate to share at, in kbit/s. Without it, the bitrate follows size and frame rate. |
 | `--watch` | Watch every screen that is shared, without showing it, and print how it goes. |
 | `--lose` | Lose this many percent of the packets that arrive, to see what a poor network does. |
 
@@ -199,13 +224,16 @@ carries a data channel named `control`, created by both sides with
 | --- | --- |
 | `{"muted": true}` | The sender muted or unmuted. |
 | `{"chat": "…"}` | A chat message. |
-| `{"sharing": {…}}` | What the sender shares of its screen: `width`, `height`, `fps` and `kbps` as set, `sentFps` and `encodeMs` as measured, and `watchers`, the ids of those it sends to. Repeated about once a second. |
+| `{"sharing": {…}}` | What the sender shares of its screen: `width`, `height`, `fps`, `codec` (`h264` or `hevc`) and `kbps` as set, `sentFps` and `encodeMs` as measured, `sound` for whether sound comes with it, and `watchers`, the ids of those it sends to. Repeated about once a second. |
 | `{"sharing": null}` | The sender stopped sharing. |
 | `{"watch": true}` | The sender wants the receiver's share, or with `false` no longer does. |
 
-Native clients offer and accept H.264 video on every connection from the
-start, with retransmission, so that sharing and watching need no new
-negotiation. Nothing is sent on it until a peer asks to watch. A browser
+Native clients offer and accept video on every connection from the start,
+one stream for H.264 and one for HEVC, each with retransmission, and a
+second Opus stream for the sound of a shared screen, so that sharing,
+watching and changing codec need no new negotiation. Nothing is sent on any
+of them until a peer asks to watch, and then only on the stream of the codec
+the sharer has picked. A browser
 that offers only audio gets only audio.
 
 ## Tests
