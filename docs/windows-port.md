@@ -74,6 +74,17 @@ Found on the way:
   size while watching.
 - `d3d11screencapturesrc` delivers frames at a steady rate that it has to
   be told, so a `capsfilter` named `capture_rate` follows it.
+- The window is drawn through Direct3D 12 and not Vulkan, which wgpu
+  would pick first. A friend with a monitor in HDR saw the whole window
+  much brighter than his other windows: Windows dims ordinary windows on
+  an HDR desktop, and leaves those drawn through Vulkan out of that. Not
+  confirmed on an HDR monitor yet; `WGPU_BACKEND=vulkan` brings the old
+  behaviour back. The colours of a share are not part of this: colour
+  bars come back from encoder and decoder within one step of 255.
+- A share that stands still, or moves little, arrives at a fraction of
+  the bitrate set. That is the encoder not needing more: noise at a
+  setting of 8.7 Mbit/s came out at 8.9, a ball on a plain background at
+  0.25.
 - One snapshot differs from the Linux image in four pixels of one line of
   text, so the snapshot tests allow 16 differing pixels on Windows.
 - `gst-plugin-rsrtp` is not needed: nothing was installed for it.

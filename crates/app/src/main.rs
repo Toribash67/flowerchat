@@ -839,7 +839,8 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     gstreamer::init()?;
 
-    let options = eframe::NativeOptions {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("flowerchat")
             .with_app_id("flowerchat")
@@ -847,6 +848,16 @@ fn main() -> anyhow::Result<()> {
             .with_min_inner_size([340.0, 480.0]),
         ..Default::default()
     };
+    // On Windows the window is drawn through Direct3D, not Vulkan, which
+    // would be picked first. On a desktop in HDR, Windows dims ordinary
+    // windows to the brightness set for them; a window drawn through Vulkan
+    // is left out of that, and the whole of it glares. `WGPU_BACKEND` still
+    // overrides this.
+    #[cfg(windows)]
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        setup.instance_descriptor.backends =
+            eframe::wgpu::Backends::from_env().unwrap_or(eframe::wgpu::Backends::DX12);
+    }
     eframe::run_native(
         "flowerchat",
         options,
