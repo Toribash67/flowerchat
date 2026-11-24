@@ -27,13 +27,43 @@ Working, and how each was checked:
   left out (`listed` in `audio.rs`).
 - Screen capture (`d3d11screencapturesrc`): a 2560x1440 monitor reached a
   viewer at 60 fps with nothing dropped. The CLI takes `--share-monitor
-  NUMBER`; the app always shares the main monitor, until there is a picker.
+  NUMBER`.
+- Choosing what to share: the app lists screens and windows in a panel
+  over the window (`screen.rs` makes the list, `share_picker` in `views.rs`
+  draws it). An end-to-end test opens it, cancels, and shares "Screen 1"
+  through it. Windows are captured through Windows Graphics Capture, which
+  was only tried with `gst-launch-1.0`: a window that changes all the time
+  came at 57 fps, one that stands still at about 10. Nobody has shared a
+  window through the app, or resized one while sharing it.
 - Stream sound (`sound/loopback.rs`): a tone played by another program
   reached the viewer. That our own playback is left out has not been
   checked by ear.
 - Push-to-talk outside the window: the key chosen with "Set key" is
   followed everywhere, by asking Windows every 10 ms whether it is down
   (`talk.rs`). Not tried on a real key yet.
+
+What sharing costs, measured by sharing a 2560x1440 monitor at 60 fps
+between two copies of the CLI, while a game ran on the same machine, so
+the figures are rough:
+
+| | Time per frame, capture to encoded | Sharer's processor |
+| --- | --- | --- |
+| First version, sent as it is | 13 to 18 ms | 0.4 cores |
+| First version, scaled to 1080p | 17 to 19 ms | 1.5 cores |
+| Now, sent as it is | 6 ms (HEVC 8) | 0.15 cores |
+| Now, scaled to 1080p | 4 ms (HEVC 6 to 7) | 0.15 cores |
+
+Two changes made the difference:
+
+- Frames stay on the graphics card from capture to encoder
+  (`d3d11convert` and `nvd3d11h264enc` or `nvd3d11h265enc`; `SIZING` and
+  `Codec::encoder` in `video.rs`). The first version brought each frame
+  into ordinary memory, scaled it there, and sent it back.
+- Windows is asked to keep time to the millisecond while a share runs
+  (`FineTimers`). The capture waits for the moment each frame is due, and
+  Windows by default only wakes a waiting thread every 15.6 ms, so frames
+  were taken 7 ms late on average, and unevenly. The encoder itself takes
+  about 5 ms for 1440p.
 
 Found on the way:
 
@@ -50,14 +80,14 @@ Found on the way:
 
 Still to do:
 
-- A picker for which monitor or window to share. `ScreenSource` can
-  already name either; the picker is new UI and wants a proposal.
-- Capturing a window (`ScreenSource::Window`) has not been run at all.
+- The two snapshots of the picker were made on Windows. If they differ on
+  Linux by a few pixels of text, make them anew there.
 - Push-to-talk on a mouse button, which is what many would bind, is not
   possible on either system: "Set key" only takes keyboard keys.
-- Encoding a 1440p screen takes 13 to 18 ms, most of it bringing each frame
-  into ordinary memory and back to the card. `nvd3d11h264enc` fed straight
-  from the capture would avoid that (step 6 below).
+- Showing a watched screen still brings every frame into ordinary memory
+  to hand it to egui, which is most of what a viewer's processor does
+  (about half a core for 1440p at 60 fps). Drawing straight from the
+  decoder's texture would need egui and GStreamer to share one.
 - Two copies of flowerchat on one machine record each other's side of the
   call as stream sound. Windows leaves out one program, not two.
 - The installer.

@@ -111,10 +111,21 @@ impl Codec {
             .find(|codec| codec.caps().starts_with(name.as_str()))
     }
 
+    #[cfg(not(windows))]
     fn encoder(self) -> &'static str {
         match self {
             Codec::H264 => "nvh264enc",
             Codec::Hevc => "nvh265enc",
+        }
+    }
+
+    /// On Windows, the encoder that takes frames as Direct3D hands them
+    /// out, which is how a captured screen arrives.
+    #[cfg(windows)]
+    fn encoder(self) -> &'static str {
+        match self {
+            Codec::H264 => "nvd3d11h264enc",
+            Codec::Hevc => "nvd3d11h265enc",
         }
     }
 
@@ -124,8 +135,8 @@ impl Codec {
     /// It sends a keyframe only when asked: a new viewer and a viewer that
     /// lost data both ask, and nobody else pays for it.
     ///
-    /// Frames are copied to the graphics card ahead of the encoder, which
-    /// would otherwise do that itself and then hold on to the captured
+    /// On Linux, frames are copied to the graphics card ahead of the
+    /// encoder ([`ENCODER_INPUT`]), which would otherwise do that itself and then hold on to the captured
     /// frame until it has encoded it, on a thread of its own. A frame of a
     /// screen belongs to PipeWire, and `pipewiresrc` (as of 1.6) locks up
     /// for good when one thread hands a frame back at the moment the
@@ -138,7 +149,10 @@ impl Codec {
             Codec::Hevc => ("video/x-h265,profile=main", "h265parse"),
         };
         format!(
-            "cudaupload ! {} name=encoder preset=p4 tune=ultra-low-latency rc-mode=cbr                zerolatency=true bframes=0 gop-size=-1 repeat-sequence-header=true                min-force-key-unit-interval={KEYFRAME_SPACING_NS}              ! {profile} ! {parser} config-interval=-1 ! capsfilter caps={}",
+            "{ENCODER_INPUT}{} name=encoder preset=p4 tune=ultra-low-latency rc-mode=cbr \
+               zerolatency=true bframes=0 gop-size=-1 repeat-sequence-header=true \
+               min-force-key-unit-interval={KEYFRAME_SPACING_NS} \
+             ! {profile} ! {parser} config-interval=-1 ! capsfilter caps={}",
             self.encoder(),
             self.caps()
         )
@@ -195,6 +209,52 @@ impl Default for ShareSettings {
             codec: Codec::default(),
             kbps: None,
         }
+    }
+}
+
+/// What stands ahead of the encoder in its stage: see
+/// [`Codec::encoder_description`].
+#[cfg(not(windows))]
+const ENCODER_INPUT: &str = "cudaupload ! ";
+#[cfg(windows)]
+const ENCODER_INPUT: &str = "";
+/// The elements that give frames the size and the format they are encoded
+/// at.
+#[cfg(not(windows))]
+const SIZING: &str = "videoconvert n-threads=2 ! videoscale add-borders=false n-threads=4";
+// A captured screen is on the graphics card already, and stays there all
+// the way into the encoder. A test picture is taken there first.
+#[cfg(windows)]
+const SIZING: &str = "d3d11upload ! d3d11convert add-borders=false";
+/// The kind of memory frames are in once sized, on Windows.
+#[cfg(windows)]
+const SIZED_MEMORY: &str = "memory:D3D11Memory";
+
+/// Makes Windows keep time to the millisecond in this process, for as long
+/// as it lives.
+///
+/// A source of frames waits for the moment each frame is due. Left alone,
+/// Windows only wakes a waiting thread every 15.6 ms, so a frame was taken
+/// up to that much late: 7 ms on average, and unevenly, at 60 frames per
+/// second.
+#[cfg(windows)]
+struct FineTimers;
+
+#[cfg(windows)]
+impl FineTimers {
+    const MILLISECONDS: u32 = 1;
+
+    fn new() -> Self {
+        // Counted by Windows, so several of these can live at once.
+        unsafe { windows_sys::Win32::Media::timeBeginPeriod(Self::MILLISECONDS) };
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FineTimers {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Media::timeEndPeriod(Self::MILLISECONDS) };
     }
 }
 
@@ -293,10 +353,11 @@ impl ScreenSource {
 }
 
 /// The caps that make a Windows screen capture deliver `fps` frames per
-/// second, in ordinary memory.
+/// second, and leave them on the graphics card.
 #[cfg(windows)]
 fn capture_caps(fps: u32) -> gst::Caps {
     gst::Caps::builder("video/x-raw")
+        .features([SIZED_MEMORY])
         .field("framerate", gst::Fraction::new(fps.max(1) as i32, 1))
         .build()
 }
@@ -433,6 +494,8 @@ pub(crate) struct Encoder {
     /// What is being shared. On Linux this holds the connection the screen
     /// is read through, which has to stay open for as long.
     _source: ShareSource,
+    #[cfg(windows)]
+    _timers: FineTimers,
 }
 
 struct EncoderState {
@@ -518,7 +581,7 @@ impl Encoder {
             "{source_description} \
              ! videorate name=rate drop-only=true max-rate={} \
              ! capssetter name=pace join=true replace=false caps=\"{}\" \
-             ! videoconvert n-threads=2 ! videoscale add-borders=false n-threads=4 \
+             ! {SIZING} \
              ! capsfilter name=size \
              appsink name=out sync=false",
             settings.fps,
@@ -649,6 +712,8 @@ impl Encoder {
             last_read: Mutex::new(Instant::now()),
             events,
             _source: source.clone(),
+            #[cfg(windows)]
+            _timers: FineTimers::new(),
         };
         this.pipeline
             .set_state(gst::State::Playing)
@@ -814,9 +879,10 @@ impl EncoderState {
         let caps = gst::Caps::builder("video/x-raw")
             .field("width", width as i32)
             .field("height", height as i32)
-            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
-            .build();
-        size.set_property("caps", &caps);
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1));
+        #[cfg(windows)]
+        let caps = caps.features([SIZED_MEMORY]);
+        size.set_property("caps", caps.build());
         encoder.set_property("bitrate", kbps);
         let burst = f64::from(kbps) * FRAMES_OF_BURST / f64::from(fps.max(1));
         encoder.set_property("vbv-buffer-size", burst.round() as u32);
