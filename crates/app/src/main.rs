@@ -851,6 +851,11 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     gstreamer::init()?;
 
+    // The icon in the corner of the window. On Windows the program file
+    // carries the same one (see build.rs), which is what the taskbar shows
+    // for a program started from a shortcut or pinned there.
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .map_err(|err| anyhow::anyhow!("the icon cannot be read: {err}"))?;
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -858,6 +863,7 @@ fn main() -> anyhow::Result<()> {
             .with_app_id("flowerchat")
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([340.0, 480.0])
+            .with_icon(icon)
             .with_transparent(COMPOSED),
         ..Default::default()
     };
