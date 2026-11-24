@@ -3,18 +3,21 @@
 //! peers send back.
 //!
 //! ```text
-//! mic -> processing -> opusenc -> tee -+-> [queue -> rtpopuspay] -> webrtcbin (peer A)
-//!                                      +-> [queue -> rtpopuspay] -> webrtcbin (peer B)
+//! {mic -> processing} -> opusenc -> tee -+-> [queue -> rtpopuspay] -> webrtcbin (peer A)
+//!                                        +-> [queue -> rtpopuspay] -> webrtcbin (peer B)
 //!
 //! webrtcbin (peer A) -> [rtpopusdepay -> opusdec] -+-> audiomixer -> speakers
 //! webrtcbin (peer B) -> [rtpopusdepay -> opusdec] -+
 //! ```
 //!
-//! The bracketed parts and the `webrtcbin`s come and go with the peers.
+//! The bracketed parts and the `webrtcbin`s come and go with the peers. The
+//! part in braces is replaced when the microphone or its processing changes,
+//! and the speakers are reopened when they change.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use flowerchat_protocol::PeerId;
@@ -27,12 +30,13 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, trace, warn};
 
+use crate::audio::{
+    AudioSettings, LEVEL_INTERVAL_NS, MAX_JITTER_MS, RAW_AUDIO, capture_bin, level_db,
+    unique_probe_name,
+};
 use crate::ice::IceConfig;
 use crate::latency::{ClickDetector, write_clicks};
 
-/// The format audio has between capture and encoder, and between decoders
-/// and playback. `webrtcdsp` needs exactly this layout.
-const RAW_AUDIO: &str = "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1";
 /// Payload type we propose for Opus when we make the offer. An answer has to
 /// reuse whatever the offer picked instead.
 const OPUS_PAYLOAD_TYPE: i32 = 111;
@@ -43,22 +47,19 @@ const MIXER_SLACK_NS: u64 = 10_000_000;
 /// Sinks default to 20 ms, which is far more than this pipeline needs, and
 /// every millisecond of it is added to the playback delay.
 const SINK_DEADLINE_NS: u64 = 5_000_000;
-/// How often loudness is reported, for level meters and speaking indicators.
-const LEVEL_INTERVAL_NS: u64 = 50_000_000;
+/// Longest to wait for playback to reach a point where the speakers can be
+/// swapped. The mixer produces audio every 10 ms, so this only runs out when
+/// playback has already stopped.
+const SPEAKER_SWAP_WAIT: Duration = Duration::from_millis(500);
 const MIC_LEVEL: &str = "mic_level";
 /// Prefix of the level element in a peer's receive branch; the id follows.
 const PEER_LEVEL_PREFIX: &str = "level-peer-";
 
 pub struct CallConfig {
-    /// PulseAudio/PipeWire source name, or the default source.
-    pub input: Option<String>,
-    /// PulseAudio/PipeWire sink name, or the default sink.
-    pub output: Option<String>,
-    /// Size of the receive buffer that absorbs network jitter.
-    pub jitter_ms: u32,
-    /// Send the microphone without echo cancellation, noise suppression or
-    /// gain control.
-    pub raw_mic: bool,
+    pub audio: AudioSettings,
+    /// Whether the microphone is sent from the start. Push-to-talk starts
+    /// without.
+    pub transmitting: bool,
     /// Send measurement clicks instead of the microphone.
     pub test_tone: bool,
     /// Time incoming clicks instead of playing audio.
@@ -138,15 +139,27 @@ pub struct PeerStats {
 
 pub struct Call {
     pipeline: gst::Pipeline,
+    /// Whatever feeds `mic_gate`: the microphone chain or the click source.
+    capture: Mutex<gst::Bin>,
     mic_tee: gst::Element,
     mic_gate: gst::Element,
     mixer: gst::Element,
     out_gate: gst::Element,
-    config: CallConfig,
+    /// The sound device we play on, and the pad that feeds it. Absent when
+    /// measuring.
+    speakers: Option<(gst::Element, gst::Pad)>,
+    /// Name of the element that hears what the speakers play, if any.
+    echo_probe: Option<String>,
+    /// The settings in effect.
+    audio: Mutex<AudioSettings>,
+    test_tone: bool,
+    ice: IceConfig,
     events: UnboundedSender<CallEvent>,
     peers: Mutex<HashMap<PeerId, Arc<Peer>>>,
     /// Shared with the control channels, which announce it when they open.
     muted: Arc<AtomicBool>,
+    /// Whether push-to-talk, if in use, currently lets the microphone out.
+    transmitting: AtomicBool,
 }
 
 struct Peer {
@@ -186,46 +199,33 @@ struct RecvBranch {
 
 impl Call {
     pub fn new(config: CallConfig, events: UnboundedSender<CallEvent>) -> Result<Self> {
-        let capture = if config.test_tone {
-            format!(
-                "audiotestsrc is-live=true wave=silence samplesperbuffer=480 \
-                 ! capsfilter name=clicks caps={RAW_AUDIO}"
-            )
-        } else {
-            let processing = if config.raw_mic {
-                String::new()
-            } else {
-                // Echo cancellation needs the playback signal, which only
-                // exists when we actually play audio.
-                format!(
-                    "! webrtcdsp echo-cancel={} noise-suppression=true gain-control=true \
-                     high-pass-filter=true",
-                    !config.measure
-                )
-            };
-            format!(
-                "pulsesrc name=mic buffer-time=20000 latency-time=10000 \
-                 ! audioconvert ! audioresample ! {RAW_AUDIO} {processing}"
-            )
-        };
-        let playback = if config.measure {
+        let CallConfig {
+            mut audio,
+            transmitting,
+            test_tone,
+            measure,
+            ice,
+        } = config;
+        audio.jitter_ms = audio.jitter_ms.min(MAX_JITTER_MS);
+
+        // Echo cancellation needs the playback signal, which only exists
+        // when we actually play audio.
+        let echo_probe = (!measure && !test_tone).then(unique_probe_name);
+        let playback = if measure {
             format!("appsink name=detector sync=true processing-deadline={SINK_DEADLINE_NS}")
         } else {
-            let probe = if config.test_tone || config.raw_mic {
-                ""
-            } else {
-                "webrtcechoprobe !"
-            };
+            let probe = echo_probe
+                .as_ref()
+                .map_or_else(String::new, |name| format!("webrtcechoprobe name={name} !"));
             format!(
-                "{probe} audioconvert ! audioresample \
+                "{probe} audioconvert ! audioresample name=to_speakers \
                  ! pulsesink name=speakers buffer-time=20000 latency-time=10000 \
                    processing-deadline={SINK_DEADLINE_NS}"
             )
         };
-        let jitter_ns = u64::from(config.jitter_ms) * 1_000_000;
+        let jitter_ns = u64::from(audio.jitter_ms) * 1_000_000;
         let description = format!(
-            "{capture} \
-             ! volume name=mic_gate \
+            "volume name=mic_gate \
              ! level name={MIC_LEVEL} interval={LEVEL_INTERVAL_NS} post-messages=true \
              ! opusenc audio-type=voice bitrate=64000 frame-size=10 inband-fec=true \
                packet-loss-percentage=5 \
@@ -245,35 +245,59 @@ impl Call {
                 .by_name(name)
                 .ok_or_else(|| anyhow!("pipeline element {name} is missing"))
         };
+        let mic_gate = by_name("mic_gate")?;
 
-        if let Some(device) = &config.input
-            && !config.test_tone
-        {
-            by_name("mic")?.set_property("device", device);
-        }
-        if let Some(device) = &config.output
-            && !config.measure
-        {
-            by_name("speakers")?.set_property("device", device);
-        }
-        if config.test_tone {
-            install_click_writer(&by_name("clicks")?)?;
-        }
-        if config.measure {
+        let capture = if test_tone {
+            let clicks = gst::parse::bin_from_description(
+                &format!(
+                    "audiotestsrc is-live=true wave=silence samplesperbuffer=480 \
+                     ! capsfilter name=clicks caps={RAW_AUDIO}"
+                ),
+                true,
+            )?;
+            let source = clicks
+                .by_name("clicks")
+                .ok_or_else(|| anyhow!("the click source is missing"))?;
+            install_click_writer(&source)?;
+            clicks
+        } else {
+            capture_bin(&audio, echo_probe.as_deref())?
+        };
+        pipeline.add(&capture)?;
+        capture.link(&mic_gate)?;
+
+        let speakers = if measure {
             install_click_detector(&by_name("detector")?, events.clone())?;
-        }
+            None
+        } else {
+            let speakers = by_name("speakers")?;
+            if let Some(device) = &audio.output {
+                speakers.set_property("device", device);
+            }
+            let feed = by_name("to_speakers")?
+                .static_pad("src")
+                .ok_or_else(|| anyhow!("nothing feeds the speakers"))?;
+            Some((speakers, feed))
+        };
 
         let call = Self {
+            capture: Mutex::new(capture),
             mic_tee: by_name("mic_tee")?,
-            mic_gate: by_name("mic_gate")?,
+            mic_gate,
             mixer: by_name("mixer")?,
             out_gate: by_name("out_gate")?,
+            speakers,
+            echo_probe,
+            audio: Mutex::new(audio),
+            test_tone,
+            ice,
             pipeline,
-            config,
             events,
             peers: Mutex::new(HashMap::new()),
             muted: Arc::new(AtomicBool::new(false)),
+            transmitting: AtomicBool::new(transmitting),
         };
+        call.update_mic_gate();
         call.pipeline
             .set_state(gst::State::Playing)
             .context("cannot start the audio pipeline (is the audio device available?)")?;
@@ -300,13 +324,9 @@ impl Call {
             gst::MessageView::Latency(_) => {
                 let _ = self.pipeline.recalculate_latency();
             }
-            gst::MessageView::Element(element) => {
+            gst::MessageView::Element(_) => {
                 let source = message.src().map(|s| s.name()).unwrap_or_default();
-                let level = element
-                    .structure()
-                    .filter(|s| s.name() == "level")
-                    .and_then(level_db);
-                if let Some(db) = level {
+                if let Some(db) = level_db(message) {
                     if source == MIC_LEVEL {
                         let _ = self.events.send(CallEvent::MicLevel { db });
                     } else if let Some(id) = source
@@ -325,8 +345,101 @@ impl Call {
     /// Stops or resumes sending the microphone, and tells the peers.
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::SeqCst);
-        self.mic_gate.set_property("mute", muted);
+        self.update_mic_gate();
         self.broadcast(&json!({ "muted": muted }));
+    }
+
+    /// Lets the microphone out or holds it back, for push-to-talk. Unlike
+    /// muting, this is not announced: to the peers, someone who is not
+    /// holding the key is simply quiet.
+    pub fn set_transmitting(&self, transmitting: bool) {
+        self.transmitting.store(transmitting, Ordering::SeqCst);
+        self.update_mic_gate();
+    }
+
+    fn update_mic_gate(&self) {
+        let open = self.transmitting.load(Ordering::SeqCst) && !self.muted.load(Ordering::SeqCst);
+        self.mic_gate.set_property("mute", !open);
+    }
+
+    /// Changes the audio settings of the running call. Fails when the
+    /// pipeline cannot be rearranged, after which the call cannot continue.
+    /// A device that does not open is reported later, through the bus.
+    pub fn apply_audio(&self, mut new: AudioSettings) -> Result<()> {
+        new.jitter_ms = new.jitter_ms.min(MAX_JITTER_MS);
+        let old = std::mem::replace(&mut *self.audio.lock().unwrap(), new.clone());
+        if !self.test_tone && !old.captures_like(&new) {
+            self.replace_capture(&new)?;
+        }
+        if old.output != new.output {
+            self.reopen_speakers(new.output.as_deref())?;
+        }
+        if old.jitter_ms != new.jitter_ms {
+            for peer in self.peers.lock().unwrap().values() {
+                peer.webrtc.set_property("latency", new.jitter_ms);
+            }
+            self.mixer
+                .set_property("min-upstream-latency", u64::from(new.jitter_ms) * 1_000_000);
+            let _ = self.pipeline.recalculate_latency();
+        }
+        Ok(())
+    }
+
+    /// Swaps the microphone chain for one built from `settings`.
+    fn replace_capture(&self, settings: &AudioSettings) -> Result<()> {
+        let new = capture_bin(settings, self.echo_probe.as_deref())?;
+        let mut capture = self.capture.lock().unwrap();
+        // The chain contains its own source, so stopping it also stops the
+        // flow into the rest of the pipeline, which just sees a pause.
+        let _ = capture.set_state(gst::State::Null);
+        capture.unlink(&self.mic_gate);
+        self.pipeline.remove(&*capture)?;
+
+        self.pipeline.add(&new)?;
+        new.link(&self.mic_gate)?;
+        new.sync_state_with_parent()
+            .context("cannot start the microphone")?;
+        *capture = new;
+        Ok(())
+    }
+
+    /// Closes the sound device we play on and opens `device` instead.
+    ///
+    /// The element stays the same one, because its clock is the clock the
+    /// whole pipeline runs on. That clock stands still while the device is
+    /// closed and carries on from where it was.
+    fn reopen_speakers(&self, device: Option<&str>) -> Result<()> {
+        let Some((speakers, feed)) = &self.speakers else {
+            return Ok(());
+        };
+        let sink_pad = speakers
+            .static_pad("sink")
+            .ok_or_else(|| anyhow!("the speakers have no sink pad"))?;
+
+        // Hold playback back at a moment when nothing is on its way into
+        // the device, and keep it there until the new device is in place.
+        let (blocked_tx, blocked) = mpsc::sync_channel(1);
+        let block = feed
+            .add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_, _| {
+                let _ = blocked_tx.try_send(());
+                gst::PadProbeReturn::Ok
+            })
+            .ok_or_else(|| anyhow!("cannot hold playback back"))?;
+        let _ = blocked.recv_timeout(SPEAKER_SWAP_WAIT);
+
+        let swap = || -> Result<()> {
+            feed.unlink(&sink_pad)?;
+            speakers.set_state(gst::State::Ready)?;
+            speakers.set_property("device", device);
+            // Linking again makes the feed repeat the format and timing
+            // information that the device forgot when it closed.
+            feed.link(&sink_pad)?;
+            speakers.sync_state_with_parent()?;
+            Ok(())
+        };
+        let outcome = swap().context("cannot switch speakers");
+        feed.remove_probe(block);
+        outcome
     }
 
     /// Silences or restores everything we play.
@@ -384,13 +497,13 @@ impl Call {
         let webrtc = gst::ElementFactory::make("webrtcbin")
             .name(format!("peer-{id}"))
             .property_from_str("bundle-policy", "max-bundle")
-            .property("latency", self.config.jitter_ms)
+            .property("latency", self.audio.lock().unwrap().jitter_ms)
             .build()
             .context("cannot create webrtcbin")?;
-        if let Some(stun) = &self.config.ice.stun {
+        if let Some(stun) = &self.ice.stun {
             webrtc.set_property("stun-server", stun);
         }
-        for turn in &self.config.ice.turn {
+        for turn in &self.ice.turn {
             if !webrtc.emit_by_name::<bool>("add-turn-server", &[turn]) {
                 warn!("webrtcbin rejected a TURN server URI");
             }
@@ -676,6 +789,15 @@ impl Call {
     }
 }
 
+impl Drop for Call {
+    /// A call that is dropped without being shut down, because its session
+    /// was cancelled, must still stop its pipeline and let go of the audio
+    /// devices.
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Decodes a peer's audio and feeds it to the mixer.
 fn attach_recv_branch(
     pipeline: &gst::Pipeline,
@@ -720,13 +842,6 @@ fn attach_recv_branch(
         volume,
     });
     Ok(())
-}
-
-/// The loudness in a message from a `level` element, in dB below full scale.
-fn level_db(level: &gst::StructureRef) -> Option<f32> {
-    let rms = level.get::<&gst::glib::ValueArray>("rms").ok()?;
-    let db = rms.first()?.get::<f64>().ok()?;
-    Some(db as f32)
 }
 
 /// Turns webrtcbin's statistics into the figures we show. `previous` holds
@@ -920,6 +1035,10 @@ fn install_click_writer(capsfilter: &gst::Element) -> Result<()> {
             };
             let captured_at = (base_time + pts).nseconds() as i128 + monotonic_offset(&clock);
             let buffer = buffer.make_mut();
+            // The source marks its silence as a gap, which lets elements
+            // downstream skip the buffer. With clicks in it, it is no gap,
+            // and the mute in particular has to process it.
+            buffer.unset_flags(gst::BufferFlags::GAP);
             if let Ok(mut map) = buffer.map_writable() {
                 let mut samples: Vec<i16> = vec![0; map.len() / 2];
                 write_clicks(&mut samples, captured_at.max(0) as u64);

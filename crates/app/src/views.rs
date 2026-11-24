@@ -8,19 +8,24 @@ use std::time::Duration;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align, Align2, Button, CentralPanel, CornerRadius, FontId, Frame, Layout, Margin, Panel,
-    RichText, ScrollArea, Sense, Stroke, TextEdit, Ui, Vec2,
+    Align, Align2, Button, CentralPanel, ComboBox, CornerRadius, FontId, Frame, Layout, Margin,
+    Panel, Rect, RichText, ScrollArea, Sense, Slider, Stroke, StrokeKind, TextEdit, Ui, Vec2,
+    WidgetInfo, WidgetType,
 };
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
+use flowerchat_client::audio::{AudioDevice, AudioDevices};
 use flowerchat_client::session::{ConnectionState, Route};
 use flowerchat_protocol::PeerId;
 
 use crate::model::{Entry, EntryKind, PeerRow, RoomModel};
+use crate::settings::{DeviceChoice, MAX_RECEIVE_BUFFER_MS, SendMode, Settings};
+use crate::talk::GlobalKey;
 use crate::theme::{self, muted, strong};
 
 const SIDE_WIDTH: f32 = 232.0;
 const CHAT_WIDTH: f32 = 300.0;
+const AUDIO_WIDTH: f32 = 280.0;
 const BIG_BUTTON_HEIGHT: f32 = 30.0;
 const ICON_SIZE: f32 = 16.0;
 
@@ -30,8 +35,21 @@ pub enum Screen<'a> {
     Lobby {
         connecting: bool,
         error: Option<&'a str>,
+        /// Microphone level from 0 (silent) to 1 (full scale).
+        mic_level: f32,
     },
     Room(&'a RoomModel),
+}
+
+/// What the views show that belongs to the machine and not to a room.
+pub struct Env<'a> {
+    /// The audio devices that are plugged in.
+    pub devices: &'a AudioDevices,
+    /// Where the system-wide push-to-talk shortcut stands.
+    pub global_key: GlobalKey,
+    /// Whether the microphone is let out right now, as far as the choice
+    /// between open mic and push-to-talk goes.
+    pub transmitting: bool,
 }
 
 /// Input that lives between frames but is not part of the room.
@@ -43,6 +61,13 @@ pub struct UiState {
     pub chat_draft: String,
     /// Which part of the room a narrow window shows.
     pub tab: Tab,
+    /// The audio panel's choices. The caller watches these for changes.
+    pub settings: Settings,
+    /// Set while the next key press is to become the push-to-talk key.
+    pub capturing_key: bool,
+    /// The receive buffer while its slider is being dragged. It becomes a
+    /// setting when the slider is let go.
+    pub buffer_draft: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -50,6 +75,7 @@ pub enum Tab {
     #[default]
     People,
     Chat,
+    Audio,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,9 +90,20 @@ pub enum Action {
         volume: f32,
     },
     SendChat(String),
+    /// Play a sound on the chosen speakers.
+    TestSpeakers,
 }
 
-pub fn draw(ui: &mut Ui, screen: Screen<'_>, state: &mut UiState) -> Vec<Action> {
+/// Whether the push-to-talk key chosen in the window is being held. Typing
+/// that key into a text field does not count.
+pub fn talk_key_down(ctx: &egui::Context, state: &UiState) -> bool {
+    let Some(key) = state.settings.talk_key() else {
+        return false;
+    };
+    !state.capturing_key && !ctx.text_edit_focused() && ctx.input(|input| input.key_down(key))
+}
+
+pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState) -> Vec<Action> {
     let mut actions = Vec::new();
     if theme::install(ui.ctx()) {
         // The fonts are not usable until the next frame.
@@ -75,18 +112,43 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, state: &mut UiState) -> Vec<Action>
     }
     let wide = ui.available_width() >= theme::NARROW_BELOW;
     match screen {
-        Screen::Lobby { connecting, error } if wide => {
+        Screen::Lobby {
+            connecting,
+            error,
+            mic_level,
+        } if wide => {
             side_panel("lobby").show(ui, |ui| {
                 app_name(ui);
                 join_form(ui, connecting, error, state, &mut actions);
             });
+            Panel::right("lobby-audio")
+                .exact_size(AUDIO_WIDTH)
+                .resizable(false)
+                .frame(
+                    Frame::new()
+                        .fill(theme::PANEL)
+                        .inner_margin(Margin::symmetric(16, 14)),
+                )
+                .show(ui, |ui| {
+                    ui.label(strong("Audio"));
+                    ui.add_space(8.0);
+                    audio_stacked(ui, env, state, &mut actions, Some(mic_level));
+                });
             CentralPanel::default().show(ui, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(muted("Not in a room. Enter a name and a room on the left."));
+                ui.vertical_centered(|ui| {
+                    ui.add_space((ui.available_height() / 2.0 - 40.0).max(0.0));
+                    ui.set_max_width(360.0);
+                    ui.label(strong("Not in a room").size(15.0));
+                    ui.label(muted(
+                        "Enter a name and a room on the left. The audio panel on the right \
+                         already works, so you can check your microphone before joining.",
+                    ));
                 });
             });
         }
-        Screen::Lobby { connecting, error } => {
+        Screen::Lobby {
+            connecting, error, ..
+        } => {
             CentralPanel::default()
                 .frame(Frame::new().fill(theme::BACKGROUND).inner_margin(20))
                 .show(ui, |ui| {
@@ -95,8 +157,8 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, state: &mut UiState) -> Vec<Action>
                     join_form(ui, connecting, error, state, &mut actions);
                 });
         }
-        Screen::Room(room) if wide => room_wide(ui, room, state, &mut actions),
-        Screen::Room(room) => room_narrow(ui, room, state, &mut actions),
+        Screen::Room(room) if wide => room_wide(ui, room, env, state, &mut actions),
+        Screen::Room(room) => room_narrow(ui, room, env, state, &mut actions),
     }
     actions
 }
@@ -154,7 +216,14 @@ fn join_form(
 
 // --- Room, wide -------------------------------------------------------------
 
-fn room_wide(ui: &mut Ui, room: &RoomModel, state: &mut UiState, actions: &mut Vec<Action>) {
+fn room_wide(
+    ui: &mut Ui,
+    room: &RoomModel,
+    env: &Env<'_>,
+    state: &mut UiState,
+    actions: &mut Vec<Action>,
+) {
+    let mode = mode_text(env, state);
     side_panel("room").show(ui, |ui| {
         Panel::bottom("me")
             .resizable(false)
@@ -162,7 +231,7 @@ fn room_wide(ui: &mut Ui, room: &RoomModel, state: &mut UiState, actions: &mut V
                 top: 12,
                 ..Margin::ZERO
             }))
-            .show(ui, |ui| me_block(ui, room, actions));
+            .show(ui, |ui| me_block(ui, room, mode, actions));
         CentralPanel::no_frame().show(ui, |ui| {
             app_name(ui);
             ui.add_space(10.0);
@@ -202,7 +271,7 @@ fn room_wide(ui: &mut Ui, room: &RoomModel, state: &mut UiState, actions: &mut V
                     top: 10,
                     ..Margin::ZERO
                 }))
-                .show(ui, |ui| audio_summary(ui, room));
+                .show(ui, |ui| audio_columns(ui, env, state, actions));
             CentralPanel::no_frame().show(ui, |ui| {
                 row(ui, 20.0, |ui| {
                     ui.label(strong("People"));
@@ -273,64 +342,55 @@ fn people_table(ui: &mut Ui, room: &RoomModel, actions: &mut Vec<Action>) {
         });
 }
 
-fn audio_summary(ui: &mut Ui, room: &RoomModel) {
-    let audio = &room.audio;
-    ui.label(strong("Audio"));
-    ui.add_space(2.0);
-    let processing = if audio.processing {
-        "Echo cancellation, noise suppression, automatic volume"
-    } else {
-        "Off"
-    };
-    let buffer = format!("{} ms", audio.receive_buffer_ms);
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = 24.0;
-        for (label, value) in [
-            ("Microphone", audio.microphone.as_str()),
-            ("Speakers", audio.speakers.as_str()),
-            ("Microphone processing", processing),
-            ("Receive buffer", buffer.as_str()),
-        ] {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(muted(label));
-                ui.label(RichText::new(value).size(theme::SMALL));
-            });
-        }
-    });
-}
-
 // --- Room, narrow -----------------------------------------------------------
 
-fn room_narrow(ui: &mut Ui, room: &RoomModel, state: &mut UiState, actions: &mut Vec<Action>) {
+fn room_narrow(
+    ui: &mut Ui,
+    room: &RoomModel,
+    env: &Env<'_>,
+    state: &mut UiState,
+    actions: &mut Vec<Action>,
+) {
     let bar = |margin: Margin| Frame::new().fill(theme::PANEL).inner_margin(margin);
+    let mode = mode_text(env, state);
+    let tab_button = |label: &str, selected: bool| {
+        if selected {
+            Button::new(strong(label)).fill(theme::CONTROL_HOVER)
+        } else {
+            Button::new(RichText::new(label).color(theme::MUTED)).fill(egui::Color32::TRANSPARENT)
+        }
+    };
 
     Panel::top("header")
         .resizable(false)
         .frame(bar(Margin::symmetric(12, 8)))
         .show(ui, |ui| {
             row(ui, theme::CONTROL_HEIGHT, |ui| {
-                ui.label(strong(&room.room).size(15.0));
-                ui.label(muted(format!(
-                    "Connected · {} · {}",
-                    room.peers.len() + 1,
-                    clock(room.in_room)
-                )));
+                // The buttons are placed first, from the right, so that it
+                // is the status that gives way when space runs out.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
                     if ui.button("Leave").clicked() {
                         actions.push(Action::Leave);
                     }
+                    let audio = state.tab == Tab::Audio;
+                    if ui.add(tab_button("Audio", audio)).clicked() {
+                        state.tab = if audio { Tab::People } else { Tab::Audio };
+                    }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(strong(&room.room).size(15.0));
+                        let status = format!(
+                            "Connected · {} · {}",
+                            room.peers.len() + 1,
+                            clock(room.in_room)
+                        );
+                        ui.add(egui::Label::new(muted(status)).truncate());
+                    });
                 });
             });
             row(ui, theme::CONTROL_HEIGHT, |ui| {
                 for (tab, label) in [(Tab::People, "People"), (Tab::Chat, "Chat")] {
-                    let button = if state.tab == tab {
-                        Button::new(strong(label)).fill(theme::CONTROL_HOVER)
-                    } else {
-                        Button::new(RichText::new(label).color(theme::MUTED))
-                            .fill(egui::Color32::TRANSPARENT)
-                    };
-                    if ui.add(button).clicked() {
+                    if ui.add(tab_button(label, state.tab == tab)).clicked() {
                         state.tab = tab;
                     }
                 }
@@ -340,7 +400,7 @@ fn room_narrow(ui: &mut Ui, room: &RoomModel, state: &mut UiState, actions: &mut
     Panel::bottom("me")
         .resizable(false)
         .frame(bar(Margin::symmetric(12, 10)))
-        .show(ui, |ui| me_block(ui, room, actions));
+        .show(ui, |ui| me_block(ui, room, mode, actions));
 
     CentralPanel::default()
         .frame(
@@ -370,7 +430,369 @@ fn room_narrow(ui: &mut Ui, room: &RoomModel, state: &mut UiState, actions: &mut
                 });
             }
             Tab::Chat => chat(ui, room, state, actions, false),
+            Tab::Audio => {
+                ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    ui.add_space(4.0);
+                    audio_stacked(ui, env, state, actions, None);
+                });
+            }
         });
+}
+
+// --- Audio settings ---------------------------------------------------------
+
+/// The audio settings side by side, for under the people table.
+fn audio_columns(ui: &mut Ui, env: &Env<'_>, state: &mut UiState, actions: &mut Vec<Action>) {
+    ui.label(strong("Audio"));
+    ui.add_space(2.0);
+    ui.spacing_mut().item_spacing.x = 20.0;
+    ui.columns(3, |columns| {
+        let [devices, processing, send] = columns else {
+            return;
+        };
+        // Columns stretch what is put in them to their full width, which
+        // suits neither text nor small controls.
+        let column = |ui: &mut Ui, contents: &mut dyn FnMut(&mut Ui)| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                contents(ui);
+            });
+        };
+        column(devices, &mut |ui| {
+            device_pickers(ui, env, state, actions, None);
+        });
+        column(processing, &mut |ui| {
+            microphone_processing(ui, state);
+            ui.add_space(4.0);
+            receive_buffer(ui, state, false);
+        });
+        column(send, &mut |ui| send_voice(ui, env, state));
+    });
+}
+
+/// The audio settings in one column. `mic_level` adds a meter under the
+/// microphone, for when nothing else shows that it works.
+fn audio_stacked(
+    ui: &mut Ui,
+    env: &Env<'_>,
+    state: &mut UiState,
+    actions: &mut Vec<Action>,
+    mic_level: Option<f32>,
+) {
+    device_pickers(ui, env, state, actions, mic_level);
+    ui.add_space(10.0);
+    microphone_processing(ui, state);
+    ui.add_space(10.0);
+    send_voice(ui, env, state);
+    ui.add_space(10.0);
+    receive_buffer(ui, state, true);
+}
+
+fn device_pickers(
+    ui: &mut Ui,
+    env: &Env<'_>,
+    state: &mut UiState,
+    actions: &mut Vec<Action>,
+    mic_level: Option<f32>,
+) {
+    let settings = &mut state.settings;
+    ui.spacing_mut().item_spacing.y = 4.0;
+    ui.label(muted("Microphone"));
+    let width = ui.available_width();
+    device_picker(
+        ui,
+        "microphone",
+        &mut settings.microphone,
+        &env.devices.inputs,
+        width,
+    );
+    if let Some(level) = mic_level {
+        ui.add_space(2.0);
+        meter(ui, level);
+    }
+    ui.add_space(6.0);
+    ui.label(muted("Speakers"));
+    row(ui, theme::CONTROL_HEIGHT, |ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui.button("Test").clicked() {
+                actions.push(Action::TestSpeakers);
+            }
+            let width = ui.available_width();
+            device_picker(
+                ui,
+                "speakers",
+                &mut settings.speakers,
+                &env.devices.outputs,
+                width,
+            );
+        });
+    });
+}
+
+/// A drop-down with the system default first and then every device.
+fn device_picker(
+    ui: &mut Ui,
+    id: &str,
+    choice: &mut Option<DeviceChoice>,
+    devices: &[AudioDevice],
+    width: f32,
+) {
+    let default = match devices.iter().find(|device| device.is_default) {
+        Some(device) => format!("System default ({})", device.label),
+        None => "System default".to_owned(),
+    };
+    let selected = match &*choice {
+        None => default.clone(),
+        Some(choice) => match devices.iter().find(|device| device.id == choice.id) {
+            Some(device) => device.label.clone(),
+            // No list at all means the devices could not be looked up.
+            None if devices.is_empty() => choice.label.clone(),
+            None => format!("{} (not connected)", choice.label),
+        },
+    };
+    ComboBox::from_id_salt(id)
+        .width(width)
+        // Room for a dozen devices before the list starts to scroll.
+        .height(12.0 * theme::CONTROL_HEIGHT)
+        .selected_text(selected)
+        .truncate()
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(choice.is_none(), default).clicked() {
+                *choice = None;
+            }
+            for device in devices {
+                let chosen = choice.as_ref().is_some_and(|choice| choice.id == device.id);
+                if ui.selectable_label(chosen, &device.label).clicked() {
+                    *choice = Some(DeviceChoice::from(device));
+                }
+            }
+        });
+}
+
+fn microphone_processing(ui: &mut Ui, state: &mut UiState) {
+    let settings = &mut state.settings;
+    option_rows(ui);
+    ui.label(muted("Microphone processing"));
+    for (on, label) in [
+        (&mut settings.echo_cancellation, "Echo cancellation"),
+        (&mut settings.noise_suppression, "Noise suppression"),
+        (&mut settings.automatic_volume, "Automatic volume"),
+    ] {
+        if option(ui, *on, Mark::Check, label).clicked() {
+            *on = !*on;
+        }
+    }
+}
+
+fn send_voice(ui: &mut Ui, env: &Env<'_>, state: &mut UiState) {
+    option_rows(ui);
+    ui.label(muted("Send voice"));
+    let send = &mut state.settings.send;
+    for (mode, label) in [
+        (SendMode::Always, "Always (open mic)"),
+        (SendMode::WhileKeyHeld, "While a key is held"),
+    ] {
+        if option(ui, *send == mode, Mark::Dot, label).clicked() {
+            *send = mode;
+        }
+    }
+    let push_to_talk = *send == SendMode::WhileKeyHeld;
+    if !push_to_talk {
+        state.capturing_key = false;
+    }
+
+    if state.capturing_key {
+        let pressed = ui.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    ..
+                } => Some(*key),
+                _ => None,
+            })
+        });
+        if let Some(key) = pressed {
+            if key != egui::Key::Escape {
+                state.settings.talk_key = Some(key.name().to_owned());
+            }
+            state.capturing_key = false;
+        }
+    }
+
+    ui.add_enabled_ui(push_to_talk, |ui| {
+        ui.spacing_mut().interact_size.y = theme::CONTROL_HEIGHT;
+        row(ui, theme::CONTROL_HEIGHT, |ui| {
+            // In line with the labels of the options above.
+            ui.add_space(OPTION_MARK + OPTION_GAP);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let label = if state.capturing_key {
+                    "Cancel"
+                } else {
+                    "Set key"
+                };
+                if ui.button(label).clicked() {
+                    state.capturing_key = !state.capturing_key;
+                }
+                let key = state.settings.talk_key();
+                let (text, color) = match key {
+                    _ if state.capturing_key => ("Press a key…", theme::TEXT),
+                    Some(key) => (key.name(), theme::TEXT),
+                    None => ("No key set", theme::MUTED),
+                };
+                readout(ui, text, color);
+            });
+        });
+    });
+    if push_to_talk {
+        let note = match &env.global_key {
+            GlobalKey::Off => None,
+            GlobalKey::Registering => Some("Asking the system for a shortcut…".to_owned()),
+            GlobalKey::Ready { trigger } if trigger.is_empty() => Some(
+                "Works while this window has focus. For everywhere else, bind \
+                 flowerchat's “push-to-talk” shortcut in your desktop's settings."
+                    .to_owned(),
+            ),
+            GlobalKey::Ready { trigger } => Some(format!(
+                "Works while this window has focus. Everywhere else: {trigger}."
+            )),
+            GlobalKey::Unavailable(reason) => Some(format!(
+                "Works while this window has focus. Nowhere else, because {reason}."
+            )),
+        };
+        if let Some(note) = note {
+            ui.add_space(2.0);
+            ui.label(muted(note));
+        }
+    }
+}
+
+/// `hint` adds a line on what the setting trades off.
+fn receive_buffer(ui: &mut Ui, state: &mut UiState, hint: bool) {
+    let mut value = state
+        .buffer_draft
+        .unwrap_or(state.settings.receive_buffer_ms);
+    ui.spacing_mut().item_spacing.y = 2.0;
+    row(ui, 18.0, |ui| {
+        ui.label(muted("Receive buffer"));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(format!("{value} ms")).size(theme::SMALL));
+        });
+    });
+    ui.spacing_mut().slider_width = ui.available_width();
+    // The handle's size follows this height.
+    ui.spacing_mut().interact_size.y = 18.0;
+    let slider = ui.add(Slider::new(&mut value, 0..=MAX_RECEIVE_BUFFER_MS).show_value(false));
+    if slider.dragged() {
+        state.buffer_draft = Some(value);
+    } else if slider.drag_stopped() || slider.changed() {
+        state.buffer_draft = None;
+        state.settings.receive_buffer_ms = value;
+    }
+    if hint {
+        ui.add_space(2.0);
+        ui.label(muted("Lower means less delay. Raise it if voices cut out."));
+    }
+}
+
+/// Spacing for a short list of checkboxes or radio buttons under a label.
+fn option_rows(ui: &mut Ui) {
+    ui.spacing_mut().item_spacing.y = 3.0;
+}
+
+const OPTION_MARK: f32 = 14.0;
+const OPTION_GAP: f32 = 8.0;
+
+/// What shows that an option is on.
+#[derive(Clone, Copy, PartialEq)]
+enum Mark {
+    /// A checkbox: any number of these can be on.
+    Check,
+    /// A radio button: one of a group is on.
+    Dot,
+}
+
+/// A checkbox or radio button with its label. The caller changes the value
+/// when it is clicked.
+fn option(ui: &mut Ui, on: bool, mark: Mark, label: &str) -> egui::Response {
+    let text = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(theme::BODY),
+        theme::TEXT,
+    );
+    let size = Vec2::new(OPTION_MARK + OPTION_GAP + text.size().x, 20.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        let kind = match mark {
+            Mark::Check => WidgetType::Checkbox,
+            Mark::Dot => WidgetType::RadioButton,
+        };
+        WidgetInfo::selected(kind, ui.is_enabled(), on, label)
+    });
+
+    let center = egui::pos2(rect.left() + OPTION_MARK / 2.0, rect.center().y);
+    let outline = if response.hovered() || response.has_focus() {
+        theme::MUTED
+    } else {
+        theme::IDLE
+    };
+    let painter = ui.painter();
+    match mark {
+        Mark::Check => {
+            let square = Rect::from_center_size(center, Vec2::splat(OPTION_MARK));
+            let radius = CornerRadius::same(3);
+            if on {
+                painter.rect_filled(square, radius, theme::ACCENT);
+                let at = |x: f32, y: f32| square.left_top() + Vec2::new(x, y);
+                painter.line(
+                    vec![at(3.5, 7.5), at(6.0, 10.0), at(10.5, 4.5)],
+                    Stroke::new(1.8, theme::ON_ACCENT),
+                );
+            } else {
+                let stroke = Stroke::new(1.5, outline);
+                painter.rect(square, radius, theme::FIELD, stroke, StrokeKind::Inside);
+            }
+        }
+        Mark::Dot => {
+            let radius = OPTION_MARK / 2.0 - 0.75;
+            if on {
+                painter.circle_stroke(center, radius, Stroke::new(1.5, theme::ACCENT));
+                painter.circle_filled(center, 3.5, theme::ACCENT);
+            } else {
+                painter.circle(center, radius, theme::FIELD, Stroke::new(1.5, outline));
+            }
+        }
+    }
+    let text_at = egui::pos2(
+        rect.left() + OPTION_MARK + OPTION_GAP,
+        rect.center().y - text.size().y / 2.0,
+    );
+    painter.galley(text_at, text, theme::TEXT);
+    response
+}
+
+/// A value shown in the shape of a text field, filling the width left.
+fn readout(ui: &mut Ui, text: &str, color: egui::Color32) {
+    let size = Vec2::new(ui.available_width(), theme::CONTROL_HEIGHT);
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(theme::RADIUS),
+        theme::FIELD,
+        Stroke::new(1.0, theme::BORDER),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        rect.left_center() + Vec2::new(8.0, 0.0),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(theme::BODY),
+        color,
+    );
 }
 
 // --- Shared pieces ----------------------------------------------------------
@@ -391,7 +813,7 @@ fn app_name(ui: &mut Ui) {
 }
 
 /// Your own status and controls: what you are sending, and mute and deafen.
-fn me_block(ui: &mut Ui, room: &RoomModel, actions: &mut Vec<Action>) {
+fn me_block(ui: &mut Ui, room: &RoomModel, mode: &str, actions: &mut Vec<Action>) {
     let me = &room.me;
     row(ui, 20.0, |ui| {
         ui.label(strong(&me.name));
@@ -407,7 +829,7 @@ fn me_block(ui: &mut Ui, room: &RoomModel, actions: &mut Vec<Action>) {
     ui.add_space(2.0);
     kv(ui, "Sending", kbps(me.sending_kbps));
     kv(ui, "Codec", "Opus, 48 kHz");
-    kv(ui, "Mode", "Open mic");
+    kv(ui, "Mode", mode);
     ui.add_space(4.0);
 
     let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
@@ -630,6 +1052,15 @@ fn row(ui: &mut Ui, height: f32, contents: impl FnOnce(&mut Ui)) {
 }
 
 // --- Wording ----------------------------------------------------------------
+
+/// How the microphone is being sent, for the block about yourself.
+fn mode_text(env: &Env<'_>, state: &UiState) -> &'static str {
+    match state.settings.send {
+        SendMode::Always => "Open mic",
+        SendMode::WhileKeyHeld if env.transmitting => "Key held, sending",
+        SendMode::WhileKeyHeld => "Hold key to talk",
+    }
+}
 
 fn peer_name(peer: &PeerRow) -> RichText {
     if peer.connected() {

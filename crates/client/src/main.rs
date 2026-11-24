@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use clap::Parser;
 use flowerchat_client::latency::Summary;
-use flowerchat_client::session::{self, Command, Event, SessionConfig};
+use flowerchat_client::session::{self, AudioSettings, Command, Event, SessionConfig};
 use flowerchat_protocol::PeerId;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -70,6 +70,18 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     gstreamer::init()?;
 
+    let audio = AudioSettings {
+        input: args.input,
+        output: args.output,
+        jitter_ms: args.jitter_ms,
+        ..AudioSettings::default()
+    };
+    let audio = if args.raw_mic {
+        audio.unprocessed()
+    } else {
+        audio
+    };
+
     let (commands, command_rx) = unbounded_channel();
     let (event_tx, mut events) = unbounded_channel();
     let session = tokio::spawn(session::run(
@@ -77,10 +89,8 @@ async fn main() -> Result<()> {
             server: args.server,
             room: args.room.clone(),
             name: args.name.clone(),
-            input: args.input,
-            output: args.output,
-            jitter_ms: args.jitter_ms,
-            raw_mic: args.raw_mic,
+            audio,
+            transmitting: true,
             test_tone: args.test_tone,
             measure: args.measure,
         },

@@ -1,14 +1,18 @@
 //! The flowerchat window: connects the views to a session.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
-use flowerchat_app::model::{AudioSummary, RoomModel};
+use flowerchat_app::model::{RoomModel, meter_level};
+use flowerchat_app::settings::{DeviceChoice, SendMode, Settings};
+use flowerchat_app::talk::Talk;
 use flowerchat_app::theme;
-use flowerchat_app::views::{self, Action, Screen, UiState};
-use flowerchat_client::session::{self, Command, Event, SessionConfig};
+use flowerchat_app::views::{self, Action, Env, Screen, UiState};
+use flowerchat_client::audio::{self, AudioDevice, AudioDevices, DeviceWatch, MicCheck};
+use flowerchat_client::session::{self, AudioSettings, Command, Event, SessionConfig};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
@@ -38,17 +42,18 @@ struct Args {
     /// Join straight away instead of showing the form first.
     #[arg(long)]
     autojoin: bool,
-    /// Microphone to use, as a PipeWire/PulseAudio source name.
+    /// Microphone to use, as a PipeWire/PulseAudio source name, instead of
+    /// the one chosen last time.
     #[arg(long)]
     input: Option<String>,
-    /// Speakers to use, as a PipeWire/PulseAudio sink name.
+    /// Speakers to use, as a PipeWire/PulseAudio sink name, instead of the
+    /// ones chosen last time.
     #[arg(long)]
     output: Option<String>,
-    /// Receive buffer in milliseconds.
-    #[arg(long, default_value_t = 40)]
-    jitter_ms: u32,
-    /// Send the microphone without echo cancellation, noise suppression or
-    /// automatic gain.
+    /// Receive buffer in milliseconds, instead of the one chosen last time.
+    #[arg(long)]
+    jitter_ms: Option<u32>,
+    /// Turn off echo cancellation, noise suppression and automatic volume.
     #[arg(long)]
     raw_mic: bool,
     /// For testing: send one click per second instead of the microphone.
@@ -64,6 +69,8 @@ struct Active {
     commands: UnboundedSender<Command>,
     task: JoinHandle<anyhow::Result<()>>,
     shared: Arc<Mutex<Shared>>,
+    /// The audio settings the session was last given.
+    audio: AudioSettings,
 }
 
 /// What the window draws. A background task keeps it current, because the
@@ -82,6 +89,17 @@ struct App {
     active: Option<Active>,
     /// Why the last join or session failed, shown on the join form.
     error: Option<String>,
+    /// Absent when this system cannot list its audio devices.
+    watch: Option<DeviceWatch>,
+    devices: AudioDevices,
+    /// Listens to the microphone while not in a room, so the join screen
+    /// can show that it works. Holds the settings it was started with, and
+    /// nothing more if it could not start.
+    mic_check: Option<(AudioSettings, Option<MicCheck>)>,
+    /// The level the microphone check last reported, as the bits of an
+    /// `f32` from 0 to 1.
+    lobby_level: Arc<AtomicU32>,
+    talk: Arc<Talk>,
 }
 
 impl App {
@@ -104,16 +122,31 @@ impl App {
                 .clone()
                 .or_else(|| saved("server"))
                 .unwrap_or_else(|| DEFAULT_SERVER.into()),
+            settings: settings_with(
+                cc.storage
+                    .and_then(|storage| eframe::get_value(storage, "settings"))
+                    .unwrap_or_default(),
+                &args,
+            ),
             ..UiState::default()
         };
+        let watch = DeviceWatch::start()
+            .inspect_err(|err| tracing::warn!("audio devices cannot be chosen: {err:#}"))
+            .ok();
         let mut app = Self {
             runtime: Runtime::new()?,
             ctx: cc.egui_ctx.clone(),
             ui,
             active: None,
             error: None,
+            devices: AudioDevices::default(),
+            watch,
+            mic_check: None,
+            lobby_level: Arc::default(),
+            talk: Arc::default(),
             args,
         };
+        app.list_devices();
         if app.args.autojoin {
             app.perform(Action::Join);
         }
@@ -127,6 +160,7 @@ impl App {
             .as_ref()
             .is_some_and(|active| active.task.is_finished());
         if finished && let Some(active) = self.active.take() {
+            self.talk.detach();
             self.error = match self.runtime.block_on(active.task) {
                 Ok(Ok(())) => None,
                 Ok(Err(err)) => Some(sentence(&format!("{err:#}"))),
@@ -136,16 +170,17 @@ impl App {
     }
 
     fn perform(&mut self, action: Action) {
-        if action == Action::Join {
-            self.join();
-            return;
+        match action {
+            Action::Join => return self.join(),
+            Action::TestSpeakers => return self.test_speakers(),
+            _ => {}
         }
         let Some(active) = &self.active else {
             return;
         };
         let room = &mut active.shared.lock().unwrap().room;
         let command = match action {
-            Action::Join => return,
+            Action::Join | Action::TestSpeakers => return,
             Action::Leave => Command::Leave,
             Action::SetMuted(muted) => {
                 room.me.muted = muted;
@@ -173,57 +208,147 @@ impl App {
         let _ = active.commands.send(command);
     }
 
+    /// The audio settings to use, given what is chosen and plugged in.
+    fn audio(&self) -> AudioSettings {
+        self.ui.settings.audio(&self.devices)
+    }
+
+    /// Looks up which audio devices are plugged in.
+    fn list_devices(&mut self) {
+        let Some(watch) = &self.watch else {
+            return;
+        };
+        self.devices = watch.devices();
+        // A device named on the command line can be chosen even when the
+        // system does not list it, as is the case for monitors of outputs.
+        for (flag, list) in [
+            (&self.args.input, &mut self.devices.inputs),
+            (&self.args.output, &mut self.devices.outputs),
+        ] {
+            if let Some(name) = flag
+                && !list.iter().any(|device| device.id == *name)
+            {
+                list.push(AudioDevice {
+                    id: name.clone(),
+                    label: name.clone(),
+                    is_default: false,
+                });
+            }
+        }
+    }
+
+    fn test_speakers(&mut self) {
+        let output = self.audio().output;
+        let Err(err) = audio::play_test_sound(output.as_deref()) else {
+            return;
+        };
+        let problem = sentence(&format!("{err:#}"));
+        match &self.active {
+            Some(active) => active.shared.lock().unwrap().room.log(&clock(), problem),
+            None => self.error = Some(problem),
+        }
+    }
+
+    /// Brings the session in line with the audio settings, and decides
+    /// whether the microphone is let out.
+    fn sync_audio(&mut self, ctx: &egui::Context) {
+        if self.watch.as_ref().is_some_and(DeviceWatch::changed) {
+            self.list_devices();
+        }
+
+        let push_to_talk = self.ui.settings.send == SendMode::WhileKeyHeld;
+        if push_to_talk {
+            let ctx = ctx.clone();
+            self.talk
+                .register_global(&self.runtime, move || ctx.request_repaint());
+        }
+        self.talk
+            .set_local(push_to_talk, views::talk_key_down(ctx, &self.ui));
+
+        let audio = self.audio();
+        match &mut self.active {
+            Some(active) => {
+                self.mic_check = None;
+                if active.audio != audio {
+                    active.audio = audio.clone();
+                    let _ = active.commands.send(Command::SetAudio(audio));
+                }
+            }
+            None => self.check_microphone(audio),
+        }
+    }
+
+    /// Keeps a microphone check running with the settings given.
+    fn check_microphone(&mut self, audio: AudioSettings) {
+        if self.args.test_tone {
+            return;
+        }
+        // The check plays nothing, so only the capturing side matters.
+        let wanted = AudioSettings {
+            output: None,
+            jitter_ms: 0,
+            ..audio
+        };
+        if self
+            .mic_check
+            .as_ref()
+            .is_some_and(|(running, _)| *running == wanted)
+        {
+            return;
+        }
+        // The old check has to let go of the microphone first.
+        self.mic_check = None;
+        self.lobby_level.store(0, Ordering::Relaxed);
+        let (level, ctx) = (self.lobby_level.clone(), self.ctx.clone());
+        let check = MicCheck::start(&wanted, move |db| {
+            level.store(meter_level(db).to_bits(), Ordering::Relaxed);
+            ctx.request_repaint();
+        })
+        .inspect_err(|err| tracing::warn!("cannot check the microphone: {err:#}"))
+        .ok();
+        self.mic_check = Some((wanted, check));
+    }
+
     fn join(&mut self) {
         if self.active.is_some() {
             return;
         }
         self.error = None;
+        // The call needs the microphone that the check is holding.
+        self.mic_check = None;
         let (name, room, server) = (
             self.ui.name.trim().to_owned(),
             self.ui.room.trim().to_owned(),
             self.ui.server.trim().to_owned(),
         );
+        let audio = self.audio();
+        let transmitting = self.talk.transmitting();
         let config = SessionConfig {
             server: server.clone(),
             room: room.clone(),
             name: name.clone(),
-            input: self.args.input.clone(),
-            output: self.args.output.clone(),
-            jitter_ms: self.args.jitter_ms,
-            raw_mic: self.args.raw_mic,
+            audio: audio.clone(),
+            transmitting,
             test_tone: self.args.test_tone,
             measure: self.args.measure,
-        };
-        let device = |name: &Option<String>| name.clone().unwrap_or("System default".into());
-        let audio = AudioSummary {
-            microphone: if self.args.test_tone {
-                "Test clicks".into()
-            } else {
-                device(&self.args.input)
-            },
-            speakers: if self.args.measure {
-                "None (measuring)".into()
-            } else {
-                device(&self.args.output)
-            },
-            processing: !self.args.raw_mic && !self.args.test_tone,
-            receive_buffer_ms: self.args.jitter_ms,
         };
 
         let (commands, command_rx) = unbounded_channel();
         let (event_tx, events) = unbounded_channel();
         let shared = Arc::new(Mutex::new(Shared {
-            room: RoomModel::new(&room, host_of(&server), &name, audio),
+            room: RoomModel::new(&room, host_of(&server), &name),
             joined_at: None,
         }));
         self.runtime
             .spawn(follow(events, shared.clone(), self.ctx.clone()));
+        self.talk.attach(commands.clone(), transmitting);
         self.active = Some(Active {
             commands,
             task: self
                 .runtime
                 .spawn(session::run(config, command_rx, event_tx)),
             shared,
+            audio,
         });
     }
 }
@@ -256,6 +381,13 @@ async fn follow(
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.reap();
+        self.sync_audio(ui.ctx());
+        let env = Env {
+            devices: &self.devices,
+            global_key: self.talk.global_key(),
+            transmitting: self.talk.transmitting(),
+        };
+        let mic_level = f32::from_bits(self.lobby_level.load(Ordering::Relaxed));
         let actions = match &self.active {
             Some(active) => {
                 let mut shared = active.shared.lock().unwrap();
@@ -267,16 +399,18 @@ impl eframe::App for App {
                     None => Screen::Lobby {
                         connecting: true,
                         error: None,
+                        mic_level: 0.0,
                     },
                 };
-                views::draw(ui, screen, &mut self.ui)
+                views::draw(ui, screen, &env, &mut self.ui)
             }
             None => {
                 let screen = Screen::Lobby {
                     connecting: false,
                     error: self.error.as_deref(),
+                    mic_level,
                 };
-                views::draw(ui, screen, &mut self.ui)
+                views::draw(ui, screen, &env, &mut self.ui)
             }
         };
         for action in actions {
@@ -291,10 +425,12 @@ impl eframe::App for App {
         storage.set_string("name", self.ui.name.clone());
         storage.set_string("room", self.ui.room.clone());
         storage.set_string("server", self.ui.server.clone());
+        eframe::set_value(storage, "settings", &self.ui.settings);
     }
 
     fn on_exit(&mut self) {
         // Leave properly, so the others see us go and audio devices close.
+        self.mic_check = None;
         if let Some(active) = self.active.take() {
             let _ = active.commands.send(Command::Leave);
             let _ = self
@@ -302,6 +438,29 @@ impl eframe::App for App {
                 .block_on(tokio::time::timeout(EXIT_GRACE, active.task));
         }
     }
+}
+
+/// The saved settings with the command line's choices on top.
+fn settings_with(mut settings: Settings, args: &Args) -> Settings {
+    let named = |name: &String| DeviceChoice {
+        id: name.clone(),
+        label: name.clone(),
+    };
+    if let Some(input) = &args.input {
+        settings.microphone = Some(named(input));
+    }
+    if let Some(output) = &args.output {
+        settings.speakers = Some(named(output));
+    }
+    if let Some(jitter_ms) = args.jitter_ms {
+        settings.receive_buffer_ms = jitter_ms;
+    }
+    if args.raw_mic {
+        settings.echo_cancellation = false;
+        settings.noise_suppression = false;
+        settings.automatic_volume = false;
+    }
+    settings
 }
 
 /// The current wall-clock time as `HH:MM`.
@@ -353,6 +512,9 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|err| anyhow::anyhow!("cannot open the window: {err}"))
 }
+
+#[cfg(test)]
+mod e2e;
 
 #[cfg(test)]
 mod tests {

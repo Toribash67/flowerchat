@@ -5,8 +5,11 @@ use std::time::Duration;
 
 use egui::Vec2;
 use egui_kittest::Harness;
-use flowerchat_app::model::{AudioSummary, Entry, EntryKind, PeerRow, RoomModel};
-use flowerchat_app::views::{self, Screen, Tab, UiState};
+use flowerchat_app::model::{Entry, EntryKind, PeerRow, RoomModel};
+use flowerchat_app::settings::{DeviceChoice, SendMode};
+use flowerchat_app::talk::GlobalKey;
+use flowerchat_app::views::{self, Env, Screen, Tab, UiState};
+use flowerchat_client::audio::{AudioDevice, AudioDevices};
 use flowerchat_client::session::{ConnectionState, PeerStats, Route};
 
 const WIDE: Vec2 = Vec2::new(1280.0, 720.0);
@@ -28,13 +31,7 @@ fn peer(id: u64, name: &str, route: Route, rtt: f64, loss: f64, jitter: f64, kbp
 
 /// A room showing every state a row can be in.
 fn room() -> RoomModel {
-    let audio = AudioSummary {
-        microphone: "System default".into(),
-        speakers: "System default".into(),
-        processing: true,
-        receive_buffer_ms: 40,
-    };
-    let mut room = RoomModel::new("lounge", "chat.example.org", "robin", audio);
+    let mut room = RoomModel::new("lounge", "chat.example.org", "robin");
     room.in_room = Duration::from_secs(42 * 60 + 17);
     room.me.mic_level = 0.42;
     room.me.sending_kbps = Some(64.0);
@@ -88,6 +85,33 @@ fn form() -> UiState {
     }
 }
 
+fn devices() -> AudioDevices {
+    let device = |id: &str, label: &str, is_default: bool| AudioDevice {
+        id: id.into(),
+        label: label.into(),
+        is_default,
+    };
+    AudioDevices {
+        inputs: vec![
+            device("headset-mic", "USB headset", true),
+            device("onboard-mic", "Built-in audio", false),
+        ],
+        outputs: vec![
+            device("headset", "USB headset", true),
+            device("hdmi", "Monitor (HDMI)", false),
+        ],
+    }
+}
+
+/// An ordinary machine with an open mic.
+fn env(devices: &AudioDevices) -> Env<'_> {
+    Env {
+        devices,
+        global_key: GlobalKey::Off,
+        transmitting: true,
+    }
+}
+
 fn snapshot(name: &str, size: Vec2, mut draw: impl FnMut(&mut egui::Ui)) {
     let mut harness = Harness::builder()
         .with_size(size)
@@ -101,24 +125,28 @@ fn snapshot(name: &str, size: Vec2, mut draw: impl FnMut(&mut egui::Ui)) {
 #[test]
 fn lobby_wide() {
     let mut state = form();
+    let devices = devices();
     let screen = || Screen::Lobby {
         connecting: false,
         error: None,
+        mic_level: 0.42,
     };
     snapshot("lobby_wide", WIDE, |ui| {
-        views::draw(ui, screen(), &mut state);
+        views::draw(ui, screen(), &env(&devices), &mut state);
     });
 }
 
 #[test]
 fn lobby_with_error() {
     let mut state = form();
+    let devices = devices();
     snapshot("lobby_with_error", NARROW, |ui| {
         let screen = Screen::Lobby {
             connecting: false,
             error: Some("cannot reach the signaling server at wss://chat.example.org/ws"),
+            mic_level: 0.0,
         };
-        views::draw(ui, screen, &mut state);
+        views::draw(ui, screen, &env(&devices), &mut state);
     });
 }
 
@@ -126,8 +154,9 @@ fn lobby_with_error() {
 fn room_wide() {
     let room = room();
     let mut state = form();
+    let devices = devices();
     snapshot("room_wide", WIDE, |ui| {
-        views::draw(ui, Screen::Room(&room), &mut state);
+        views::draw(ui, Screen::Room(&room), &env(&devices), &mut state);
     });
 }
 
@@ -137,8 +166,9 @@ fn room_wide_muted_and_deafened() {
     room.me.muted = true;
     room.me.deafened = true;
     let mut state = form();
+    let devices = devices();
     snapshot("room_wide_muted_and_deafened", WIDE, |ui| {
-        views::draw(ui, Screen::Room(&room), &mut state);
+        views::draw(ui, Screen::Room(&room), &env(&devices), &mut state);
     });
 }
 
@@ -146,8 +176,9 @@ fn room_wide_muted_and_deafened() {
 fn room_narrow_people() {
     let room = room();
     let mut state = form();
+    let devices = devices();
     snapshot("room_narrow_people", NARROW, |ui| {
-        views::draw(ui, Screen::Room(&room), &mut state);
+        views::draw(ui, Screen::Room(&room), &env(&devices), &mut state);
     });
 }
 
@@ -156,7 +187,54 @@ fn room_narrow_chat() {
     let room = room();
     let mut state = form();
     state.tab = Tab::Chat;
+    let devices = devices();
     snapshot("room_narrow_chat", NARROW, |ui| {
-        views::draw(ui, Screen::Room(&room), &mut state);
+        views::draw(ui, Screen::Room(&room), &env(&devices), &mut state);
+    });
+}
+
+#[test]
+fn room_wide_push_to_talk() {
+    let room = room();
+    let mut state = form();
+    state.settings.send = SendMode::WhileKeyHeld;
+    state.settings.talk_key = Some("F8".into());
+    state.settings.noise_suppression = false;
+    state.settings.receive_buffer_ms = 80;
+    // Chosen once, but not plugged in now.
+    state.settings.microphone = Some(DeviceChoice {
+        id: "webcam-mic".into(),
+        label: "Webcam".into(),
+    });
+    let devices = devices();
+    let env = Env {
+        devices: &devices,
+        global_key: GlobalKey::Ready {
+            trigger: String::new(),
+        },
+        transmitting: false,
+    };
+    snapshot("room_wide_push_to_talk", WIDE, |ui| {
+        views::draw(ui, Screen::Room(&room), &env, &mut state);
+    });
+}
+
+#[test]
+fn room_narrow_audio() {
+    let room = room();
+    let mut state = form();
+    state.tab = Tab::Audio;
+    state.settings.send = SendMode::WhileKeyHeld;
+    let devices = devices();
+    let env = Env {
+        devices: &devices,
+        global_key: GlobalKey::Unavailable(
+            "the desktop does not know this app (is se.flowerboi.flowerchat.desktop installed?)"
+                .into(),
+        ),
+        transmitting: false,
+    };
+    snapshot("room_narrow_audio", NARROW, |ui| {
+        views::draw(ui, Screen::Room(&room), &env, &mut state);
     });
 }

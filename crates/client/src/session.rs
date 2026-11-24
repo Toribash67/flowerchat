@@ -11,6 +11,7 @@ use flowerchat_protocol::{ClientMsg, PeerId, ServerMsg};
 use futures_util::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+pub use crate::audio::AudioSettings;
 use crate::call::{Call, CallConfig, CallEvent};
 pub use crate::call::{ConnectionState, PeerStats, Route};
 use crate::ice::IceConfig;
@@ -25,15 +26,10 @@ pub struct SessionConfig {
     pub server: String,
     pub room: String,
     pub name: String,
-    /// PulseAudio/PipeWire source name, or the default source.
-    pub input: Option<String>,
-    /// PulseAudio/PipeWire sink name, or the default sink.
-    pub output: Option<String>,
-    /// Size of the receive buffer that absorbs network jitter.
-    pub jitter_ms: u32,
-    /// Send the microphone without echo cancellation, noise suppression or
-    /// gain control.
-    pub raw_mic: bool,
+    pub audio: AudioSettings,
+    /// Whether the microphone is sent from the start. Push-to-talk starts
+    /// without, and turns it on with [`Command::SetTransmitting`].
+    pub transmitting: bool,
     /// Send measurement clicks instead of the microphone.
     pub test_tone: bool,
     /// Time incoming clicks instead of playing audio.
@@ -44,6 +40,11 @@ pub struct SessionConfig {
 pub enum Command {
     SetMuted(bool),
     SetDeafened(bool),
+    /// Lets the microphone out or holds it back, for push-to-talk. The
+    /// peers are not told, unlike with muting.
+    SetTransmitting(bool),
+    /// Changes devices, processing or the receive buffer during the call.
+    SetAudio(AudioSettings),
     /// Playback gain for one peer, 1.0 being unchanged.
     SetPeerVolume {
         id: PeerId,
@@ -109,10 +110,8 @@ pub async fn run(
     let (call_events_tx, mut call_events) = unbounded_channel();
     let call = Call::new(
         CallConfig {
-            input: config.input,
-            output: config.output,
-            jitter_ms: config.jitter_ms,
-            raw_mic: config.raw_mic,
+            audio: config.audio,
+            transmitting: config.transmitting,
             test_tone: config.test_tone,
             measure: config.measure,
             ice: IceConfig::from_servers(&welcome.ice_servers),
@@ -180,6 +179,12 @@ pub async fn run(
             command = commands.recv() => match command {
                 Some(Command::SetMuted(muted)) => call.set_muted(muted),
                 Some(Command::SetDeafened(deafened)) => call.set_deafened(deafened),
+                Some(Command::SetTransmitting(on)) => call.set_transmitting(on),
+                Some(Command::SetAudio(audio)) => {
+                    if let Err(err) = call.apply_audio(audio) {
+                        break Err(err);
+                    }
+                }
                 Some(Command::SetPeerVolume { id, volume }) => call.set_peer_volume(id, volume),
                 Some(Command::SendChat(text)) => call.send_chat(&text),
                 // A dropped command channel means the interface is gone.

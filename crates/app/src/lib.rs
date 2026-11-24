@@ -2,5 +2,7 @@
 //! that draw one with the other.
 
 pub mod model;
+pub mod settings;
+pub mod talk;
 pub mod theme;
 pub mod views;

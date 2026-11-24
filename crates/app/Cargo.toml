@@ -13,13 +13,21 @@ egui-phosphor = "0.14.0"
 egui_extras = "0.36"
 flowerchat-client = { version = "0.1.0", path = "../client" }
 flowerchat-protocol = { version = "0.1.0", path = "../protocol" }
+futures-util = "0.3.34"
 gstreamer = "0.25.4"
+serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.14.3", default-features = false, features = ["tokio", "global_shortcuts"] }
+
 [dev-dependencies]
-egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+axum = "0.8.9"
+flowerchat-server = { path = "../server" }
+tokio = { version = "1.54.1", features = ["net"] }
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }
 
 [[bin]]
 name = "flowerchat"

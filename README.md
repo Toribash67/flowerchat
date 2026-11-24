@@ -47,11 +47,48 @@ Enter a name, a room and the server's address, and join. The window shows
 who is in the room with each connection's route, delay, loss, jitter and
 bitrate, a volume slider per person, and a chat whose timeline also records
 what happens in the room. Below 900 px wide the columns collapse into one.
-The name, room and server are remembered between runs.
+
+The audio panel is on the join screen, where a meter shows that the
+microphone works, and under the list of people once in a room (behind the
+Audio button in a narrow window). Everything on it takes effect at once,
+also in the middle of a call:
+
+- the microphone and the speakers, with a button that plays a test sound;
+- echo cancellation, noise suppression and automatic volume, each on its own;
+- the receive buffer: lower means less delay, higher tolerates more jitter;
+- whether voice is sent always or only while a key is held.
+
+A device that was chosen and is then unplugged gives way to the system
+default, and is used again when it comes back. The name, room, server and
+audio settings are remembered between runs.
 
 `--name`, `--room` and `--server` prefill the form and `--autojoin` skips it.
-`--input`, `--output`, `--jitter-ms` and `--raw-mic` work as in the
-command-line client below; there is no settings screen yet.
+`--input`, `--output`, `--jitter-ms` and `--raw-mic` set the corresponding
+audio settings, as in the command-line client below.
+
+### Push-to-talk
+
+The key chosen with "Set key" works while the window has focus. For a key
+that works everywhere, the app registers a shortcut named `push-to-talk` with
+the desktop, through the GlobalShortcuts portal, the first time push-to-talk
+is turned on. Which key triggers it is then set in the desktop, not in the
+app.
+
+Desktops only give such shortcuts to apps they can identify, so the launcher
+entry has to be installed, under exactly this name:
+
+```sh
+install -Dm644 crates/app/assets/se.flowerboi.flowerchat.desktop \
+    ~/.local/share/applications/se.flowerboi.flowerchat.desktop
+```
+
+Its `Exec` line assumes `flowerchat` is on the `PATH`; change it if not.
+Without the entry, the audio panel says that the desktop does not know the
+app, and only the key chosen in the window works.
+
+On Hyprland the shortcut is bound with the `global` dispatcher, as
+`se.flowerboi.flowerchat:push-to-talk`; `hyprctl globalshortcuts` lists it
+while the app runs.
 
 The interface is drawn from a plain data model, so `crates/app/tests`
 renders every screen from fixed data and compares the result with the images
@@ -125,6 +162,18 @@ status and `{"chat": "…"}` for a chat message.
 cargo test --workspace
 ```
 
-The client's end-to-end test starts a server and two clients and checks that
-they measure a plausible latency. It needs a network interface other than
-loopback.
+The client's end-to-end tests start a server and two clients, check that
+they measure a plausible latency, and change settings in the middle of the
+call. They need a network interface other than loopback, but no audio device.
+
+One test is left out of that, and is run on request:
+
+```sh
+cargo test -p flowerchat-app -- --ignored
+```
+
+It runs the whole app without showing a window, joins a room, and works the
+audio panel like a user would, checking what another participant and the
+sound devices get to hear. For that it adds three virtual sound devices to
+the system with `pactl` and removes them when it ends. It takes a minute, and
+neither plays on nor listens to a real device.

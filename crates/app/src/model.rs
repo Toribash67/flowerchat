@@ -26,7 +26,6 @@ pub struct RoomModel {
     pub peers: Vec<PeerRow>,
     /// Chat messages and room events, oldest first.
     pub timeline: Vec<Entry>,
-    pub audio: AudioSummary,
 }
 
 #[derive(Debug, Clone)]
@@ -93,17 +92,8 @@ pub enum EntryKind {
     },
 }
 
-/// The audio settings in effect, shown read-only.
-#[derive(Debug, Clone)]
-pub struct AudioSummary {
-    pub microphone: String,
-    pub speakers: String,
-    pub processing: bool,
-    pub receive_buffer_ms: u32,
-}
-
 impl RoomModel {
-    pub fn new(room: &str, server: &str, my_name: &str, audio: AudioSummary) -> Self {
+    pub fn new(room: &str, server: &str, my_name: &str) -> Self {
         Self {
             room: room.to_owned(),
             server: server.to_owned(),
@@ -117,7 +107,6 @@ impl RoomModel {
             },
             peers: Vec::new(),
             timeline: Vec::new(),
-            audio,
         }
     }
 
@@ -219,7 +208,8 @@ impl RoomModel {
         });
     }
 
-    fn log(&mut self, clock: &str, text: String) {
+    /// Records something that happened in the room.
+    pub fn log(&mut self, clock: &str, text: String) {
         self.timeline.push(Entry {
             time: clock.to_owned(),
             kind: EntryKind::Event(text),
@@ -232,7 +222,7 @@ impl RoomModel {
 }
 
 /// Maps decibels to a meter position from 0 to 1.
-fn meter_level(db: f32) -> f32 {
+pub fn meter_level(db: f32) -> f32 {
     ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0)
 }
 
@@ -241,13 +231,7 @@ mod tests {
     use super::*;
 
     fn room() -> RoomModel {
-        let audio = AudioSummary {
-            microphone: "default".into(),
-            speakers: "default".into(),
-            processing: true,
-            receive_buffer_ms: 40,
-        };
-        let mut room = RoomModel::new("lounge", "example.org", "robin", audio);
+        let mut room = RoomModel::new("lounge", "example.org", "robin");
         let now = Instant::now();
         room.apply(
             Event::PeerJoined {
