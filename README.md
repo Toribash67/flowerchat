@@ -1,5 +1,3 @@
-HELLLOOOOO
-
 # flowerchat
 
 Peer-to-peer voice chat and screen sharing for a small group of friends.
