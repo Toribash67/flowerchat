@@ -464,11 +464,32 @@ impl DecoderKind {
         // side by side, and hand each out that much later.
         let settings = match self {
             DecoderKind::Libav => " thread-type=slice",
+            DecoderKind::Dav1d if dav1d_filters_are_a_setting() => {
+                " max-frame-delay=1 inloop-filters=deblock+cdef+restoration"
+            }
             DecoderKind::Dav1d => " max-frame-delay=1",
             _ => "",
         };
         format!("{parser} ! {} name=decoder{settings}", self.element(codec))
     }
+}
+
+/// Whether `dav1ddec` has to be told to apply the filters that AV1 passes
+/// every frame through before the next one builds on it.
+///
+/// Where it has a setting for them, none are applied unless asked for
+/// (gst-plugins-rs 0.15.4). Each frame then differs a little from what the
+/// sharer encoded, the next builds on that and differs more, and with no
+/// keyframe but those asked for nothing puts it right: the picture gets
+/// blocky, and within minutes it is covered in coloured noise. A version
+/// without the setting applies them all.
+fn dav1d_filters_are_a_setting() -> bool {
+    static SETTING: OnceLock<bool> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        gst::ElementFactory::make("dav1ddec")
+            .build()
+            .is_ok_and(|decoder| decoder.has_property("inloop-filters"))
+    })
 }
 
 /// What the person sharing chooses about the stream.
@@ -1728,6 +1749,8 @@ impl Drop for Decoder {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[test]
@@ -1995,6 +2018,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// How alike two pictures of the same size are, in decibels: 30 is a
+    /// picture that looks right, 20 one that plainly does not.
+    fn likeness(one: &[u8], other: &[u8]) -> f64 {
+        assert_eq!(one.len(), other.len());
+        let squares: f64 = one
+            .iter()
+            .zip(other)
+            .map(|(a, b)| f64::from(i32::from(*a) - i32::from(*b)).powi(2))
+            .sum();
+        10.0 * (255.0 * 255.0 * one.len() as f64 / squares.max(1.0)).log10()
+    }
+
+    /// Everything that arrives at `sink`, by its time, once the pipeline
+    /// has come to its end.
+    fn collected(pipeline: &gst::Pipeline, sink: &str) -> BTreeMap<gst::ClockTime, gst::Buffer> {
+        let sink = pipeline
+            .by_name(sink)
+            .and_then(|sink| sink.downcast::<gst_app::AppSink>().ok())
+            .unwrap();
+        let mut buffers = BTreeMap::new();
+        while let Ok(sample) = sink.pull_sample() {
+            let buffer = sample.buffer_owned().unwrap();
+            buffers.insert(buffer.pts().unwrap(), buffer);
+        }
+        let failed = pipeline
+            .bus()
+            .and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error]));
+        if let Some(gst::MessageView::Error(err)) = failed.as_ref().map(|message| message.view()) {
+            panic!("{}: {:?}", err.error(), err.debug());
+        }
+        buffers
+    }
+
+    /// What dav1d makes of a stream stays what was encoded, however long
+    /// ago the last keyframe was: the sharer sends one only when asked, so
+    /// a picture that strays a little with every frame never comes back.
+    #[test]
+    fn dav1d_shows_the_last_frame_as_well_as_the_first() {
+        gst::init().unwrap();
+        // Any encoder will do that sends one frame at a time and no
+        // keyframe after the first. The call's own may be missing here.
+        let encoder = [
+            (
+                "svtav1enc",
+                "svtav1enc preset=12 crf=50 intra-period-length=-1 parameters-string=pred-struct=1",
+            ),
+            (
+                "av1enc",
+                "av1enc usage-profile=realtime cpu-used=10 lag-in-frames=0 keyframe-mode=disabled \n                 end-usage=q cq-level=50",
+            ),
+        ]
+        .into_iter()
+        .find(|(element, _)| element_exists(element));
+        let (Some((_, encoder)), true) = (encoder, element_exists("dav1ddec")) else {
+            eprintln!("nothing here to encode AV1 with, or no dav1d");
+            return;
+        };
+        let _alone = PROCESSOR
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        const RAW: &str = "video/x-raw,format=I420,width=640,height=360,framerate=30/1";
+        const ALL: &str = "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0";
+        let caps = Codec::Av1.caps();
+        // Ten seconds of a picture that moves, all of it and in fine detail.
+        let encoding = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=300 pattern=zone-plate kx2=20 ky2=20 kt=1 ! {RAW} ! tee name=raw \
+             raw. ! {ALL} ! appsink name=source sync=false \
+             raw. ! {ALL} ! {encoder} ! av1parse ! {caps} ! appsink name=stream sync=false"
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        encoding.set_state(gst::State::Playing).unwrap();
+        let stream = collected(&encoding, "stream");
+        let source = collected(&encoding, "source");
+        encoding.set_state(gst::State::Null).unwrap();
+        assert_eq!((source.len(), stream.len()), (300, 300));
+        let keyframes = stream
+            .values()
+            .filter(|frame| !frame.flags().contains(gst::BufferFlags::DELTA_UNIT))
+            .count();
+        assert_eq!(keyframes, 1, "the test wants a stream with one keyframe");
+
+        let decoding = gst::parse::launch(&format!(
+            "appsrc name=in format=time caps={caps} ! {} \
+             ! videoconvert ! video/x-raw,format=I420 ! appsink name=out sync=false",
+            DecoderKind::Dav1d.description(Codec::Av1)
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let input = decoding
+            .by_name("in")
+            .and_then(|input| input.downcast::<gst_app::AppSrc>().ok())
+            .unwrap();
+        decoding.set_state(gst::State::Playing).unwrap();
+        for frame in stream.values() {
+            input.push_buffer(frame.clone()).unwrap();
+        }
+        input.end_of_stream().unwrap();
+        let shown = collected(&decoding, "out");
+        decoding.set_state(gst::State::Null).unwrap();
+        assert!(shown.len() >= 295, "{} frames shown", shown.len());
+
+        let likeness: Vec<f64> = shown
+            .iter()
+            .map(|(time, frame)| {
+                likeness(
+                    &frame.map_readable().unwrap(),
+                    &source[time].map_readable().unwrap(),
+                )
+            })
+            .collect();
+        let mean = |frames: &[f64]| frames.iter().sum::<f64>() / frames.len() as f64;
+        // The second second, when the encoder has settled, and the last.
+        let (early, late) = (
+            mean(&likeness[30..60]),
+            mean(&likeness[likeness.len() - 30..]),
+        );
+        eprintln!("dav1d: {early:.1} dB after one second, {late:.1} dB after ten");
+        assert!(late > early - 1.5, "{early:.1} dB became {late:.1} dB");
     }
 
     /// Without a graphics card that encodes or decodes, the processor
