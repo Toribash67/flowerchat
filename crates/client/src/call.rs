@@ -1086,6 +1086,17 @@ impl Call {
             lose_incoming_packets(&webrtc, self.incoming_loss);
         }
         self.pipeline.add(&webrtc)?;
+        // Data channels can only be created once the element has left NULL.
+        webrtc.set_state(gst::State::Ready)?;
+        self.open_control_channel(&peer)?;
+        webrtc.sync_state_with_parent()?;
+
+        // Only now is the connection given anything to send. The microphone
+        // is running already, and a connection that is handed a packet
+        // before it has been started turns it away, after which the branch
+        // that brought it sends nothing more: the peer never hears us. A
+        // packet comes every 10 ms, so that happened now and then, and
+        // more often on a busy machine.
         if we_offer {
             // As the offerer we pick the payload types. As the answerer we
             // have to wait for the offer to learn them.
@@ -1096,11 +1107,6 @@ impl Call {
             }
             self.attach_sound_send_branch(&peer, STREAM_SOUND_PAYLOAD_TYPE)?;
         }
-
-        // Data channels can only be created once the element has left NULL.
-        webrtc.set_state(gst::State::Ready)?;
-        self.open_control_channel(&peer)?;
-        webrtc.sync_state_with_parent()?;
 
         self.peers.lock().unwrap().insert(id, peer.clone());
         if we_offer {
