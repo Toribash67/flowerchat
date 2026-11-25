@@ -2,6 +2,7 @@
 //! that draw one with the other.
 
 pub mod model;
+pub mod palettes;
 pub mod screen;
 pub mod settings;
 pub mod talk;

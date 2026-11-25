@@ -1,8 +1,12 @@
-//! What the user has chosen on the audio panel, as it is saved between runs.
+//! What the user has chosen on the audio panel and of the colours, as it is
+//! saved between runs.
 
 use flowerchat_client::audio::{AudioDevice, AudioDevices, AudioSettings};
 use flowerchat_client::session::{Codec, ShareSettings};
 use serde::{Deserialize, Serialize};
+
+use crate::palettes;
+use crate::theme::Palette;
 
 /// The top of the receive buffer slider.
 pub const MAX_RECEIVE_BUFFER_MS: u32 = 120;
@@ -33,6 +37,8 @@ pub struct Settings {
     /// The bitrate to share a screen at, in kbit/s, or whatever suits the
     /// size and frame rate of the picture.
     pub share_kbps: Option<u32>,
+    /// The palette the interface is drawn in, by the name it is saved as.
+    pub palette: String,
 }
 
 /// A device the user picked. The label is kept so that the device can still
@@ -79,6 +85,7 @@ impl Default for Settings {
             share_sound: share.sound,
             share_codec: share.codec.id().into(),
             share_kbps: share.kbps,
+            palette: palettes::default().id.into(),
         }
     }
 }
@@ -112,6 +119,12 @@ impl Settings {
     /// as a later version might have saved, gives way to the default.
     pub fn share_codec(&self) -> Codec {
         Codec::from_id(&self.share_codec).unwrap_or_default()
+    }
+
+    /// The palette chosen. A name that means nothing, as a later version
+    /// might have saved, gives way to the default.
+    pub fn palette(&self) -> &'static Palette {
+        palettes::by_id(&self.palette).unwrap_or_else(palettes::default)
     }
 
     pub fn talk_key(&self) -> Option<egui::Key> {
@@ -180,6 +193,21 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(unknown.share().codec, Codec::H264);
+    }
+
+    #[test]
+    fn the_palette_survives_being_saved_by_name() {
+        let settings = Settings {
+            palette: "gruvbox-darker".into(),
+            ..Settings::default()
+        };
+        assert_eq!(settings.palette().name, "Gruvbox Darker");
+        let unknown = Settings {
+            palette: "beige".into(),
+            ..Settings::default()
+        };
+        assert_eq!(unknown.palette(), palettes::default());
+        assert_eq!(Settings::default().palette(), palettes::default());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Every colour, size and font the interface uses, in one place.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use egui::epaint::text::{FontTweak, VariationCoords};
@@ -8,28 +9,67 @@ use egui::{
     TextStyle, Vec2,
 };
 
-pub const BACKGROUND: Color32 = Color32::from_rgb(0x15, 0x17, 0x1B);
-/// Behind a shared screen.
-pub const STAGE: Color32 = Color32::from_rgb(0x0B, 0x0C, 0x0E);
-/// Side columns and bars.
-pub const PANEL: Color32 = Color32::from_rgb(0x1A, 0x1C, 0x21);
-/// Text fields.
-pub const FIELD: Color32 = Color32::from_rgb(0x1D, 0x20, 0x25);
-/// Buttons.
-pub const CONTROL: Color32 = Color32::from_rgb(0x23, 0x27, 0x2E);
-pub const CONTROL_HOVER: Color32 = Color32::from_rgb(0x2C, 0x30, 0x38);
-pub const BORDER: Color32 = Color32::from_rgb(0x30, 0x35, 0x3E);
-/// Lines between table rows.
-pub const HAIRLINE: Color32 = Color32::from_rgb(0x23, 0x27, 0x2E);
-pub const TEXT: Color32 = Color32::from_rgb(0xE8, 0xEA, 0xED);
-pub const MUTED: Color32 = Color32::from_rgb(0xA3, 0xAA, 0xB5);
-/// Outline of an indicator for someone who is not speaking.
-pub const IDLE: Color32 = Color32::from_rgb(0x6B, 0x72, 0x80);
-pub const ACCENT: Color32 = Color32::from_rgb(0x4C, 0xC3, 0x8A);
-pub const ON_ACCENT: Color32 = Color32::from_rgb(0x0E, 0x15, 0x12);
-/// Muted, deafened and other states the user should not overlook.
-pub const WARN: Color32 = Color32::from_rgb(0xF2, 0x99, 0x4A);
-pub const ON_WARN: Color32 = Color32::from_rgb(0x1A, 0x12, 0x06);
+use crate::palettes;
+
+/// The colours of the interface, by what they are used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Colors {
+    pub background: Color32,
+    /// Behind a shared screen.
+    pub stage: Color32,
+    /// Side columns and bars.
+    pub panel: Color32,
+    /// Text fields.
+    pub field: Color32,
+    /// Buttons.
+    pub control: Color32,
+    pub control_hover: Color32,
+    pub border: Color32,
+    /// Lines between table rows.
+    pub hairline: Color32,
+    pub text: Color32,
+    pub muted: Color32,
+    /// Outline of an indicator for someone who is not speaking.
+    pub idle: Color32,
+    pub accent: Color32,
+    pub on_accent: Color32,
+    /// Muted, deafened and other states the user should not overlook.
+    pub warn: Color32,
+    pub on_warn: Color32,
+}
+
+/// A set of colours the user can pick: see [`crate::palettes`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct Palette {
+    /// What it is saved as.
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Whether it is dark text on a light background.
+    pub light: bool,
+    pub colors: Colors,
+}
+
+thread_local! {
+    // The window is drawn on one thread, and so is each test's. Kept per
+    // thread, a test that draws in other colours leaves the others alone.
+    static CURRENT: Cell<&'static Palette> = Cell::new(palettes::default());
+}
+
+/// The palette the interface is drawn in.
+pub fn palette() -> &'static Palette {
+    CURRENT.get()
+}
+
+/// Its colours.
+pub fn colors() -> &'static Colors {
+    &palette().colors
+}
+
+/// Changes the palette, for whatever this thread draws from now on.
+/// [`install`] carries it over to the widgets.
+pub fn set_palette(palette: &'static Palette) {
+    CURRENT.set(palette);
+}
 
 pub const BODY: f32 = 13.0;
 pub const SMALL: f32 = 12.0;
@@ -58,33 +98,48 @@ pub fn semibold() -> FontFamily {
 
 /// Body text in the heavier weight.
 pub fn strong(text: impl Into<String>) -> RichText {
-    RichText::new(text).family(semibold_family()).color(TEXT)
+    RichText::new(text)
+        .family(semibold_family())
+        .color(colors().text)
 }
 
 pub fn muted(text: impl Into<String>) -> RichText {
-    RichText::new(text).size(SMALL).color(MUTED)
+    RichText::new(text).size(SMALL).color(colors().muted)
 }
 
 pub fn title(text: impl Into<String>) -> RichText {
     RichText::new(text)
         .family(semibold_family())
         .size(TITLE)
-        .color(TEXT)
+        .color(colors().text)
 }
 
-/// Applies fonts, colours and spacing. Safe to call every frame; it only
-/// does the work once per context.
+/// Applies fonts, colours and spacing. Safe to call every frame: the fonts
+/// are only set up once per context, and the rest again whenever the
+/// palette has changed.
 ///
-/// Returns `true` when it has just done so. New fonts only become usable on
-/// the following frame, so a caller that gets `true` in the middle of a
-/// frame must not draw text with them until the next one.
+/// Returns `true` when it has just set up the fonts. New fonts only become
+/// usable on the following frame, so a caller that gets `true` in the middle
+/// of a frame must not draw text with them until the next one.
 pub fn install(ctx: &egui::Context) -> bool {
     let installed = egui::Id::new("flowerchat-theme-installed");
-    if ctx.data(|data| data.get_temp::<bool>(installed).unwrap_or(false)) {
-        return false;
+    let first = !ctx.data(|data| data.get_temp::<bool>(installed).unwrap_or(false));
+    if first {
+        ctx.data_mut(|data| data.insert_temp(installed, true));
+        install_fonts(ctx);
     }
-    ctx.data_mut(|data| data.insert_temp(installed, true));
+    let painted = egui::Id::new("flowerchat-theme-palette");
+    let palette = palette();
+    if ctx.data(|data| data.get_temp::<&'static str>(painted)) != Some(palette.id) {
+        ctx.data_mut(|data| data.insert_temp(painted, palette.id));
+        install_style(ctx, palette);
+        // What is being drawn right now began in the old colours.
+        ctx.request_repaint();
+    }
+    first
+}
 
+fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     fonts
         .font_data
@@ -108,7 +163,10 @@ pub fn install(ctx: &egui::Context) -> bool {
         vec!["inter-semibold".into(), "phosphor".into()],
     );
     ctx.set_fonts(fonts);
+}
 
+fn install_style(ctx: &egui::Context, palette: &Palette) {
+    let colors = palette.colors;
     ctx.all_styles_mut(|style| {
         style.text_styles = [
             (TextStyle::Body, FontId::proportional(BODY)),
@@ -124,39 +182,42 @@ pub fn install(ctx: &egui::Context) -> bool {
         style.spacing.slider_rail_height = 4.0;
 
         let visuals = &mut style.visuals;
-        *visuals = egui::Visuals::dark();
-        visuals.panel_fill = BACKGROUND;
-        visuals.window_fill = PANEL;
-        visuals.extreme_bg_color = FIELD;
-        visuals.faint_bg_color = HAIRLINE;
-        visuals.override_text_color = Some(TEXT);
-        visuals.weak_text_color = Some(MUTED);
-        visuals.hyperlink_color = TEXT;
-        visuals.selection.bg_fill = ACCENT;
-        visuals.selection.stroke = Stroke::new(1.0, ON_ACCENT);
+        *visuals = if palette.light {
+            egui::Visuals::light()
+        } else {
+            egui::Visuals::dark()
+        };
+        visuals.panel_fill = colors.background;
+        visuals.window_fill = colors.panel;
+        visuals.extreme_bg_color = colors.field;
+        visuals.faint_bg_color = colors.hairline;
+        visuals.override_text_color = Some(colors.text);
+        visuals.weak_text_color = Some(colors.muted);
+        visuals.hyperlink_color = colors.text;
+        visuals.selection.bg_fill = colors.accent;
+        visuals.selection.stroke = Stroke::new(1.0, colors.on_accent);
         visuals.slider_trailing_fill = true;
         visuals.handle_shape = egui::style::HandleShape::Circle;
 
         let radius = CornerRadius::same(RADIUS);
-        let border = Stroke::new(1.0, BORDER);
+        let border = Stroke::new(1.0, colors.border);
         let widgets = &mut visuals.widgets;
-        widgets.noninteractive.bg_fill = BACKGROUND;
+        widgets.noninteractive.bg_fill = colors.background;
         widgets.noninteractive.bg_stroke = border;
-        widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+        widgets.noninteractive.fg_stroke = Stroke::new(1.0, colors.text);
         widgets.noninteractive.corner_radius = radius;
         for (state, fill) in [
-            (&mut widgets.inactive, CONTROL),
-            (&mut widgets.hovered, CONTROL_HOVER),
-            (&mut widgets.active, CONTROL_HOVER),
-            (&mut widgets.open, CONTROL_HOVER),
+            (&mut widgets.inactive, colors.control),
+            (&mut widgets.hovered, colors.control_hover),
+            (&mut widgets.active, colors.control_hover),
+            (&mut widgets.open, colors.control_hover),
         ] {
             state.bg_fill = fill;
             state.weak_bg_fill = fill;
             state.bg_stroke = border;
-            state.fg_stroke = Stroke::new(1.0, TEXT);
+            state.fg_stroke = Stroke::new(1.0, colors.text);
             state.corner_radius = radius;
             state.expansion = 0.0;
         }
     });
-    true
 }

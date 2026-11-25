@@ -504,7 +504,7 @@ impl App {
         let id = egui::ViewportId::from_hash_of("shared-screen");
         let closed = ctx.show_viewport_immediate(id, viewport, |ui, _| {
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(theme::STAGE))
+                .frame(egui::Frame::new().fill(theme::colors().stage))
                 .show(ui, |ui| {
                     if let Some(picture) = picture {
                         let height = views::draw_picture(ui, ui.max_rect(), picture);

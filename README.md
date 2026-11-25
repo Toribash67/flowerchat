@@ -72,6 +72,14 @@ A device that was chosen and is then unplugged gives way to the system
 default, and is used again when it comes back. The name, room, server and
 audio settings are remembered between runs.
 
+The palette button beside the app's name, or in the bar at the top of a
+narrow window, changes the colours of the interface: flowerchat's own, the
+Gruvbox, One Half, Monokai and Catppuccin families, and a dozen more. A
+click on one applies it at once and leaves the list open, so that they can
+be tried one after the other. The choice is remembered too. A new palette
+is one more entry in `crates/app/src/palettes.rs`, where a test holds every
+palette to text that can be read on what it is written on.
+
 `--name`, `--room` and `--server` prefill the form and `--autojoin` skips it.
 `--input`, `--output`, `--jitter-ms` and `--raw-mic` set the corresponding
 audio settings, as in the command-line client below.

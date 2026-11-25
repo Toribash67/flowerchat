@@ -9,8 +9,8 @@ use std::time::Duration;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align, Align2, Button, CentralPanel, ComboBox, CornerRadius, FontId, Frame, Layout, Margin,
-    Panel, Rect, RichText, ScrollArea, Sense, Slider, Stroke, StrokeKind, TextEdit, Ui, Vec2,
-    WidgetInfo, WidgetType,
+    Panel, Popup, PopupCloseBehavior, Rect, RichText, ScrollArea, Sense, Slider, Stroke,
+    StrokeKind, TextEdit, Ui, Vec2, WidgetInfo, WidgetType,
 };
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
@@ -19,10 +19,11 @@ use flowerchat_client::session::{Codec, ConnectionState, Route};
 use flowerchat_protocol::PeerId;
 
 use crate::model::{Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
+use crate::palettes;
 use crate::screen::{Choice, Choices, Picked};
 use crate::settings::{DeviceChoice, MAX_RECEIVE_BUFFER_MS, SendMode, Settings};
 use crate::talk::GlobalKey;
-use crate::theme::{self, muted, strong};
+use crate::theme::{self, Palette, muted, strong};
 
 const SIDE_WIDTH: f32 = 232.0;
 /// The left column while a screen is open: it holds the list of people too.
@@ -35,8 +36,10 @@ const BIG_BUTTON_HEIGHT: f32 = 30.0;
 const ICON_SIZE: f32 = 16.0;
 /// Width of the panel that asks what to share, where the window has room.
 const PICKER_WIDTH: f32 = 480.0;
-/// Height of a row in it.
+/// Height of a row in it, and in the list of palettes.
 const CHOICE_HEIGHT: f32 = 28.0;
+/// Width of the list of palettes.
+const PALETTES_WIDTH: f32 = 230.0;
 
 pub enum Screen<'a> {
     /// Not in a room. `connecting` is set while a join is under way, and
@@ -168,6 +171,7 @@ pub fn talk_key_down(ctx: &egui::Context, state: &UiState) -> bool {
 
 pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState) -> Vec<Action> {
     let mut actions = Vec::new();
+    theme::set_palette(state.settings.palette());
     if theme::install(ui.ctx()) {
         // The fonts are not usable until the next frame.
         ui.ctx().request_repaint();
@@ -181,7 +185,7 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState)
             mic_level,
         } if wide => {
             side_panel("lobby").show(ui, |ui| {
-                app_name(ui);
+                app_name(ui, &mut state.settings);
                 join_form(ui, connecting, error, state, &mut actions);
             });
             Panel::right("lobby-audio")
@@ -189,7 +193,7 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState)
                 .resizable(false)
                 .frame(
                     Frame::new()
-                        .fill(theme::PANEL)
+                        .fill(theme::colors().panel)
                         .inner_margin(Margin::symmetric(16, 14)),
                 )
                 .show(ui, |ui| {
@@ -213,10 +217,14 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState)
             connecting, error, ..
         } => {
             CentralPanel::default()
-                .frame(Frame::new().fill(theme::BACKGROUND).inner_margin(20))
+                .frame(
+                    Frame::new()
+                        .fill(theme::colors().background)
+                        .inner_margin(20),
+                )
                 .show(ui, |ui| {
                     ui.set_max_width(320.0);
-                    app_name(ui);
+                    app_name(ui, &mut state.settings);
                     join_form(ui, connecting, error, state, &mut actions);
                 });
         }
@@ -278,7 +286,8 @@ fn join_form(
             .iter()
             .all(|value| !value.trim().is_empty());
         let label = if connecting { "Joining…" } else { "Join" };
-        let join = Button::new(strong(label).color(theme::ON_ACCENT)).fill(theme::ACCENT);
+        let join = Button::new(strong(label).color(theme::colors().on_accent))
+            .fill(theme::colors().accent);
         let size = Vec2::new(ui.available_width(), BIG_BUTTON_HEIGHT);
         let clicked = ui
             .add_enabled(ready, |ui: &mut Ui| ui.add_sized(size, join))
@@ -290,7 +299,11 @@ fn join_form(
 
     if let Some(error) = error {
         ui.add_space(8.0);
-        ui.label(RichText::new(error).size(theme::SMALL).color(theme::WARN));
+        ui.label(
+            RichText::new(error)
+                .size(theme::SMALL)
+                .color(theme::colors().warn),
+        );
     }
 }
 
@@ -316,7 +329,7 @@ fn room_wide(
                 me_block(ui, room, mode, screen, actions);
             });
         CentralPanel::no_frame().show(ui, |ui| {
-            app_name(ui);
+            app_name(ui, &mut state.settings);
             ui.add_space(10.0);
             ui.label(theme::title(&room.room));
             ui.add_space(4.0);
@@ -336,7 +349,7 @@ fn room_wide(
         .resizable(false)
         .frame(
             Frame::new()
-                .fill(theme::PANEL)
+                .fill(theme::colors().panel)
                 .inner_margin(Margin::symmetric(14, 12)),
         )
         .show(ui, |ui| chat(ui, room, state, actions, true));
@@ -344,7 +357,7 @@ fn room_wide(
     CentralPanel::default()
         .frame(
             Frame::new()
-                .fill(theme::BACKGROUND)
+                .fill(theme::colors().background)
                 .inner_margin(Margin::symmetric(16, 12)),
         )
         .show(ui, |ui| {
@@ -370,7 +383,11 @@ fn people_table(ui: &mut Ui, room: &RoomModel, actions: &mut Vec<Action>) {
     let numeric = |ui: &mut Ui, text: RichText| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(text));
     };
-    let heading = |text: &str| RichText::new(text).size(theme::TINY).color(theme::MUTED);
+    let heading = |text: &str| {
+        RichText::new(text)
+            .size(theme::TINY)
+            .color(theme::colors().muted)
+    };
 
     TableBuilder::new(ui)
         .cell_layout(Layout::left_to_right(Align::Center))
@@ -447,7 +464,11 @@ fn room_narrow(
     state: &mut UiState,
     actions: &mut Vec<Action>,
 ) {
-    let bar = |margin: Margin| Frame::new().fill(theme::PANEL).inner_margin(margin);
+    let bar = |margin: Margin| {
+        Frame::new()
+            .fill(theme::colors().panel)
+            .inner_margin(margin)
+    };
     let mode = mode_text(env, state);
 
     Panel::top("header")
@@ -466,6 +487,7 @@ fn room_narrow(
                     if ui.add(tab_button("Audio", audio)).clicked() {
                         state.tab = if audio { Tab::People } else { Tab::Audio };
                     }
+                    palette_picker(ui, &mut state.settings);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         ui.label(strong(&room.room).size(15.0));
                         let status = format!(
@@ -507,7 +529,7 @@ fn room_narrow(
     CentralPanel::default()
         .frame(
             Frame::new()
-                .fill(theme::BACKGROUND)
+                .fill(theme::colors().background)
                 .inner_margin(Margin::symmetric(12, 8)),
         )
         .show(ui, |ui| match state.tab {
@@ -541,7 +563,9 @@ fn people_rows(ui: &mut Ui, room: &RoomModel, slider_width: f32, actions: &mut V
                     ui.spacing_mut().item_spacing.x = 5.0;
                     ui.label(peer_name(peer));
                     if peer.sharing.is_some() {
-                        let tag = |text: &str| strong(text).size(theme::TINY).color(theme::ACCENT);
+                        let tag = |text: &str| {
+                            strong(text).size(theme::TINY).color(theme::colors().accent)
+                        };
                         if watched == Some(peer.id) {
                             ui.label(tag("· sharing"));
                         } else {
@@ -580,7 +604,7 @@ fn room_stream(
         .resizable(false)
         .frame(
             Frame::new()
-                .fill(theme::PANEL)
+                .fill(theme::colors().panel)
                 .inner_margin(Margin::symmetric(14, 12)),
         )
         .show(ui, |ui| {
@@ -600,6 +624,7 @@ fn room_stream(
                         if ui.button("Leave").clicked() {
                             actions.push(Action::Leave);
                         }
+                        palette_picker(ui, &mut state.settings);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.label(strong(&room.room).size(15.0));
@@ -624,7 +649,7 @@ fn room_stream(
         .resizable(false)
         .frame(
             Frame::new()
-                .fill(theme::PANEL)
+                .fill(theme::colors().panel)
                 .inner_margin(Margin::symmetric(14, 10)),
         )
         .show(ui, |ui| {
@@ -661,7 +686,7 @@ fn room_stream(
     let name = sharer_name(room, watching);
     let figures = StreamFigures::of(room, watching, state);
     CentralPanel::default()
-        .frame(Frame::new().fill(theme::BACKGROUND))
+        .frame(Frame::new().fill(theme::colors().background))
         .show(ui, |ui| {
             Panel::top("stage-header")
                 .exact_size(BAR_HEIGHT)
@@ -674,10 +699,10 @@ fn room_stream(
                             let maximize = Button::new(icon_label(
                                 icon::CORNERS_OUT,
                                 "Maximize",
-                                theme::ON_ACCENT,
+                                theme::colors().on_accent,
                                 true,
                             ))
-                            .fill(theme::ACCENT);
+                            .fill(theme::colors().accent);
                             if ui.add(maximize).clicked() {
                                 state.maximized = true;
                             }
@@ -743,7 +768,7 @@ fn room_maximized(
 ) {
     let bar = || {
         Frame::new()
-            .fill(theme::BACKGROUND)
+            .fill(theme::colors().background)
             .inner_margin(Margin::symmetric(12, 0))
     };
     let name = sharer_name(room, watching);
@@ -757,8 +782,12 @@ fn room_maximized(
             row(ui, BAR_HEIGHT, |ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
-                    let restore =
-                        Button::new(icon_label(icon::CORNERS_IN, "Restore", theme::TEXT, false));
+                    let restore = Button::new(icon_label(
+                        icon::CORNERS_IN,
+                        "Restore",
+                        theme::colors().text,
+                        false,
+                    ));
                     if ui.add(restore).clicked() {
                         state.maximized = false;
                     }
@@ -827,11 +856,11 @@ fn room_maximized(
                         for peer in room.peers.iter().filter(|peer| peer.connected()) {
                             indicator(ui, peer);
                             let color = if peer.muted {
-                                theme::WARN
+                                theme::colors().warn
                             } else if peer.speaking {
-                                theme::TEXT
+                                theme::colors().text
                             } else {
-                                theme::MUTED
+                                theme::colors().muted
                             };
                             ui.label(RichText::new(&peer.name).color(color));
                             ui.add_space(10.0);
@@ -847,14 +876,14 @@ fn room_maximized(
             .resizable(false)
             .frame(
                 Frame::new()
-                    .fill(theme::PANEL)
+                    .fill(theme::colors().panel)
                     .inner_margin(Margin::symmetric(14, 12)),
             )
             .show(ui, |ui| chat(ui, room, state, actions, true));
     }
 
     CentralPanel::default()
-        .frame(Frame::new().fill(theme::STAGE))
+        .frame(Frame::new().fill(theme::colors().stage))
         .show(ui, |ui| stage(ui, &name, env.picture, state));
 }
 
@@ -960,7 +989,7 @@ fn pop_out_button(ui: &mut Ui, state: &mut UiState) {
 fn stage(ui: &mut Ui, name: &str, picture: Option<Picture>, state: &mut UiState) {
     let (rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
     ui.painter()
-        .rect_filled(rect, CornerRadius::ZERO, theme::STAGE);
+        .rect_filled(rect, CornerRadius::ZERO, theme::colors().stage);
     let note = match picture {
         _ if state.popped_out => format!("{name}'s screen is in its own window"),
         Some(picture) => {
@@ -980,7 +1009,7 @@ fn stage(ui: &mut Ui, name: &str, picture: Option<Picture>, state: &mut UiState)
         Align2::CENTER_CENTER,
         note,
         FontId::proportional(theme::BODY),
-        theme::MUTED,
+        theme::colors().muted,
     );
 }
 
@@ -1021,7 +1050,7 @@ fn stream_sound(
         ui.label(
             strong("Stream sound")
                 .size(theme::SMALL)
-                .color(theme::MUTED),
+                .color(theme::colors().muted),
         );
         ui.add_space(4.0);
         let Some(peer) = room.peer(watching.id) else {
@@ -1064,7 +1093,11 @@ fn stream_volume_rtl(ui: &mut Ui, peer: &PeerRow, width: f32, actions: &mut Vec<
 fn figure_group(ui: &mut Ui, heading: &str, figures: &[(&str, &str)]) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(8.0, 2.0);
-        ui.label(strong(heading).size(theme::SMALL).color(theme::MUTED));
+        ui.label(
+            strong(heading)
+                .size(theme::SMALL)
+                .color(theme::colors().muted),
+        );
         ui.add_space(4.0);
         for (key, value) in figures {
             kv(ui, key, *value);
@@ -1075,9 +1108,10 @@ fn figure_group(ui: &mut Ui, heading: &str, figures: &[(&str, &str)]) {
 /// A button for one of several views, lit while its view is the one shown.
 fn tab_button<'a>(label: &str, selected: bool) -> Button<'a> {
     if selected {
-        Button::new(strong(label)).fill(theme::CONTROL_HOVER)
+        Button::new(strong(label)).fill(theme::colors().control_hover)
     } else {
-        Button::new(RichText::new(label).color(theme::MUTED)).fill(egui::Color32::TRANSPARENT)
+        Button::new(RichText::new(label).color(theme::colors().muted))
+            .fill(egui::Color32::TRANSPARENT)
     }
 }
 
@@ -1281,9 +1315,9 @@ fn send_voice(ui: &mut Ui, env: &Env<'_>, state: &mut UiState) {
                 }
                 let key = state.settings.talk_key();
                 let (text, color) = match key {
-                    _ if state.capturing_key => ("Press a key…", theme::TEXT),
-                    Some(key) => (key.name(), theme::TEXT),
-                    None => ("No key set", theme::MUTED),
+                    _ if state.capturing_key => ("Press a key…", theme::colors().text),
+                    Some(key) => (key.name(), theme::colors().text),
+                    None => ("No key set", theme::colors().muted),
                 };
                 readout(ui, text, color);
             });
@@ -1366,7 +1400,7 @@ fn option(ui: &mut Ui, on: bool, mark: Mark, label: &str) -> egui::Response {
     let text = ui.painter().layout_no_wrap(
         label.to_owned(),
         FontId::proportional(theme::BODY),
-        theme::TEXT,
+        theme::colors().text,
     );
     let size = Vec2::new(OPTION_MARK + OPTION_GAP + text.size().x, 20.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -1380,9 +1414,9 @@ fn option(ui: &mut Ui, on: bool, mark: Mark, label: &str) -> egui::Response {
 
     let center = egui::pos2(rect.left() + OPTION_MARK / 2.0, rect.center().y);
     let outline = if response.hovered() || response.has_focus() {
-        theme::MUTED
+        theme::colors().muted
     } else {
-        theme::IDLE
+        theme::colors().idle
     };
     let painter = ui.painter();
     match mark {
@@ -1390,24 +1424,35 @@ fn option(ui: &mut Ui, on: bool, mark: Mark, label: &str) -> egui::Response {
             let square = Rect::from_center_size(center, Vec2::splat(OPTION_MARK));
             let radius = CornerRadius::same(3);
             if on {
-                painter.rect_filled(square, radius, theme::ACCENT);
+                painter.rect_filled(square, radius, theme::colors().accent);
                 let at = |x: f32, y: f32| square.left_top() + Vec2::new(x, y);
                 painter.line(
                     vec![at(3.5, 7.5), at(6.0, 10.0), at(10.5, 4.5)],
-                    Stroke::new(1.8, theme::ON_ACCENT),
+                    Stroke::new(1.8, theme::colors().on_accent),
                 );
             } else {
                 let stroke = Stroke::new(1.5, outline);
-                painter.rect(square, radius, theme::FIELD, stroke, StrokeKind::Inside);
+                painter.rect(
+                    square,
+                    radius,
+                    theme::colors().field,
+                    stroke,
+                    StrokeKind::Inside,
+                );
             }
         }
         Mark::Dot => {
             let radius = OPTION_MARK / 2.0 - 0.75;
             if on {
-                painter.circle_stroke(center, radius, Stroke::new(1.5, theme::ACCENT));
-                painter.circle_filled(center, 3.5, theme::ACCENT);
+                painter.circle_stroke(center, radius, Stroke::new(1.5, theme::colors().accent));
+                painter.circle_filled(center, 3.5, theme::colors().accent);
             } else {
-                painter.circle(center, radius, theme::FIELD, Stroke::new(1.5, outline));
+                painter.circle(
+                    center,
+                    radius,
+                    theme::colors().field,
+                    Stroke::new(1.5, outline),
+                );
             }
         }
     }
@@ -1415,7 +1460,7 @@ fn option(ui: &mut Ui, on: bool, mark: Mark, label: &str) -> egui::Response {
         rect.left() + OPTION_MARK + OPTION_GAP,
         rect.center().y - text.size().y / 2.0,
     );
-    painter.galley(text_at, text, theme::TEXT);
+    painter.galley(text_at, text, theme::colors().text);
     response
 }
 
@@ -1427,8 +1472,8 @@ fn readout(ui: &mut Ui, text: &str, color: egui::Color32) {
     painter.rect(
         rect,
         CornerRadius::same(theme::RADIUS),
-        theme::FIELD,
-        Stroke::new(1.0, theme::BORDER),
+        theme::colors().field,
+        Stroke::new(1.0, theme::colors().border),
         StrokeKind::Inside,
     );
     painter.text(
@@ -1448,13 +1493,112 @@ fn side_panel(id: &'static str) -> Panel {
         .resizable(false)
         .frame(
             Frame::new()
-                .fill(theme::PANEL)
+                .fill(theme::colors().panel)
                 .inner_margin(Margin::symmetric(16, 14)),
         )
 }
 
-fn app_name(ui: &mut Ui) {
-    ui.label(strong("flowerchat").color(theme::MUTED));
+/// The name of the app, and beside it the button for its colours.
+fn app_name(ui: &mut Ui, settings: &mut Settings) {
+    row(ui, theme::CONTROL_HEIGHT, |ui| {
+        ui.label(strong("flowerchat").color(theme::colors().muted));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            palette_picker(ui, settings);
+        });
+    });
+}
+
+/// The button that opens the list of palettes, and the list. A click on a
+/// palette changes the colours at once and leaves the list open, so that
+/// one after the other can be tried.
+fn palette_picker(ui: &mut Ui, settings: &mut Settings) {
+    let colors = theme::colors();
+    let glyph = RichText::new(icon::PALETTE).size(ICON_SIZE);
+    let button = ui
+        .add(Button::new(glyph).min_size(Vec2::splat(theme::CONTROL_HEIGHT)))
+        .on_hover_text("Colours");
+    button.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Colours"));
+    let chosen = settings.palette();
+    // As many as fit in the window, and the rest by scrolling.
+    let room = ui.ctx().content_rect().height() - 2.0 * BAR_HEIGHT;
+    let height = room.clamp(3.0 * CHOICE_HEIGHT, 12.5 * CHOICE_HEIGHT);
+    let frame = Frame::new()
+        .fill(colors.panel)
+        .stroke(Stroke::new(1.0, colors.border))
+        .corner_radius(CornerRadius::same(theme::RADIUS))
+        .inner_margin(Margin::same(6));
+    Popup::menu(&button)
+        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+        .frame(frame)
+        .width(PALETTES_WIDTH)
+        .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                for palette in &palettes::ALL {
+                    if palette_row(ui, palette, palette == chosen).clicked() {
+                        settings.palette = palette.id.to_owned();
+                    }
+                }
+            });
+        });
+}
+
+/// One palette to choose: a taste of its colours, its name, and a mark on
+/// the one in use.
+fn palette_row(ui: &mut Ui, palette: &Palette, chosen: bool) -> egui::Response {
+    const PAD: f32 = 8.0;
+    const SWATCH: Vec2 = Vec2::new(38.0, 16.0);
+    let colors = theme::colors();
+    let size = Vec2::new(ui.available_width(), CHOICE_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, chosen, palette.name));
+    let painter = ui.painter();
+    if response.hovered() || response.has_focus() {
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(theme::RADIUS),
+            colors.control_hover,
+        );
+    }
+    // Its background, with its text, its accent and its warning on it.
+    let swatch = Rect::from_min_size(
+        egui::pos2(rect.left() + PAD, rect.center().y - SWATCH.y / 2.0),
+        SWATCH,
+    );
+    painter.rect(
+        swatch,
+        CornerRadius::same(theme::RADIUS),
+        palette.colors.background,
+        Stroke::new(1.0, colors.border),
+        StrokeKind::Inside,
+    );
+    let dots = [
+        palette.colors.text,
+        palette.colors.accent,
+        palette.colors.warn,
+    ];
+    for (place, color) in dots.into_iter().enumerate() {
+        let x = swatch.left() + SWATCH.x * (place as f32 + 1.0) / 4.0;
+        painter.circle_filled(egui::pos2(x, swatch.center().y), 3.0, color);
+    }
+    painter.text(
+        egui::pos2(swatch.right() + PAD, rect.center().y),
+        Align2::LEFT_CENTER,
+        palette.name,
+        FontId::proportional(theme::BODY),
+        colors.text,
+    );
+    if chosen {
+        painter.text(
+            rect.right_center() - Vec2::new(PAD, 0.0),
+            Align2::RIGHT_CENTER,
+            icon::CHECK,
+            FontId::proportional(ICON_SIZE),
+            colors.accent,
+        );
+    }
+    response
 }
 
 /// Your own status and controls: what you are sending, mute and deafen,
@@ -1470,11 +1614,11 @@ fn me_block(
     let me = &room.me;
     row(ui, 20.0, |ui| {
         ui.label(strong(&me.name));
-        ui.label(RichText::new("(you)").color(theme::MUTED));
+        ui.label(RichText::new("(you)").color(theme::colors().muted));
         if me.muted {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let text = format!("{} Muted", icon::MICROPHONE_SLASH);
-                ui.label(strong(text).size(theme::SMALL).color(theme::WARN));
+                ui.label(strong(text).size(theme::SMALL).color(theme::colors().warn));
             });
         }
     });
@@ -1670,8 +1814,8 @@ fn share_picker(ui: &mut Ui, choices: &Choices, actions: &mut Vec<Action>) {
     let fixed = 150.0 + CHOICE_HEIGHT * choices.screens.len() as f32;
     let room_for_windows = (window.height() - fixed).max(CHOICE_HEIGHT * 3.0);
     let frame = Frame::new()
-        .fill(theme::PANEL)
-        .stroke(Stroke::new(1.0, theme::BORDER))
+        .fill(theme::colors().panel)
+        .stroke(Stroke::new(1.0, theme::colors().border))
         .corner_radius(CornerRadius::same(theme::RADIUS))
         .inner_margin(Margin::symmetric(16, 14));
     let modal = egui::Modal::new(egui::Id::new("share-picker"))
@@ -1727,7 +1871,7 @@ fn choice_row(ui: &mut Ui, glyph: &str, choice: &Choice) -> egui::Response {
         painter.rect_filled(
             rect,
             CornerRadius::same(theme::RADIUS),
-            theme::CONTROL_HOVER,
+            theme::colors().control_hover,
         );
     }
     // A line of text cut short with "…" where it would pass `width`.
@@ -1742,14 +1886,19 @@ fn choice_row(ui: &mut Ui, glyph: &str, choice: &Choice) -> egui::Response {
         Align2::LEFT_CENTER,
         glyph,
         FontId::proportional(ICON_SIZE),
-        theme::MUTED,
+        theme::colors().muted,
     );
     let inner = rect.width() - 2.0 * PAD - ICON_SIZE - 8.0;
-    let detail = line(&choice.detail, theme::SMALL, theme::MUTED, inner * 0.4);
+    let detail = line(
+        &choice.detail,
+        theme::SMALL,
+        theme::colors().muted,
+        inner * 0.4,
+    );
     let title = line(
         &choice.title,
         theme::BODY,
-        theme::TEXT,
+        theme::colors().text,
         inner - detail.size().x - 12.0,
     );
     let title_at = egui::pos2(
@@ -1760,16 +1909,18 @@ fn choice_row(ui: &mut Ui, glyph: &str, choice: &Choice) -> egui::Response {
         rect.right() - PAD - detail.size().x,
         rect.center().y - detail.size().y / 2.0,
     );
-    painter.galley(title_at, title, theme::TEXT);
-    painter.galley(detail_at, detail, theme::MUTED);
+    painter.galley(title_at, title, theme::colors().text);
+    painter.galley(detail_at, detail, theme::colors().muted);
     response
 }
 
 /// The small button that opens someone's shared screen.
 fn watch_button(ui: &mut Ui, peer: &PeerRow) -> egui::Response {
-    let text = strong("Watch").size(theme::SMALL).color(theme::ON_ACCENT);
+    let text = strong("Watch")
+        .size(theme::SMALL)
+        .color(theme::colors().on_accent);
     let button = Button::new(text)
-        .fill(theme::ACCENT)
+        .fill(theme::colors().accent)
         .min_size(Vec2::new(0.0, 24.0));
     let response = ui.add(button);
     response.widget_info(|| {
@@ -1782,9 +1933,10 @@ fn watch_button(ui: &mut Ui, peer: &PeerRow) -> egui::Response {
 /// A button that turns orange while the state it controls is on.
 fn toggle<'a>(glyph: &str, label: &str, on: bool) -> Button<'a> {
     if on {
-        Button::new(icon_label(glyph, label, theme::ON_WARN, true)).fill(theme::WARN)
+        Button::new(icon_label(glyph, label, theme::colors().on_warn, true))
+            .fill(theme::colors().warn)
     } else {
-        Button::new(icon_label(glyph, label, theme::TEXT, false))
+        Button::new(icon_label(glyph, label, theme::colors().text, false))
     }
 }
 
@@ -1878,7 +2030,7 @@ fn timeline_entry(ui: &mut Ui, entry: &Entry) {
                     ui.label(
                         RichText::new(&entry.time)
                             .size(theme::TINY)
-                            .color(theme::MUTED),
+                            .color(theme::colors().muted),
                     );
                 });
                 ui.label(text);
@@ -1893,31 +2045,33 @@ fn indicator(ui: &mut Ui, peer: &PeerRow) {
     let center = rect.center();
     let painter = ui.painter();
     if !peer.connected() {
-        painter.circle_stroke(center, 3.5, Stroke::new(1.5, theme::BORDER));
+        painter.circle_stroke(center, 3.5, Stroke::new(1.5, theme::colors().border));
     } else if peer.muted {
         painter.text(
             center,
             Align2::CENTER_CENTER,
             icon::MICROPHONE_SLASH,
             FontId::proportional(14.0),
-            theme::WARN,
+            theme::colors().warn,
         );
     } else if peer.speaking {
-        painter.circle_filled(center, 3.5, theme::ACCENT);
-        painter.circle_stroke(center, 6.5, Stroke::new(1.5, theme::ACCENT));
+        painter.circle_filled(center, 3.5, theme::colors().accent);
+        painter.circle_stroke(center, 6.5, Stroke::new(1.5, theme::colors().accent));
     } else {
-        painter.circle_stroke(center, 3.5, Stroke::new(1.5, theme::IDLE));
+        painter.circle_stroke(center, 3.5, Stroke::new(1.5, theme::colors().idle));
     }
 }
 
 fn meter(ui: &mut Ui, level: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 6.0), Sense::hover());
     let radius = CornerRadius::same(3);
-    ui.painter().rect_filled(rect, radius, theme::BORDER);
+    ui.painter()
+        .rect_filled(rect, radius, theme::colors().border);
     if level > 0.0 {
         let mut filled = rect;
         filled.set_width(rect.width() * level.clamp(0.0, 1.0));
-        ui.painter().rect_filled(filled, radius, theme::ACCENT);
+        ui.painter()
+            .rect_filled(filled, radius, theme::colors().accent);
     }
 }
 
@@ -1987,19 +2141,19 @@ fn peer_name(peer: &PeerRow) -> RichText {
     if peer.connected() {
         strong(&peer.name)
     } else {
-        RichText::new(&peer.name).color(theme::MUTED)
+        RichText::new(&peer.name).color(theme::colors().muted)
     }
 }
 
 fn status(peer: &PeerRow) -> RichText {
     let (text, color) = match peer.state {
-        ConnectionState::Connecting => ("Connecting…", theme::MUTED),
-        ConnectionState::Disconnected => ("Connection lost", theme::WARN),
-        ConnectionState::Failed => ("Unreachable", theme::WARN),
-        ConnectionState::Closed => ("Closed", theme::MUTED),
-        ConnectionState::Connected if peer.muted => ("Muted", theme::WARN),
-        ConnectionState::Connected if peer.speaking => ("Speaking", theme::TEXT),
-        ConnectionState::Connected => ("Idle", theme::MUTED),
+        ConnectionState::Connecting => ("Connecting…", theme::colors().muted),
+        ConnectionState::Disconnected => ("Connection lost", theme::colors().warn),
+        ConnectionState::Failed => ("Unreachable", theme::colors().warn),
+        ConnectionState::Closed => ("Closed", theme::colors().muted),
+        ConnectionState::Connected if peer.muted => ("Muted", theme::colors().warn),
+        ConnectionState::Connected if peer.speaking => ("Speaking", theme::colors().text),
+        ConnectionState::Connected => ("Idle", theme::colors().muted),
     };
     RichText::new(text).color(color)
 }
@@ -2149,9 +2303,9 @@ impl StreamFigures {
 /// A figure in a table cell; dashes for missing values are dimmed.
 fn figure(text: String) -> RichText {
     let color = if text == "–" {
-        theme::MUTED
+        theme::colors().muted
     } else {
-        theme::TEXT
+        theme::colors().text
     };
     RichText::new(text).color(color)
 }

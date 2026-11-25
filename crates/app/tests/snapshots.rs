@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use egui::Vec2;
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use flowerchat_app::model::{Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
 use flowerchat_app::screen::{Choice, Choices};
 use flowerchat_app::settings::{DeviceChoice, SendMode};
@@ -220,11 +221,15 @@ fn snapshot(name: &str, size: Vec2, mut draw: impl FnMut(&mut egui::Ui)) {
         .wgpu()
         .build_ui(|ui| draw(ui));
     harness.run();
+    harness.snapshot_options(name, &options());
+}
+
+/// How closely a drawing has to match its image.
+fn options() -> egui_kittest::SnapshotOptions {
     // The images were made on Linux. Windows draws through another graphics
     // backend, which rounds the edges of a few letters differently.
-    let options = egui_kittest::SnapshotOptions::new()
-        .max_failed_pixels(egui_kittest::OsThreshold::new(0).windows(16));
-    harness.snapshot_options(name, &options);
+    egui_kittest::SnapshotOptions::new()
+        .max_failed_pixels(egui_kittest::OsThreshold::new(0).windows(16))
 }
 
 #[test]
@@ -482,6 +487,59 @@ fn room_narrow_screens() {
             codecs: &Codec::ALL,
             ..env(&devices)
         };
+        views::draw(ui, Screen::Room(&room), &env, &mut state);
+    });
+}
+
+/// The list of palettes is opened and one is picked from it. The list
+/// stays open, already in the colours picked.
+#[test]
+fn lobby_choosing_colours() {
+    let mut state = form();
+    let devices = devices();
+    {
+        let mut harness = Harness::builder()
+            .with_size(WIDE)
+            .with_pixels_per_point(1.0)
+            .wgpu()
+            .build_ui(|ui| {
+                let screen = Screen::Lobby {
+                    connecting: false,
+                    error: None,
+                    mic_level: 0.42,
+                };
+                views::draw(ui, screen, &env(&devices), &mut state);
+            });
+        harness.run();
+        harness.get_by_label("Colours").click();
+        harness.run();
+        harness.get_by_label("Gruvbox Darker").click();
+        harness.run();
+        harness.snapshot_options("lobby_choosing_colours", &options());
+    }
+    assert_eq!(state.settings.palette, "gruvbox-darker");
+}
+
+#[test]
+fn room_wide_in_a_dark_palette() {
+    let room = room();
+    let mut state = form();
+    state.settings.palette = "gruvbox-darker".into();
+    let devices = devices();
+    let env = env(&devices);
+    snapshot("room_wide_in_a_dark_palette", WIDE, |ui| {
+        views::draw(ui, Screen::Room(&room), &env, &mut state);
+    });
+}
+
+#[test]
+fn room_wide_in_a_light_palette() {
+    let room = room();
+    let mut state = form();
+    state.settings.palette = "catppuccin-latte".into();
+    let devices = devices();
+    let env = env(&devices);
+    snapshot("room_wide_in_a_light_palette", WIDE, |ui| {
         views::draw(ui, Screen::Room(&room), &env, &mut state);
     });
 }
