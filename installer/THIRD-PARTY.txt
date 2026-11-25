@@ -5,8 +5,8 @@ everything in lib\ and libexec\.
 
 GStreamer is free software under the GNU Lesser General Public License,
 version 2.1 or later. Its source code, and the licenses of the libraries it
-brings along (among them GLib, libnice, OpenSSL, Opus, libsrtp, usrsctp, dav1d and
-the WebRTC audio processing library), are at
+brings along (among them GLib, libnice, OpenSSL, Opus, libsrtp, usrsctp,
+dav1d, OpenH264, FFmpeg and the WebRTC audio processing library), are at
 
     https://gstreamer.freedesktop.org/
 

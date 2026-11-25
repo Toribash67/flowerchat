@@ -17,7 +17,8 @@ pub use crate::call::{ConnectionState, PeerStats, Route};
 use crate::ice::IceConfig;
 use crate::signaling;
 pub use crate::video::{
-    Codec, FrameSink, ScreenSource, ShareSettings, ShareSource, Sharing, VideoFrame, WatchStats,
+    Codec, FrameSink, ScreenSource, ShareCodec, ShareSettings, ShareSource, Sharing, VideoFrame,
+    WatchStats,
 };
 
 /// How often connection statistics are refreshed.
@@ -40,6 +41,9 @@ pub struct SessionConfig {
     /// Where the frames of the screens being watched go. Without it they
     /// are decoded and counted, but not shown.
     pub frames: Option<FrameSink>,
+    /// Encode and decode video on the processor even where the graphics
+    /// card could: for trying that out, or for a card that lets one down.
+    pub software_video: bool,
     /// For testing: the share, from 0 to 1, of arriving packets to lose, as
     /// a poor network would.
     pub incoming_loss: f64,
@@ -179,6 +183,7 @@ pub async fn run(
             measure: config.measure,
             ice: IceConfig::from_servers(&welcome.ice_servers),
             frames: config.frames,
+            software_video: config.software_video,
             incoming_loss: config.incoming_loss,
         },
         call_events_tx,

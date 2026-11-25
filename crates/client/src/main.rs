@@ -91,6 +91,10 @@ struct Args {
     /// it goes once a second.
     #[arg(long)]
     watch: bool,
+    /// Encode and decode video on the processor even where the graphics
+    /// card could.
+    #[arg(long)]
+    software_video: bool,
     /// For testing: lose this many percent of the packets that arrive, as
     /// a poor network would.
     #[arg(long, default_value_t = 0.0)]
@@ -166,6 +170,7 @@ async fn main() -> Result<()> {
             test_tone: args.test_tone,
             measure: args.measure,
             frames: None,
+            software_video: args.software_video,
             incoming_loss: args.lose / 100.0,
         },
         command_rx,
@@ -230,11 +235,17 @@ async fn main() -> Result<()> {
                     }
                     Event::PeerStats { .. } => {}
                     Event::OwnShare(Some(sharing)) => println!(
-                        "sharing {}x{} at {} fps, {} at {} kbps: sent {:.1} fps, encoding takes {:.1} ms, watched by {:?}",
+                        "sharing {}x{} at {} fps, {} by {} ({}) at {} kbps: sent {:.1} fps, encoding takes {:.1} ms, watched by {:?}",
                         sharing.width,
                         sharing.height,
                         sharing.fps,
                         sharing.codec.label(),
+                        sharing.encoder,
+                        if sharing.software {
+                            "software"
+                        } else {
+                            "hardware"
+                        },
                         sharing.kbps,
                         sharing.sent_fps,
                         sharing.encode_ms,
@@ -269,16 +280,17 @@ async fn main() -> Result<()> {
                     Event::Watching { id, stats } => {
                         let sound = stream_levels.remove(&id).unwrap_or(f32::NEG_INFINITY);
                         println!(
-                            "watching peer {id}: {}x{} at {:.1} fps, {:.1}% dropped, ready in {:.1} ms{}, sound {sound:.0} dB",
+                            "watching peer {id}: {}x{} at {:.1} fps, {:.1}% dropped, ready in {:.1} ms by {} ({}), sound {sound:.0} dB",
                             stats.width,
                             stats.height,
                             stats.fps,
                             stats.dropped_percent,
                             stats.decode_ms,
+                            stats.decoder,
                             if stats.software {
-                                " (decoded on the processor)"
+                                "software"
                             } else {
-                                ""
+                                "hardware"
                             }
                         );
                     }

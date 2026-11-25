@@ -126,6 +126,9 @@ pub struct CallConfig {
     /// Where the frames of watched screens go. Without it they are decoded
     /// and counted, but not shown.
     pub frames: Option<FrameSink>,
+    /// Encode and decode video on the processor even where the graphics
+    /// card could.
+    pub software_video: bool,
     /// For testing: the share, from 0 to 1, of arriving packets to lose, as
     /// a poor network would.
     pub incoming_loss: f64,
@@ -277,6 +280,8 @@ pub struct Call {
     /// channels, which repeat it to peers that connect later.
     announced: Arc<Mutex<Option<Value>>>,
     frames: FrameSink,
+    /// Whether the graphics card is left out of encoding and decoding.
+    software_video: bool,
     incoming_loss: f64,
 }
 
@@ -394,6 +399,7 @@ impl Call {
             measure,
             ice,
             frames,
+            software_video,
             incoming_loss,
         } = config;
         audio.jitter_ms = audio.jitter_ms.min(MAX_JITTER_MS);
@@ -527,6 +533,7 @@ impl Call {
             share,
             announced: Arc::default(),
             frames: frames.unwrap_or_else(|| Arc::new(|_, _| {})),
+            software_video,
             incoming_loss,
             capture: Mutex::new(capture),
             mic_tee: by_name("mic_tee")?,
@@ -744,6 +751,7 @@ impl Call {
         let encoder = Encoder::start(
             source,
             settings,
+            self.software_video,
             &clock,
             base_time,
             move |event| match event {
@@ -853,6 +861,8 @@ impl Call {
                 source_height,
                 fps: share.encoder.settings().fps,
                 codec: share.encoder.settings().codec,
+                encoder: share.encoder.engine().0.to_owned(),
+                software: share.encoder.engine().1,
                 kbps,
                 sent_fps: share.sent_fps,
                 encode_ms: share.encode_ms,
@@ -904,7 +914,13 @@ impl Call {
         let previous = if watch {
             let max_height = peer.view_height.load(Ordering::SeqCst);
             let codec = *peer.shared_codec.lock().unwrap();
-            let decoder = Decoder::start(id, self.frames.clone(), max_height, codec)?;
+            let decoder = Decoder::start(
+                id,
+                self.frames.clone(),
+                max_height,
+                codec,
+                self.software_video,
+            )?;
             peer.viewer.lock().unwrap().replace(decoder)
         } else {
             peer.viewer.lock().unwrap().take()
@@ -1666,6 +1682,9 @@ fn attach_video_recv_branch(
     let viewer = peer.viewer.clone();
     let id = peer.id;
     let mut last_request: Option<Instant> = None;
+    // Whether frames are being left out until a keyframe, because the
+    // decoder could not keep up with them.
+    let mut catching_up = false;
     bin.by_name("out")
         .and_then(|out| out.downcast::<gst_app::AppSink>().ok())
         .ok_or_else(|| anyhow!("video receive branch has no exit"))?
@@ -1680,8 +1699,24 @@ fn attach_video_recv_branch(
                     let Some(decoder) = &mut *viewer else {
                         return Ok(gst::FlowSuccess::Ok);
                     };
-                    if decoder.codec() != codec {
-                        // The sharer has changed codec, and this is the
+                    let other_codec = decoder.codec() != codec;
+                    if !other_codec && !catching_up && decoder.behind() {
+                        // Frames arrive faster than this machine decodes
+                        // them, which a processor may be too slow for
+                        // where a graphics card is not. Each would be
+                        // shown later than the last, without end. So the
+                        // decoder goes on with what it has, the frames
+                        // after that are left out, and a new one takes
+                        // over at the keyframe asked for here. The picture
+                        // jumps ahead, as often as it takes.
+                        warn!(
+                            peer = id,
+                            "the shared screen is decoded too slowly; skipping ahead"
+                        );
+                        catching_up = true;
+                    }
+                    if other_codec || catching_up {
+                        // Or the sharer has changed codec, and this is the
                         // stream it changed to or the one it changed from.
                         // A keyframe settles it: a stream that has ended
                         // sends none. Should the new stream's first have
@@ -1702,10 +1737,11 @@ fn attach_video_recv_branch(
                         match decoder.for_codec(codec) {
                             Ok(new) => *decoder = new,
                             Err(err) => {
-                                warn!(peer = id, "cannot follow the change of codec: {err:#}");
+                                warn!(peer = id, "cannot start decoding afresh: {err:#}");
                                 return Ok(gst::FlowSuccess::Ok);
                             }
                         }
+                        catching_up = false;
                     }
                     decoder.push(buffer);
                     Ok(gst::FlowSuccess::Ok)

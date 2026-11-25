@@ -76,9 +76,23 @@ it sends.
 
 The app and the command-line client run on Linux and on Windows. They need
 GStreamer 1.28 with the base, good and bad plugin sets, and on Linux the
-PipeWire plugin. Sharing a screen and watching one need an NVIDIA graphics
-card: the picture is encoded and decoded as H.264 or HEVC on the card (NVENC
-and NVDEC), and nothing else is tried.
+PipeWire plugin.
+
+A shared screen is encoded and decoded on an NVIDIA graphics card where
+there is one that knows the codec (NVENC and NVDEC), and on the processor
+where there is not: with OpenH264 for H.264, x265 and libde265 or FFmpeg for
+HEVC, and libaom and dav1d for AV1, all of which GStreamer has plugins for.
+Graphics cards of other makes are not used. The app names what does the
+work, and says whether that is the card or the processor, as in "NVENC
+(hardware)" or "x265 (software)": beside each codec in the list to pick
+from, as the encoder while sharing, and as the decoder of a screen being
+watched. The processor is slower, more so the larger the
+picture and the newer the codec. Where this was written, on a Ryzen 5 5600X,
+it shares 1080p at 60 frames per second in any of the three, 1440p nearly
+so, and 4K at about half that. A sharer whose processor cannot keep up
+sends fewer frames, and a viewer whose cannot skips ahead every few
+seconds. `--software-video` leaves the graphics card out even where it
+would do, for trying this out.
 
 What follows describes Linux. Where Windows differs, a paragraph says so;
 `docs/windows-port.md` has how to build there and what is still missing.
@@ -144,10 +158,11 @@ they have no picture to send.
 
 Watching opens the screen in the middle of the window, with the people on
 the left and the chat or the audio panel on the right. Under the picture
-are its resolution, frame rate and bitrate as they arrive, the delay from
-the sharer's screen to ours (encoding, half a round trip, the receive buffer
-and decoding; what the capture and the display add is not known), and the
-share of frames dropped here and of packets lost on the way. "Maximize"
+are its resolution, frame rate and bitrate as they arrive, what decodes
+it here, the delay from the sharer's screen to ours (encoding, half a round
+trip, the receive buffer and decoding; what the capture and the display add
+is not known), and the share of frames dropped here and of packets lost on
+the way. "Maximize"
 gives the picture the whole window and "Pop out" a window of its own. In a
 narrow window all of this is on the Screens tab.
 
@@ -159,19 +174,23 @@ The first two pickers above the button set the tallest picture to send and
 the frames per second, also in the middle of a share, where the picture
 changes over without a break. A screen taller than the limit is scaled down;
 a smaller one is sent as it is, up to 4096 pixels a side in H.264 and 8192
-in HEVC.
+in HEVC and AV1.
 
 The two below them set the bitrate and the codec, and can be changed in the
 middle of a share as well: viewers carry on watching without doing anything.
 Left on "Auto bitrate", the bitrate follows from size and frame rate: about
 8.7 Mbit/s for 1080p at 60 frames per second and about 35 Mbit/s for 4K in
-H.264, and three quarters of that in HEVC, which needs fewer bits for the
-same picture and takes somewhat longer to encode. Otherwise it is held to
+H.264, three quarters of that in HEVC and two thirds in AV1, which need
+fewer bits for the same picture and take longer to encode. Otherwise it is
+held to
 the figure picked, from 1 to 50 Mbit/s. Every viewer gets the whole stream,
-so what leaves the machine is the bitrate times the number of viewers.
+so what leaves the machine is the bitrate times the number of viewers. The
+list of codecs has those this machine can encode, each with what would
+encode it: "H.264 · NVENC (hardware)", "AV1 · libaom (software)".
 
 While sharing, the block about yourself shows what is being sent, the codec
-and the bitrate aimed for, how long encoding a frame takes, and who watches.
+and the bitrate aimed for, what encodes it and how long that takes for a
+frame, and who watches.
 `--share-height` (0 for the size the screen has) and `--share-fps` set the
 first two pickers when starting the app.
 
@@ -248,9 +267,10 @@ ones that matter most:
 | `--share-monitor` | Windows: share a monitor, by its number from zero. |
 | `--share-height`, `--share-fps` | The tallest picture to send (0 for the size it has), and how many frames per second. |
 | `--share-silent` | Share the picture without the sound that goes with it. |
-| `--share-codec` | Codec to share in: `h264` (the default) or `hevc`. |
+| `--share-codec` | Codec to share in: `h264` (the default), `hevc` or `av1`. |
 | `--share-kbps` | Bitrate to share at, in kbit/s. Without it, the bitrate follows size and frame rate. |
 | `--watch` | Watch every screen that is shared, without showing it, and print how it goes. |
+| `--software-video` | Encode and decode video on the processor even where the graphics card could. |
 | `--lose` | Lose this many percent of the packets that arrive, to see what a poor network does. |
 
 Set `RUST_LOG=flowerchat_client=debug` to see the SDP being exchanged.
@@ -298,12 +318,12 @@ carries a data channel named `control`, created by both sides with
 | --- | --- |
 | `{"muted": true}` | The sender muted or unmuted. |
 | `{"chat": "…"}` | A chat message. |
-| `{"sharing": {…}}` | What the sender shares of its screen: `width`, `height`, `fps`, `codec` (`h264` or `hevc`) and `kbps` as set, `sentFps` and `encodeMs` as measured, `sound` for whether sound comes with it, and `watchers`, the ids of those it sends to. Repeated about once a second. |
+| `{"sharing": {…}}` | What the sender shares of its screen: `width`, `height`, `fps`, `codec` (`h264`, `hevc` or `av1`) and `kbps` as set, `encoder` for what encodes it (`NVENC`, `x265` and so on) and `software` for whether that runs on its processor, `sentFps` and `encodeMs` as measured, `sound` for whether sound comes with it, and `watchers`, the ids of those it sends to. Repeated about once a second. |
 | `{"sharing": null}` | The sender stopped sharing. |
 | `{"watch": true}` | The sender wants the receiver's share, or with `false` no longer does. |
 
 Native clients offer and accept video on every connection from the start,
-one stream for H.264 and one for HEVC, each with retransmission, and a
+one stream each for H.264, HEVC and AV1, each with retransmission, and a
 second Opus stream for the sound of a shared screen, so that sharing,
 watching and changing codec need no new negotiation. Nothing is sent on any
 of them until a peer asks to watch, and then only on the stream of the codec
@@ -332,7 +352,11 @@ The sharing tests, in the client and in the app, also need an NVIDIA
 graphics card: one client shares a test picture, others watch it, one of
 them through 2% packet loss, and the voice must stay as quick as it was. In
 the app's test, the app itself shares and watches through its buttons,
-without showing a window.
+without showing a window. `software.rs` in the client does without the
+card: the processor encodes the picture in each codec and decodes it for
+one of two viewers. Two more tests in `video.rs` run every encoder and
+decoder the machine has, card or processor, and hold each to its bitrate,
+its frame rate and to keyframes only when asked.
 
 One test is left out of that, and is run on request:
 

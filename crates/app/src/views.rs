@@ -15,7 +15,7 @@ use egui::{
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use flowerchat_client::audio::{AudioDevice, AudioDevices};
-use flowerchat_client::session::{Codec, ConnectionState, Route};
+use flowerchat_client::session::{ConnectionState, Route, ShareCodec};
 use flowerchat_protocol::PeerId;
 
 use crate::model::{Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
@@ -64,8 +64,9 @@ pub struct Env<'a> {
     pub transmitting: bool,
     /// The latest frame of the screen being watched, once there is one.
     pub picture: Option<Picture>,
-    /// The codecs this machine can share a screen in.
-    pub codecs: &'a [Codec],
+    /// The codecs this machine can share a screen in, and for each whether
+    /// its processor would have to encode it.
+    pub codecs: &'a [ShareCodec],
 }
 
 /// A frame of a shared screen, ready to draw.
@@ -737,6 +738,7 @@ fn room_stream(
                                 ("Resolution", &figures.resolution),
                                 ("Frame rate", &figures.frame_rate),
                                 ("Codec", &figures.codec),
+                                ("Decoder", &figures.decoder),
                                 ("Bitrate", &figures.bitrate),
                             ],
                         );
@@ -803,10 +805,11 @@ fn room_maximized(
                         ui.spacing_mut().item_spacing.x = 12.0;
                         ui.label(strong(format!("{name}'s screen")));
                         let line = format!(
-                            "{} · {} · {} · {} · delay {} · {} frames dropped",
+                            "{} · {} · {} by {} · {} · delay {} · {} frames dropped",
                             figures.resolution,
                             figures.frame_rate,
                             figures.codec,
+                            figures.decoder,
                             figures.bitrate,
                             figures.delay,
                             figures.frames_dropped
@@ -906,6 +909,7 @@ fn screens_tab(
             for (key, value) in [
                 ("Resolution", &figures.resolution),
                 ("Frame rate", &figures.frame_rate),
+                ("Decoder", &figures.decoder),
                 ("Bitrate", &figures.bitrate),
                 ("Delay", &figures.delay),
                 ("Frames dropped", &figures.frames_dropped),
@@ -1608,7 +1612,7 @@ fn me_block(
     ui: &mut Ui,
     room: &RoomModel,
     mode: &str,
-    screen: Option<(&mut Settings, &[Codec])>,
+    screen: Option<(&mut Settings, &[ShareCodec])>,
     actions: &mut Vec<Action>,
 ) {
     let me = &room.me;
@@ -1673,6 +1677,11 @@ fn own_share_figures(ui: &mut Ui, room: &RoomModel) {
             bitrate(Some(f64::from(sharing.kbps)))
         );
         kv(ui, "Video", video);
+        kv(
+            ui,
+            "Encoder",
+            engine_text(&sharing.encoder, sharing.software),
+        );
         kv(ui, "Encoded in", format!("{:.0} ms", sharing.encode_ms));
         kv(
             ui,
@@ -1691,7 +1700,7 @@ const SHARE_MBPS: [u32; 12] = [1, 2, 3, 4, 6, 8, 10, 15, 20, 30, 40, 50];
 
 /// The size, frame rate, bitrate and codec to share a screen at, the last
 /// from among `codecs`. All can be changed while sharing.
-fn share_pickers(ui: &mut Ui, room: &RoomModel, settings: &mut Settings, codecs: &[Codec]) {
+fn share_pickers(ui: &mut Ui, room: &RoomModel, settings: &mut Settings, codecs: &[ShareCodec]) {
     // What the machine plays, with the call itself left out.
     if option(ui, settings.share_sound, Mark::Check, "With sound").clicked() {
         settings.share_sound = !settings.share_sound;
@@ -1736,11 +1745,16 @@ fn share_pickers(ui: &mut Ui, room: &RoomModel, settings: &mut Settings, codecs:
 
     // A codec chosen on another machine may not be one this one has.
     let mut codec = settings.share_codec();
-    if !codecs.contains(&codec)
-        && let Some(first) = codecs.first()
-    {
-        codec = *first;
-        settings.share_codec = codec.id().into();
+    let mut software = false;
+    match codecs.iter().find(|choice| choice.codec == codec) {
+        Some(choice) => software = choice.software,
+        None => {
+            if let Some(first) = codecs.first() {
+                codec = first.codec;
+                software = first.software;
+                settings.share_codec = codec.id().into();
+            }
+        }
     }
     // Left to itself, the bitrate follows the size and frame rate. What it
     // comes to is among the figures above while sharing.
@@ -1768,18 +1782,44 @@ fn share_pickers(ui: &mut Ui, room: &RoomModel, settings: &mut Settings, codecs:
                     }
                 }
             });
-        ComboBox::from_id_salt("share-codec")
+        // The list says what would encode each codec. The box itself is
+        // too narrow to, so it says so when pointed at.
+        let picker = ComboBox::from_id_salt("share-codec")
             .width(ui.available_width())
             .selected_text(codec.label())
             .truncate()
             .show_ui(ui, |ui| {
                 for choice in codecs {
-                    let chosen = codec == *choice;
-                    if ui.selectable_label(chosen, choice.label()).clicked() {
-                        settings.share_codec = choice.id().into();
+                    let chosen = codec == choice.codec;
+                    let text = format!(
+                        "{} · {}",
+                        choice.codec.label(),
+                        engine_text(choice.encoder, choice.software)
+                    );
+                    if ui.selectable_label(chosen, text).clicked() {
+                        settings.share_codec = choice.codec.id().into();
                     }
                 }
             });
+        let encoder = codecs.iter().find(|choice| choice.codec == codec);
+        if let Some(choice) = encoder {
+            let hint = if software {
+                format!(
+                    "{} is encoded by {} on the processor here, for want of a graphics \
+                     card that flowerchat can use for it. That takes longer, and may not \
+                     keep up with a large picture.",
+                    codec.label(),
+                    choice.encoder
+                )
+            } else {
+                format!(
+                    "{} is encoded by {} on the graphics card.",
+                    codec.label(),
+                    choice.encoder
+                )
+            };
+            picker.response.on_hover_text(hint);
+        }
     });
 }
 
@@ -2210,6 +2250,13 @@ fn unread(room: &RoomModel, state: &UiState) -> usize {
     message_count(room).saturating_sub(state.messages_seen)
 }
 
+/// What encodes or decodes, by name, and whether that is the graphics
+/// card (hardware) or a library on the processor (software).
+fn engine_text(name: &str, software: bool) -> String {
+    let kind = if software { "software" } else { "hardware" };
+    format!("{name} ({kind})")
+}
+
 fn own_share_text(share: &OwnShare) -> String {
     match share {
         OwnShare::NotSharing => "Not sharing".into(),
@@ -2252,8 +2299,9 @@ fn bitrate(kbps: Option<f64>) -> String {
 struct StreamFigures {
     resolution: String,
     frame_rate: String,
-    /// The codec, and a note if the processor has to decode it.
     codec: String,
+    /// What decodes it here, and whether that is the graphics card.
+    decoder: String,
     bitrate: String,
     delay: String,
     frames_dropped: String,
@@ -2286,11 +2334,13 @@ impl StreamFigures {
                 "–".into()
             },
             codec: match peer.and_then(|peer| peer.sharing.as_ref()) {
-                Some(sharing) if stats.software => {
-                    format!("{} (software)", sharing.codec.label())
-                }
                 Some(sharing) => sharing.codec.label().into(),
                 None => "–".into(),
+            },
+            decoder: if started {
+                engine_text(stats.decoder, stats.software)
+            } else {
+                "–".into()
             },
             bitrate: bitrate(peer.and_then(|peer| peer.stats.video_receiving_kbps)),
             delay: millis(delay),

@@ -108,10 +108,25 @@ Found on the way:
   are those of the HEVC encoder, which GStreamer's documentation lists for
   it too, less `repeat-sequence-header`. A viewer decodes with `nvav1dec`
   if the card has it and with `dav1ddec` on the processor if not, and the
-  stream's figures then say "AV1 (software)". The second was tried here
+  stream's figures then say "dav1d (software)". The second was tried here
   with a stream from `svtav1enc`, as was the way through `rtpav1pay` and
   `rtpav1depay`; the first has not run anywhere. A client from before
   this does not see a share in AV1 at all.
+- The processor stands in where no NVIDIA card encodes or decodes a codec
+  (`EncoderKind` and `DecoderKind` in `video.rs`), which was written and
+  tried on Linux only. Nothing of it has run on Windows, where it differs
+  in three ways. A captured frame is on the graphics card and has to be
+  brought back for an encoder on the processor (`SOFTWARE_INPUT`:
+  `d3d11download ! videoconvert`). GStreamer for Windows has neither
+  libde265 nor libaom, so HEVC is decoded by FFmpeg (`avdec_h265`), which
+  has decoded nothing on Linux either, and AV1 is not encoded on the
+  processor at all: `svtav1enc` is there but stops after one frame in the
+  mode a call needs (see `EncoderKind::Aom`). And the installer leaves
+  out x265, which is under the GPL, so without a card that encodes it
+  HEVC is not offered there. That leaves a friend without an NVIDIA card
+  sharing in H.264 and watching all three. The bundle gained the
+  `openh264` and `libav` plugins for it and has not been built since:
+  the size below is from before, and FFmpeg's libraries will add to it.
 
 Still to do:
 
@@ -143,9 +158,10 @@ else can join.
   Linux and Windows; no Mac.
 - Rust on GStreamer, using `webrtcbin` directly. `webrtcsink` encodes once
   per viewer; here one encode fans out to everyone who watches.
-- Everyone has an NVIDIA card, so video is NVENC and NVDEC only: H.264 and
-  HEVC. AV1 was left out at first because the 2070 SUPER cannot encode
-  it; see "Found on the way" for how it came in.
+- Everyone had an NVIDIA card, so video was NVENC and NVDEC only: H.264
+  and HEVC. AV1 was left out at first because the 2070 SUPER cannot encode
+  it, and the processor did nothing; see "Found on the way" for how both
+  came in. Cards of other makes are still not used.
 - The window is egui 0.36 through eframe (pinned by `egui-phosphor` 0.14).
   Martin wants desktop density, live figures shown rather than hidden, and
   to be shown a proposal before a change of look or layout is built.
@@ -246,7 +262,7 @@ $env:PKG_CONFIG_PATH = "$gst\lib\pkgconfig"
 
 - `cargo build --release`. Release builds of the app have no console
   window, so they print nothing; debug builds keep it.
-- `bundle.ps1` gathers the programs, the 27 GStreamer plugins the
+- `bundle.ps1` gathers the programs, the 29 GStreamer plugins the
   pipelines use, and the libraries those ask for, read from their import
   tables: 56 MB in `target\bundle`, of GStreamer's 1.1 GB. A pipeline that
   gains an element from another plugin needs that plugin added to the list

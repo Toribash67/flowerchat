@@ -23,13 +23,17 @@ $ErrorActionPreference = 'Stop'
 # webrtcbin builds by itself (dtls, srtp, sctp). When a pipeline gains an
 # element from another plugin, it goes here; `gst-inspect-1.0 ELEMENT` says
 # which plugin that is.
+#
+# openh264, libav and dav1d are for those without a graphics card that
+# encodes or decodes: H.264 both ways, HEVC and AV1 to watch. What would
+# encode those two on the processor stays out: x265 is under the GPL, and
+# GStreamer for Windows has no libaom.
 $plugins = @(
     'app', 'audioconvert', 'audiomixer', 'audioresample', 'audiotestsrc',
-    'coreelements', 'd3d11', 'dav1d', 'debug', 'dtls', 'level', 'nice',
-    'nvcodec', 'opus', 'rsrtp', 'rtp', 'rtpmanager', 'sctp', 'srtp',
-    'videoconvertscale',
-    'videoparsersbad', 'videorate', 'videotestsrc', 'volume', 'wasapi2',
-    'webrtc', 'webrtcdsp'
+    'coreelements', 'd3d11', 'dav1d', 'debug', 'dtls', 'level', 'libav',
+    'nice', 'nvcodec', 'openh264', 'opus', 'rsrtp', 'rtp', 'rtpmanager',
+    'sctp', 'srtp', 'videoconvertscale', 'videoparsersbad', 'videorate',
+    'videotestsrc', 'volume', 'wasapi2', 'webrtc', 'webrtcdsp'
 )
 
 # The names of the libraries a program or library asks Windows to load with

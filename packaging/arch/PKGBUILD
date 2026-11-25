@@ -17,10 +17,14 @@ url='https://github.com/Toribash67/flowerchat'
 license=('LicenseRef-unknown' 'OFL-1.1')
 depends=(
   'gcc-libs' 'glibc' 'glib2' 'openssl'
-  # GStreamer, which does the sound, the calls and the screens.
+  # GStreamer, which does the sound, the calls and the screens. The bad
+  # plugins bring what encodes and decodes a screen on the processor:
+  # OpenH264, x265, libde265 and libaom.
   'gstreamer' 'gst-plugins-base' 'gst-plugins-base-libs'
   'gst-plugins-good' 'gst-plugins-bad' 'gst-plugins-bad-libs'
   'gst-plugin-pipewire' 'libnice'
+  # What puts AV1 into packets. Without it no call connects at all.
+  'gst-plugin-rsrtp'
   # pw-dump and pw-link, for the sound of a shared screen.
   'pipewire'
   # Microphones and speakers are opened through the PulseAudio protocol.
@@ -31,7 +35,8 @@ depends=(
 )
 makedepends=('cargo' 'pkgconf')
 optdepends=(
-  'nvidia-utils: sharing and watching screens (NVENC and NVDEC)'
+  'nvidia-utils: sharing and watching screens on the graphics card (NVENC and NVDEC)'
+  'gst-plugin-dav1d: a quicker way to watch AV1 without a graphics card that decodes it'
   'xdg-desktop-portal: choosing what to share, and push-to-talk in every window'
 )
 # Cargo makes its own optimized, stripped build.

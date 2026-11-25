@@ -12,13 +12,20 @@
 //! call's pipeline would delay the voice as well.
 //!
 //! The part in braces is replaced when the sharer picks another [`Codec`],
-//! and the decoder with it at the other end. A viewer whose graphics card
-//! cannot decode AV1 decodes it on the processor ([`WatchStats::software`]).
+//! and the decoder with it at the other end.
+//!
+//! The graphics card encodes and decodes where it can. Where it cannot,
+//! for want of a card that knows the codec or of any card that this is
+//! written for, the processor does (`EncoderKind`, `DecoderKind`), and
+//! both ends say so: [`Sharing::software`] and [`WatchStats::software`].
+//! The processor is slower, and falls behind where the picture is large:
+//! the sharer then sends fewer frames (`SOFTWARE_INPUT`), and a viewer
+//! skips ahead (`Decoder::behind`).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use flowerchat_protocol::PeerId;
@@ -82,9 +89,58 @@ impl Codec {
         Self::ALL.into_iter().find(|codec| codec.id() == id)
     }
 
-    /// Whether this machine can encode it.
-    pub fn can_encode(self) -> bool {
-        gst::ElementFactory::find(self.encoder()).is_some()
+    /// The codecs this machine can share a screen in, and for each whether
+    /// its processor would have to do the encoding. `software_only` leaves
+    /// the graphics card out of it.
+    pub fn for_sharing(software_only: bool) -> Vec<ShareCodec> {
+        Self::ALL
+            .into_iter()
+            .filter_map(|codec| {
+                let kind = codec.encoder(software_only)?;
+                Some(ShareCodec {
+                    codec,
+                    encoder: kind.name(),
+                    software: kind.software(),
+                })
+            })
+            .collect()
+    }
+
+    /// The ways there are to encode it, the best first.
+    fn encoders(self) -> &'static [EncoderKind] {
+        match self {
+            Codec::H264 => &[EncoderKind::Nvidia, EncoderKind::OpenH264],
+            Codec::Hevc => &[EncoderKind::Nvidia, EncoderKind::X265],
+            Codec::Av1 => &[EncoderKind::Nvidia, EncoderKind::Aom],
+        }
+    }
+
+    /// The best way this machine has to encode it, if it has any.
+    fn encoder(self, software_only: bool) -> Option<EncoderKind> {
+        self.encoders()
+            .iter()
+            .copied()
+            .find(|kind| (kind.software() || !software_only) && element_exists(kind.element(self)))
+    }
+
+    /// The ways there are to decode it, the best first.
+    fn decoders(self) -> &'static [DecoderKind] {
+        match self {
+            Codec::H264 => &[
+                DecoderKind::Nvidia,
+                DecoderKind::OpenH264,
+                DecoderKind::Libav,
+            ],
+            Codec::Hevc => &[DecoderKind::Nvidia, DecoderKind::De265, DecoderKind::Libav],
+            Codec::Av1 => &[DecoderKind::Nvidia, DecoderKind::Dav1d, DecoderKind::Aom],
+        }
+    }
+
+    /// The ways this machine has to decode it, the best first.
+    fn decoders_here(self, software_only: bool) -> impl Iterator<Item = DecoderKind> {
+        self.decoders().iter().copied().filter(move |kind| {
+            (kind.software() || !software_only) && element_exists(kind.element(self))
+        })
     }
 
     /// The name it has in RTP.
@@ -119,8 +175,9 @@ impl Codec {
             .find(|codec| codec.caps().starts_with(name.as_str()))
     }
 
+    /// The graphics card's encoder for it.
     #[cfg(not(windows))]
-    fn encoder(self) -> &'static str {
+    fn nvidia_encoder(self) -> &'static str {
         match self {
             Codec::H264 => "nvh264enc",
             Codec::Hevc => "nvh265enc",
@@ -128,72 +185,15 @@ impl Codec {
         }
     }
 
-    /// On Windows, the encoder that takes frames as Direct3D hands them
-    /// out, which is how a captured screen arrives.
+    /// The graphics card's encoder for it. On Windows, the one that takes
+    /// frames as Direct3D hands them out, which is how a captured screen
+    /// arrives.
     #[cfg(windows)]
-    fn encoder(self) -> &'static str {
+    fn nvidia_encoder(self) -> &'static str {
         match self {
             Codec::H264 => "nvd3d11h264enc",
             Codec::Hevc => "nvd3d11h265enc",
             Codec::Av1 => "nvd3d11av1enc",
-        }
-    }
-
-    /// The elements that turn frames into the encoded stream. The encoder
-    /// is named `encoder`.
-    ///
-    /// It sends a keyframe only when asked: a new viewer and a viewer that
-    /// lost data both ask, and nobody else pays for it.
-    ///
-    /// On Linux, frames are copied to the graphics card ahead of the
-    /// encoder ([`ENCODER_INPUT`]), which would otherwise do that itself and then hold on to the captured
-    /// frame until it has encoded it, on a thread of its own. A frame of a
-    /// screen belongs to PipeWire, and `pipewiresrc` (as of 1.6) locks up
-    /// for good when one thread hands a frame back at the moment the
-    /// capturing thread lets go of the frame it keeps for a still screen:
-    /// each then holds the lock the other waits for. With the copy made
-    /// here, on the capturing thread, no other thread ever holds one.
-    fn encoder_description(self) -> String {
-        // `headers` makes every keyframe carry what a decoder needs to
-        // start from it. The AV1 encoder has no setting for that.
-        let (headers, profile, parser) = match self {
-            Codec::H264 => (
-                "repeat-sequence-header=true",
-                "video/x-h264,profile=high",
-                "h264parse config-interval=-1",
-            ),
-            Codec::Hevc => (
-                "repeat-sequence-header=true",
-                "video/x-h265,profile=main",
-                "h265parse config-interval=-1",
-            ),
-            Codec::Av1 => ("", "video/x-av1,profile=main", "av1parse"),
-        };
-        format!(
-            "{ENCODER_INPUT}{} name=encoder preset=p4 tune=ultra-low-latency rc-mode=cbr \
-               zerolatency=true bframes=0 gop-size=-1 {headers} \
-               min-force-key-unit-interval={KEYFRAME_SPACING_NS} \
-             ! {profile} ! {parser} ! capsfilter caps={}",
-            self.encoder(),
-            self.caps()
-        )
-    }
-
-    /// The elements that turn the encoded stream into frames, and whether
-    /// they do it on the processor instead of the graphics card. The last
-    /// is named `decoder`.
-    ///
-    /// The graphics card only offers the decoders it has, so a card too old
-    /// for AV1 has no `nvav1dec`.
-    fn decoder_description(self) -> (&'static str, bool) {
-        match self {
-            Codec::H264 => ("h264parse ! nvh264dec name=decoder", false),
-            Codec::Hevc => ("h265parse ! nvh265dec name=decoder", false),
-            Codec::Av1 if gst::ElementFactory::find("nvav1dec").is_some() => {
-                ("av1parse ! nvav1dec name=decoder", false)
-            }
-            // One frame at a time, or it holds on to several for speed.
-            Codec::Av1 => ("av1parse ! dav1ddec name=decoder max-frame-delay=1", true),
         }
     }
 
@@ -213,6 +213,261 @@ impl Codec {
             Codec::Hevc => 0.75,
             Codec::Av1 => 0.65,
         }
+    }
+}
+
+/// A codec this machine can share a screen in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareCodec {
+    pub codec: Codec,
+    /// What would encode it, by the name people know it by: `NVENC`,
+    /// `x265` and so on.
+    pub encoder: &'static str,
+    /// Whether that runs on the processor, for want of a graphics card
+    /// that encodes the codec.
+    pub software: bool,
+}
+
+fn element_exists(name: &str) -> bool {
+    gst::ElementFactory::find(name).is_some()
+}
+
+/// How many threads an encoder on the processor is given. Whatever is
+/// being shared wants the processor too.
+fn encoder_threads() -> usize {
+    let cores = std::thread::available_parallelism().map_or(2, |cores| cores.get());
+    (cores / 2).clamp(1, 4)
+}
+
+/// What turns frames into a stream: the graphics card, or a library that
+/// runs on the processor.
+///
+/// The graphics card only offers the encoders it has, so a card too old
+/// for AV1 has no `nvav1enc`, and a machine without such a card has none
+/// of them. That is how [`Codec::encoder`] knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncoderKind {
+    /// The graphics card, through NVENC.
+    Nvidia,
+    /// OpenH264, for H.264: 3 ms for a 1080p frame where this was
+    /// written, on four threads of a Ryzen 5 5600X.
+    OpenH264,
+    /// x265, for HEVC: 9 ms for a 1080p frame, and too slow for 60 frames
+    /// per second at 4K.
+    X265,
+    /// libaom, for AV1: 7 ms for a 1080p frame, and too slow for 60
+    /// frames per second at 4K. SVT-AV1 would be the quicker library, but
+    /// through `svtav1enc` (GStreamer 1.28.9, SVT-AV1 4.3) it cannot be
+    /// used in a call: asked for one frame out per frame in (`rtc=1`), the
+    /// element waits for a second frame out after the first and never
+    /// gets it.
+    Aom,
+}
+
+impl EncoderKind {
+    /// Whether it runs on the processor.
+    fn software(self) -> bool {
+        self != EncoderKind::Nvidia
+    }
+
+    /// The name people know it by.
+    fn name(self) -> &'static str {
+        match self {
+            EncoderKind::Nvidia => "NVENC",
+            EncoderKind::OpenH264 => "OpenH264",
+            EncoderKind::X265 => "x265",
+            EncoderKind::Aom => "libaom",
+        }
+    }
+
+    /// The element that does it.
+    fn element(self, codec: Codec) -> &'static str {
+        match self {
+            EncoderKind::Nvidia => codec.nvidia_encoder(),
+            EncoderKind::OpenH264 => "openh264enc",
+            EncoderKind::X265 => "x265enc",
+            EncoderKind::Aom => "av1enc",
+        }
+    }
+
+    /// The elements that turn frames into the encoded stream. The encoder
+    /// is named `encoder`.
+    ///
+    /// It sends a keyframe only when asked: a new viewer and a viewer that
+    /// lost data both ask, and nobody else pays for it.
+    ///
+    /// On Linux, frames are copied to the graphics card ahead of its
+    /// encoder ([`ENCODER_INPUT`]), which would otherwise do that itself
+    /// and then hold on to the captured frame until it has encoded it, on
+    /// a thread of its own. A frame of a screen belongs to PipeWire, and
+    /// `pipewiresrc` (as of 1.6) locks up for good when one thread hands a
+    /// frame back at the moment the capturing thread lets go of the frame
+    /// it keeps for a still screen: each then holds the lock the other
+    /// waits for. With the copy made here, on the capturing thread, no
+    /// other thread ever holds one.
+    ///
+    /// An encoder on the processor gets its frames from a queue
+    /// ([`SOFTWARE_INPUT`]): see there.
+    fn description(self, codec: Codec) -> String {
+        let element = self.element(codec);
+        let caps = codec.caps();
+        let threads = encoder_threads();
+        match self {
+            EncoderKind::Nvidia => {
+                // `headers` makes every keyframe carry what a decoder needs
+                // to start from it. The AV1 encoder has no setting for that.
+                let (headers, profile, parser) = match codec {
+                    Codec::H264 => (
+                        "repeat-sequence-header=true",
+                        "video/x-h264,profile=high",
+                        "h264parse config-interval=-1",
+                    ),
+                    Codec::Hevc => (
+                        "repeat-sequence-header=true",
+                        "video/x-h265,profile=main",
+                        "h265parse config-interval=-1",
+                    ),
+                    Codec::Av1 => ("", "video/x-av1,profile=main", "av1parse"),
+                };
+                format!(
+                    "{ENCODER_INPUT}{element} name=encoder preset=p4 tune=ultra-low-latency \
+                       rc-mode=cbr zerolatency=true bframes=0 gop-size=-1 {headers} \
+                       min-force-key-unit-interval={KEYFRAME_SPACING_NS} \
+                     ! {profile} ! {parser} ! capsfilter caps={caps}"
+                )
+            }
+            // One slice per thread, which is what lets the threads work
+            // side by side. It quantizes less coarsely than the others at
+            // their coarsest, so a picture can be too much for the bitrate:
+            // it then leaves frames out, where it would otherwise send
+            // more than it was told to.
+            EncoderKind::OpenH264 => format!(
+                "{SOFTWARE_INPUT}{element} name=encoder complexity=low rate-control=bitrate \
+                   enable-frame-skip=true \
+                   gop-size={NO_KEYFRAMES_OF_ITS_OWN} scene-change-detection=false \
+                   multi-thread={threads} slice-mode=auto \
+                   min-force-key-unit-interval={KEYFRAME_SPACING_NS} \
+                 ! h264parse config-interval=-1 ! capsfilter caps={caps}"
+            ),
+            EncoderKind::X265 => format!(
+                "{SOFTWARE_INPUT}{element} name=encoder speed-preset=ultrafast \
+                   tune=zerolatency key-int-max={NO_KEYFRAMES_OF_ITS_OWN} \
+                   min-force-key-unit-interval={KEYFRAME_SPACING_NS} \
+                 ! video/x-h265,profile=main ! h265parse config-interval=-1 \
+                 ! capsfilter caps={caps}"
+            ),
+            // Left to itself the element allows no quantizer but the
+            // finest, and with that no bitrate but the highest.
+            EncoderKind::Aom => format!(
+                "{SOFTWARE_INPUT}{element} name=encoder usage-profile=realtime end-usage=cbr \
+                   cpu-used=10 lag-in-frames=0 max-quantizer=63 keyframe-mode=disabled \
+                   row-mt=true tile-columns=2 threads={threads} \
+                   min-force-key-unit-interval={KEYFRAME_SPACING_NS} \
+                 ! av1parse ! capsfilter caps={caps}"
+            ),
+        }
+    }
+
+    /// Tells `encoder` the bitrate to aim for and how far a single frame
+    /// may go beyond its share of it. All of them take that while they
+    /// run.
+    fn set_rate(self, encoder: &gst::Element, kbps: u32, fps: u32) {
+        let frames_per_second = f64::from(fps.max(1));
+        match self {
+            EncoderKind::Nvidia => {
+                let burst = f64::from(kbps) * FRAMES_OF_BURST / frames_per_second;
+                encoder.set_property("bitrate", kbps);
+                encoder.set_property("vbv-buffer-size", burst.round() as u32);
+            }
+            EncoderKind::OpenH264 => encoder.set_property("bitrate", kbps * 1000),
+            EncoderKind::X265 => {
+                let burst = f64::from(kbps) * FRAMES_OF_BURST / frames_per_second;
+                encoder.set_property("bitrate", kbps);
+                encoder.set_property(
+                    "option-string",
+                    format!("vbv-maxrate={kbps}:vbv-bufsize={}", burst.round() as u32),
+                );
+            }
+            EncoderKind::Aom => {
+                encoder.set_property("target-bitrate", kbps);
+            }
+        }
+    }
+}
+
+/// What turns a stream back into frames: the graphics card, or a library
+/// that runs on the processor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecoderKind {
+    /// The graphics card, through NVDEC. It only offers the decoders it
+    /// has, so a card too old for AV1 has no `nvav1dec`.
+    Nvidia,
+    /// OpenH264, for H.264. A stream from another encoder than its own it
+    /// hands out one frame late: each frame when the next has arrived.
+    OpenH264,
+    /// libde265, for HEVC. It hands out every frame two frames late.
+    De265,
+    /// FFmpeg, for H.264 and HEVC. GStreamer for Windows has nothing else
+    /// for HEVC. It comes after the two above only because those are what
+    /// this was tried with: it was not installed where this was written,
+    /// and has not decoded anything here.
+    Libav,
+    /// dav1d, for AV1.
+    Dav1d,
+    /// libaom, for AV1: slower than dav1d, and too slow for 4K.
+    Aom,
+}
+
+impl DecoderKind {
+    /// Whether it runs on the processor.
+    fn software(self) -> bool {
+        self != DecoderKind::Nvidia
+    }
+
+    /// The name people know it by.
+    fn name(self) -> &'static str {
+        match self {
+            DecoderKind::Nvidia => "NVDEC",
+            DecoderKind::OpenH264 => "OpenH264",
+            DecoderKind::De265 => "libde265",
+            DecoderKind::Libav => "FFmpeg",
+            DecoderKind::Dav1d => "dav1d",
+            DecoderKind::Aom => "libaom",
+        }
+    }
+
+    /// The element that does it.
+    fn element(self, codec: Codec) -> &'static str {
+        match (self, codec) {
+            (DecoderKind::Nvidia, Codec::H264) => "nvh264dec",
+            (DecoderKind::Nvidia, Codec::Hevc) => "nvh265dec",
+            (DecoderKind::Nvidia, Codec::Av1) => "nvav1dec",
+            (DecoderKind::OpenH264, _) => "openh264dec",
+            (DecoderKind::De265, _) => "libde265dec",
+            (DecoderKind::Libav, Codec::H264) => "avdec_h264",
+            (DecoderKind::Libav, Codec::Hevc) => "avdec_h265",
+            (DecoderKind::Libav, Codec::Av1) => "avdec_av1",
+            (DecoderKind::Dav1d, _) => "dav1ddec",
+            (DecoderKind::Aom, _) => "av1dec",
+        }
+    }
+
+    /// The elements that turn the encoded stream into frames. The last is
+    /// named `decoder`.
+    fn description(self, codec: Codec) -> String {
+        let parser = match codec {
+            Codec::H264 => "h264parse",
+            Codec::Hevc => "h265parse",
+            Codec::Av1 => "av1parse",
+        };
+        // Both would otherwise hold on to several frames to work on them
+        // side by side, and hand each out that much later.
+        let settings = match self {
+            DecoderKind::Libav => " thread-type=slice",
+            DecoderKind::Dav1d => " max-frame-delay=1",
+            _ => "",
+        };
+        format!("{parser} ! {} name=decoder{settings}", self.element(codec))
     }
 }
 
@@ -244,16 +499,41 @@ impl Default for ShareSettings {
     }
 }
 
-/// What stands ahead of the encoder in its stage: see
-/// [`Codec::encoder_description`].
+/// What stands ahead of the graphics card's encoder in its stage: see
+/// [`EncoderKind::description`].
 #[cfg(not(windows))]
 const ENCODER_INPUT: &str = "cudaupload ! ";
 #[cfg(windows)]
 const ENCODER_INPUT: &str = "";
+/// What stands ahead of an encoder on the processor in its stage.
+///
+/// The graphics card encodes a frame in less time than there is until the
+/// next. The processor may not: a large picture, HEVC or AV1 can each take
+/// longer. Frames then have to be left out, and the newest is the one to
+/// keep: the queue holds the one frame that waits for the encoder, and a
+/// newer one takes its place. Without it frames would wait in line where
+/// they are captured, each older than the one before when its turn comes.
+///
+/// The frames in the queue are copies in the format the encoder takes,
+/// made by [`SIZING`] on the capturing thread, and not PipeWire's own,
+/// which no screen delivers in that format: see
+/// [`EncoderKind::description`] for why that matters. On Windows they are
+/// brought from the graphics card first.
+#[cfg(not(windows))]
+const SOFTWARE_INPUT: &str = "queue leaky=downstream max-size-buffers=1 max-size-time=0 \
+                              max-size-bytes=0 ! ";
+#[cfg(windows)]
+const SOFTWARE_INPUT: &str = "d3d11download ! videoconvert n-threads=2 \
+                              ! queue leaky=downstream max-size-buffers=1 max-size-time=0 \
+                              max-size-bytes=0 ! ";
+/// The distance between two keyframes that an encoder is told to keep,
+/// where it has to be told one: far enough never to be reached, so that it
+/// sends them only when asked.
+const NO_KEYFRAMES_OF_ITS_OWN: u32 = i32::MAX as u32;
 /// The elements that give frames the size and the format they are encoded
 /// at.
 #[cfg(not(windows))]
-const SIZING: &str = "videoconvert n-threads=2 ! videoscale add-borders=false n-threads=4";
+const SIZING: &str = "videoconvert n-threads=4 ! videoscale add-borders=false n-threads=4";
 // A captured screen is on the graphics card already, and stays there all
 // the way into the encoder. A test picture is taken there first.
 #[cfg(windows)]
@@ -407,6 +687,12 @@ pub struct Sharing {
     /// Frames per second the sharer asked for.
     pub fps: u32,
     pub codec: Codec,
+    /// What does the encoding, by the name people know it by: `NVENC`,
+    /// `x265` and so on. Empty if the sharer does not say.
+    pub encoder: String,
+    /// Whether that runs on the sharer's processor, for want of a graphics
+    /// card that encodes this codec.
+    pub software: bool,
     /// Bitrate the encoder aims for.
     pub kbps: u32,
     /// Frames per second actually sent of late.
@@ -426,6 +712,8 @@ impl Sharing {
             "height": self.height,
             "fps": self.fps,
             "codec": self.codec.id(),
+            "encoder": self.encoder,
+            "software": self.software,
             "kbps": self.kbps,
             "sentFps": self.sent_fps,
             "sourceWidth": self.source_width,
@@ -447,6 +735,8 @@ impl Sharing {
                 Some(id) => Codec::from_id(id)?,
                 None => Codec::H264,
             },
+            encoder: value["encoder"].as_str().unwrap_or_default().to_owned(),
+            software: value["software"].as_bool().unwrap_or(false),
             kbps: number("kbps")?,
             sent_fps: value["sentFps"].as_f64().unwrap_or(0.0),
             source_width: number("sourceWidth").or(number("width"))?,
@@ -532,6 +822,8 @@ pub(crate) struct Encoder {
 
 struct EncoderState {
     settings: ShareSettings,
+    /// Whether the graphics card is left out of the encoding.
+    software_only: bool,
     /// Size of what the source delivers, once known.
     source: Option<(u32, u32)>,
     /// Size and bitrate being sent.
@@ -546,18 +838,24 @@ struct EncoderState {
 struct EncodingStage {
     bin: gst::Bin,
     encoder: gst::Element,
+    kind: EncoderKind,
 }
 
 impl EncodingStage {
-    fn new(codec: Codec) -> Result<Self> {
-        let description = codec.encoder_description();
+    /// A stage that encodes `codec` in the best way this machine has, or
+    /// with `software_only` the best that leaves the graphics card out.
+    fn new(codec: Codec, software_only: bool) -> Result<Self> {
+        let kind = codec
+            .encoder(software_only)
+            .ok_or_else(|| anyhow!("nothing on this machine encodes {}", codec.label()))?;
+        let description = kind.description(codec);
         debug!(%description, "building the encoding stage");
         let bin = gst::parse::bin_from_description(&description, true)
             .with_context(|| format!("cannot encode {} on this machine", codec.label()))?;
         let encoder = bin
             .by_name("encoder")
             .ok_or_else(|| anyhow!("the encoding stage has no encoder"))?;
-        Ok(Self { bin, encoder })
+        Ok(Self { bin, encoder, kind })
     }
 
     /// Puts the stage in place between `size` and `out`.
@@ -590,10 +888,12 @@ pub(crate) struct EncoderStats {
 impl Encoder {
     /// Starts encoding `source`. `clock` and `base_time` are those of the
     /// pipeline the frames are headed for, so that their timestamps can be
-    /// expressed in its terms.
+    /// expressed in its terms. `software_only` leaves the graphics card out
+    /// of the encoding.
     pub fn start(
         source: &ShareSource,
         settings: ShareSettings,
+        software_only: bool,
         clock: &gst::Clock,
         base_time: gst::ClockTime,
         events: impl Fn(EncoderEvent) + Send + Sync + 'static,
@@ -631,13 +931,14 @@ impl Encoder {
         };
         let (rate, size, out) = (by_name("rate")?, by_name("size")?, by_name("out")?);
         let pace = by_name("pace")?;
-        let stage = EncodingStage::new(settings.codec)?;
+        let stage = EncodingStage::new(settings.codec, software_only)?;
         stage.place(&pipeline, &size, &out)?;
         if let ShareSource::Screen(screen) = source {
             screen.apply(&by_name("screen")?);
         }
         let state = Arc::new(Mutex::new(EncoderState {
             settings,
+            software_only,
             source: None,
             format: None,
             stage,
@@ -763,7 +1064,7 @@ impl Encoder {
         let new_stage = if state.settings.codec == settings.codec {
             None
         } else {
-            EncodingStage::new(settings.codec)
+            EncodingStage::new(settings.codec, state.software_only)
                 .inspect_err(|err| {
                     warn!("staying with {}: {err:#}", state.settings.codec.label());
                     settings.codec = state.settings.codec;
@@ -853,6 +1154,13 @@ impl Encoder {
         self.state.lock().unwrap().settings
     }
 
+    /// What does the encoding, by name, and whether it runs on the
+    /// processor.
+    pub fn engine(&self) -> (&'static str, bool) {
+        let kind = self.state.lock().unwrap().stage.kind;
+        (kind.name(), kind.software())
+    }
+
     /// Makes the next frame one that can be decoded on its own.
     pub fn force_keyframe(&self) {
         let event = gst_video::UpstreamForceKeyUnitEvent::builder()
@@ -915,10 +1223,8 @@ impl EncoderState {
         #[cfg(windows)]
         let caps = caps.features([SIZED_MEMORY]);
         size.set_property("caps", caps.build());
-        encoder.set_property("bitrate", kbps);
-        let burst = f64::from(kbps) * FRAMES_OF_BURST / f64::from(fps.max(1));
-        encoder.set_property("vbv-buffer-size", burst.round() as u32);
-        debug!(?source, width, height, kbps, ?codec, "encoder configured");
+        self.stage.kind.set_rate(encoder, kbps, fps);
+        debug!(?source, width, height, kbps, ?codec, kind = ?self.stage.kind, "encoder configured");
         self.format = Some((width, height, kbps));
     }
 }
@@ -927,7 +1233,7 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         // The screen goes first, so that its thread is gone by the time
         // the other elements hand back the frames they still hold. See
-        // `Codec::encoder_description` for what happens otherwise.
+        // `EncoderKind::description` for what happens otherwise.
         if let Some(screen) = self.pipeline.by_name("screen") {
             let _ = screen.set_state(gst::State::Null);
         }
@@ -971,8 +1277,11 @@ pub struct WatchStats {
     pub dropped_percent: f64,
     /// Time from a frame's arrival to it being ready to show.
     pub decode_ms: f64,
-    /// Whether the processor decodes the stream, because the graphics card
-    /// cannot decode its codec.
+    /// What decodes the stream, by the name people know it by: `NVDEC`,
+    /// `dav1d` and so on.
+    pub decoder: &'static str,
+    /// Whether that runs on the processor, for want of a graphics card
+    /// that decodes the stream's codec.
     pub software: bool,
 }
 
@@ -980,8 +1289,10 @@ pub struct WatchStats {
 pub(crate) struct Decoder {
     from: PeerId,
     codec: Codec,
-    /// Whether the processor does the decoding.
-    software: bool,
+    /// What does the decoding.
+    kind: DecoderKind,
+    /// Whether the graphics card is left out of the decoding.
+    software_only: bool,
     frames: FrameSink,
     pipeline: gst::Pipeline,
     input: gst_app::AppSrc,
@@ -992,6 +1303,7 @@ pub(crate) struct Decoder {
     state: Arc<Mutex<DecoderState>>,
     counters: Arc<DecoderCounters>,
     last_read: Mutex<Instant>,
+    started: Instant,
 }
 
 struct DecoderState {
@@ -1088,13 +1400,43 @@ struct DecoderCounters {
 }
 
 /// How many frames can be inside the decoder at once before the oldest are
-/// forgotten. Only the measuring of the delay depends on it.
+/// forgotten. The measuring of the delay depends on it, and it has to be
+/// more than [`FRAMES_BEHIND`].
 const ARRIVALS_KEPT: usize = 64;
+/// How many frames may wait inside a decoder before it counts as having
+/// fallen behind: half a second's worth at 60 frames per second. The
+/// graphics card never comes near it. A processor asked for more than it
+/// can do passes it within seconds.
+const FRAMES_BEHIND: usize = 30;
+/// How long a decoder is left to itself after it starts, in which time it
+/// works off what arrived while it was being set up. It also keeps one
+/// that cannot keep up from asking for a new start more often than this.
+const SETTLING: Duration = Duration::from_secs(3);
 
 impl Decoder {
     /// `max_height` is the tallest the frames are wanted, or zero for the
-    /// size the sharer sends.
-    pub fn start(from: PeerId, frames: FrameSink, max_height: u32, codec: Codec) -> Result<Self> {
+    /// size the sharer sends. `software_only` leaves the graphics card out
+    /// of the decoding.
+    pub fn start(
+        from: PeerId,
+        frames: FrameSink,
+        max_height: u32,
+        codec: Codec,
+        software_only: bool,
+    ) -> Result<Self> {
+        let kinds = codec.decoders_here(software_only);
+        Self::start_with(from, frames, max_height, codec, software_only, kinds)
+    }
+
+    /// Starts a decoder of the first of `kinds` that can be built.
+    fn start_with(
+        from: PeerId,
+        frames: FrameSink,
+        max_height: u32,
+        codec: Codec,
+        software_only: bool,
+        kinds: impl Iterator<Item = DecoderKind>,
+    ) -> Result<Self> {
         // Turning what the decoder puts out into pixels for display, at the
         // size they are shown at, is quick on the graphics card and slow
         // on the processor.
@@ -1109,24 +1451,46 @@ impl Decoder {
         // Encoded frames cannot be skipped, because the ones after them
         // build on them. Decoded ones can, so when preparing frames for
         // display falls behind, frames are dropped ahead of that step.
-        let (decoder, software) = codec.decoder_description();
-        if software {
-            warn!(
+        let build = |kind: DecoderKind| {
+            let description = format!(
+                "appsrc name=in is-live=true format=time caps={} \
+                 ! {} \
+                 ! queue leaky=downstream max-size-buffers=2 max-size-time=0 max-size-bytes=0 \
+                 ! {prepare} \
+                 ! appsink name=out sync=false max-buffers=2 drop=true",
+                codec.caps(),
+                kind.description(codec)
+            );
+            debug!(%description, "building the decoder");
+            gst::parse::launch(&description)
+        };
+        // The best way this machine has. Should its element not take the
+        // settings it is given here, as another version of it might not,
+        // the next best.
+        let mut built = Err(anyhow!("nothing on this machine decodes {}", codec.label()));
+        for kind in kinds {
+            match build(kind) {
+                Ok(pipeline) => {
+                    built = Ok((pipeline, kind));
+                    break;
+                }
+                Err(err) => {
+                    warn!(?kind, "a decoder for {} is of no use: {err}", codec.label());
+                    built = Err(anyhow!(err)
+                        .context(format!("cannot decode {} on this machine", codec.label())));
+                }
+            }
+        }
+        let (pipeline, kind) = built?;
+        if kind.software() {
+            debug!(
                 peer = from,
-                "the graphics card cannot decode {}; the processor does it",
+                ?kind,
+                "the processor decodes {}",
                 codec.label()
             );
         }
-        let description = format!(
-            "appsrc name=in is-live=true format=time caps={} \
-             ! {decoder} \
-             ! queue leaky=downstream max-size-buffers=2 max-size-time=0 max-size-bytes=0 \
-             ! {prepare} \
-             ! appsink name=out sync=false max-buffers=2 drop=true",
-            codec.caps()
-        );
-        let pipeline = gst::parse::launch(&description)
-            .with_context(|| format!("cannot decode {} on this machine", codec.label()))?
+        let pipeline = pipeline
             .downcast::<gst::Pipeline>()
             .map_err(|_| anyhow!("the video decoder is not a pipeline"))?;
         let by_name = |name: &str| {
@@ -1222,7 +1586,8 @@ impl Decoder {
         Ok(Self {
             from,
             codec,
-            software,
+            kind,
+            software_only,
             frames,
             pipeline,
             input,
@@ -1231,7 +1596,23 @@ impl Decoder {
             state,
             counters,
             last_read: Mutex::new(Instant::now()),
+            started: Instant::now(),
         })
+    }
+
+    /// Whether frames arrive faster than they are decoded, so that each is
+    /// shown later than the one before it.
+    ///
+    /// Encoded frames cannot be left out, because the ones after them
+    /// build on them. What is left is to stop where it is and start again
+    /// from a frame that builds on nothing: see where this is asked.
+    pub fn behind(&self) -> bool {
+        // One that shows nothing at all is not slow but broken, and a new
+        // start would not mend it.
+        let shows_frames = self.counters.size.load(Ordering::Relaxed) != 0;
+        shows_frames
+            && self.started.elapsed() >= SETTLING
+            && self.counters.arrivals.lock().unwrap().len() >= FRAMES_BEHIND
     }
 
     /// The codec of the stream it decodes.
@@ -1242,7 +1623,13 @@ impl Decoder {
     /// A decoder like this one for a stream in another codec.
     pub fn for_codec(&self, codec: Codec) -> Result<Self> {
         let max_height = self.state.lock().unwrap().max_height;
-        Self::start(self.from, self.frames.clone(), max_height, codec)
+        Self::start(
+            self.from,
+            self.frames.clone(),
+            max_height,
+            codec,
+            self.software_only,
+        )
     }
 
     /// Changes the tallest the frames are wanted, or with zero asks for
@@ -1297,7 +1684,8 @@ impl Decoder {
             } else {
                 latency_ns as f64 / shown as f64 / 1e6
             },
-            software: self.software,
+            decoder: self.kind.name(),
+            software: self.kind.software(),
         }
     }
 }
@@ -1386,54 +1774,247 @@ mod tests {
         assert_eq!(Codec::from_id("vp12"), None);
     }
 
-    /// An AV1 stream is decoded whatever the graphics card: by it if it
-    /// can, and by the processor if not. The stream is made by an encoder
-    /// that runs on the processor, where there is one.
-    #[test]
-    fn av1_is_decoded_with_or_without_the_graphics_card() {
-        gst::init().unwrap();
-        if gst::ElementFactory::find("svtav1enc").is_none() {
-            eprintln!("skipped: no svtav1enc to make a stream with");
-            return;
-        }
-        let hardware = gst::ElementFactory::find("nvav1dec").is_some();
-        assert_eq!(Codec::Av1.decoder_description().1, !hardware);
+    /// What an [`Encoder`] under test has put out.
+    #[derive(Default)]
+    struct Encoded {
+        /// Each frame: when it came, its size in bytes, and whether it
+        /// can be decoded on its own.
+        frames: Vec<(Instant, usize, bool)>,
+        buffers: Vec<gst::Buffer>,
+        ended: Option<String>,
+    }
 
-        let shown = Arc::new(AtomicU64::new(0));
-        let counted = shown.clone();
-        let frames: FrameSink = Arc::new(move |_, frame| {
-            assert_eq!((frame.width, frame.height), (320, 180));
-            counted.fetch_add(1, Ordering::Relaxed);
-        });
-        let decoder = Decoder::start(7, frames, 0, Codec::Av1).unwrap();
-        let source = gst::parse::launch(&format!(
-            "videotestsrc num-buffers=30 ! video/x-raw,width=320,height=180,framerate=30/1 \
-             ! svtav1enc preset=12 target-bitrate=500 ! av1parse ! {} \
-             ! appsink name=out sync=false",
-            Codec::Av1.caps()
-        ))
-        .unwrap()
-        .downcast::<gst::Pipeline>()
+    impl Encoded {
+        /// Frames per second and kbit/s over the last `seconds`, and how
+        /// many of those frames were keyframes.
+        fn lately(&self, seconds: f64) -> (f64, f64, usize) {
+            let recent = self
+                .frames
+                .iter()
+                .filter(|(at, ..)| at.elapsed().as_secs_f64() <= seconds);
+            let (mut count, mut bytes, mut keyframes) = (0, 0, 0);
+            for (_, size, keyframe) in recent {
+                count += 1;
+                bytes += size;
+                keyframes += usize::from(*keyframe);
+            }
+            (
+                count as f64 / seconds,
+                bytes as f64 * 8.0 / 1000.0 / seconds,
+                keyframes,
+            )
+        }
+    }
+
+    /// Starts encoding a test picture, 60 times a second.
+    fn encode(
+        size: (u32, u32),
+        codec: Codec,
+        kbps: Option<u32>,
+        software_only: bool,
+    ) -> (Encoder, Arc<Mutex<Encoded>>) {
+        let encoded = Arc::new(Mutex::new(Encoded::default()));
+        let log = encoded.clone();
+        let clock = gst::SystemClock::obtain();
+        let settings = ShareSettings {
+            max_height: None,
+            fps: 60,
+            sound: false,
+            codec,
+            kbps,
+        };
+        let source = ShareSource::TestPicture {
+            width: size.0,
+            height: size.1,
+        };
+        let base_time = clock.time();
+        let encoder = Encoder::start(&source, settings, software_only, &clock, base_time, {
+            move |event| {
+                let mut log = log.lock().unwrap();
+                match event {
+                    EncoderEvent::Frame(frame_codec, buffer) => {
+                        assert_eq!(frame_codec, codec);
+                        let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                        log.frames.push((Instant::now(), buffer.size(), keyframe));
+                        log.buffers.push(buffer);
+                    }
+                    EncoderEvent::Format => {}
+                    EncoderEvent::Ended(reason) => {
+                        log.ended = Some(reason.unwrap_or_else(|| "the source ended".into()));
+                    }
+                }
+            }
+        })
         .unwrap();
-        let out = source
-            .by_name("out")
-            .unwrap()
-            .downcast::<gst_app::AppSink>()
-            .unwrap();
-        source.set_state(gst::State::Playing).unwrap();
-        while let Ok(sample) = out.pull_sample() {
-            decoder.push(sample.buffer_owned().unwrap());
-        }
-        source.set_state(gst::State::Null).unwrap();
+        (encoder, encoded)
+    }
 
-        let started = Instant::now();
-        while shown.load(Ordering::Relaxed) == 0 && started.elapsed().as_secs() < 10 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+    fn wait(seconds: f64) {
+        std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+    }
+
+    /// Held by a test that times encoders or decoders on the processor,
+    /// which would take the time from each other if two ran at once.
+    static PROCESSOR: Mutex<()> = Mutex::new(());
+
+    /// Whatever encodes on this machine, the graphics card or the
+    /// processor, does what a call needs of it: it keeps up with the
+    /// picture and to the bitrate, also one set while it runs, and sends a
+    /// keyframe when asked and at no other time.
+    #[test]
+    fn every_encoder_here_does_as_it_is_told() {
+        gst::init().unwrap();
+        let _alone = PROCESSOR
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for codec in Codec::ALL {
+            for software_only in [false, true] {
+                let Some(kind) = codec.encoder(software_only) else {
+                    eprintln!("nothing here encodes {}", codec.label());
+                    continue;
+                };
+                if !software_only && kind.software() {
+                    // The next round is this one again.
+                    continue;
+                }
+                let what = format!("{} by {kind:?}", codec.label());
+                let first = 16_000;
+                let (encoder, encoded) = encode((1280, 720), codec, Some(first), software_only);
+                assert_eq!(encoder.engine(), (kind.name(), kind.software()), "{what}");
+                wait(4.0);
+                assert_eq!(encoder.format(), Some((1280, 720, first)));
+                let (fps, kbps, keyframes) = encoded.lock().unwrap().lately(2.0);
+                eprintln!("{what}: {fps:.1} fps, {kbps:.0} of {first} kbit/s");
+                assert!((55.0..65.0).contains(&fps), "{what}: {fps:.1} fps");
+                assert!(
+                    (0.7..1.3).contains(&(kbps / f64::from(first))),
+                    "{what}: {kbps:.0} of {first} kbit/s"
+                );
+                assert_eq!(keyframes, 0, "{what}: keyframes nobody asked for");
+                let largest = encoded
+                    .lock()
+                    .unwrap()
+                    .frames
+                    .iter()
+                    .skip(60)
+                    .map(|(_, size, _)| *size)
+                    .max()
+                    .unwrap_or(0);
+                let average = f64::from(first) * 1000.0 / 8.0 / 60.0;
+                eprintln!(
+                    "{what}: the largest frame is {:.1} times the average",
+                    largest as f64 / average
+                );
+
+                encoder.force_keyframe();
+                wait(1.0);
+                let (_, _, keyframes) = encoded.lock().unwrap().lately(1.0);
+                assert_eq!(keyframes, 1, "{what}: a keyframe when asked");
+
+                let set = first / 2;
+                encoder.set_settings(ShareSettings {
+                    kbps: Some(set),
+                    ..encoder.settings()
+                });
+                wait(4.0);
+                let (fps, kbps, _) = encoded.lock().unwrap().lately(2.0);
+                eprintln!("{what}: {fps:.1} fps, {kbps:.0} of {set} kbit/s once set");
+                assert!((55.0..65.0).contains(&fps), "{what}: {fps:.1} fps once set");
+                assert!(
+                    (0.7..1.3).contains(&(kbps / f64::from(set))),
+                    "{what}: {kbps:.0} of {set} kbit/s once set"
+                );
+                let stats = encoder.take_stats();
+                eprintln!("{what}: encoded in {:.1} ms", stats.encode_ms);
+                assert!(stats.encode_ms < 50.0, "{what}: {:.1} ms", stats.encode_ms);
+                assert_eq!(encoded.lock().unwrap().ended, None, "{what}");
+            }
         }
-        assert!(shown.load(Ordering::Relaxed) > 0, "no frame was decoded");
-        let stats = decoder.take_stats();
-        assert_eq!((stats.width, stats.height), (320, 180));
-        assert_eq!(stats.software, !hardware);
+    }
+
+    /// Whatever decodes on this machine, the graphics card or the
+    /// processor, makes frames of what each encoder here puts out, and
+    /// says which of the two it is.
+    #[test]
+    fn every_decoder_here_shows_what_was_encoded() {
+        gst::init().unwrap();
+        let _alone = PROCESSOR
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for codec in Codec::ALL {
+            for software_only in [false, true] {
+                let Some(encoder_kind) = codec.encoder(software_only) else {
+                    eprintln!("nothing here encodes {}", codec.label());
+                    continue;
+                };
+                if !software_only && encoder_kind.software() {
+                    // The next round is this one again.
+                    continue;
+                }
+                let (encoder, encoded) = encode((640, 360), codec, None, software_only);
+                wait(2.0);
+                drop(encoder);
+                let stream = std::mem::take(&mut encoded.lock().unwrap().buffers);
+                assert!(
+                    stream.len() > 60,
+                    "{encoder_kind:?}: {} frames",
+                    stream.len()
+                );
+
+                let kinds = codec.decoders().iter().copied();
+                for kind in kinds.filter(|kind| element_exists(kind.element(codec))) {
+                    let what = format!("{} from {encoder_kind:?} by {kind:?}", codec.label());
+                    let shown = Arc::new(AtomicU64::new(0));
+                    let counted = shown.clone();
+                    let frames: FrameSink = Arc::new(move |_, frame| {
+                        assert_eq!((frame.width, frame.height), (640, 360));
+                        counted.fetch_add(1, Ordering::Relaxed);
+                    });
+                    let only = [kind].into_iter();
+                    let decoder = Decoder::start_with(7, frames, 0, codec, false, only).unwrap();
+                    for buffer in &stream {
+                        decoder.push(buffer.clone());
+                        wait(1.0 / 60.0);
+                    }
+                    wait(0.5);
+                    let shown = shown.load(Ordering::Relaxed) as usize;
+                    let stats = decoder.take_stats();
+                    eprintln!(
+                        "{what}: {shown} of {} frames, ready in {:.1} ms",
+                        stream.len(),
+                        stats.decode_ms
+                    );
+                    assert!(shown + 5 >= stream.len(), "{what}: {shown} frames shown");
+                    assert_eq!((stats.width, stats.height), (640, 360), "{what}");
+                    assert_eq!(
+                        (stats.decoder, stats.software),
+                        (kind.name(), kind.software()),
+                        "{what}"
+                    );
+                    assert!(stats.decode_ms < 50.0, "{what}: {:.1} ms", stats.decode_ms);
+                }
+            }
+        }
+    }
+
+    /// Without a graphics card that encodes or decodes, the processor
+    /// stands in for every codec there is a library for.
+    #[test]
+    fn the_processor_stands_in_for_the_graphics_card() {
+        gst::init().unwrap();
+        for ShareCodec {
+            codec, software, ..
+        } in Codec::for_sharing(true)
+        {
+            assert!(software, "{}", codec.label());
+            assert!(codec.decoders_here(true).all(DecoderKind::software));
+        }
+        for choice in Codec::for_sharing(false) {
+            let codec = choice.codec;
+            let hardware = element_exists(EncoderKind::Nvidia.element(codec));
+            assert_eq!(choice.software, !hardware, "{}", codec.label());
+            assert_eq!(choice.encoder == "NVENC", hardware, "{}", codec.label());
+        }
     }
 
     #[test]
@@ -1445,6 +2026,8 @@ mod tests {
             source_height: 1440,
             fps: 60,
             codec: Codec::Hevc,
+            encoder: "x265".into(),
+            software: true,
             kbps: 8700,
             sent_fps: 59.5,
             encode_ms: 4.25,

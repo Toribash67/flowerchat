@@ -163,6 +163,7 @@ fn audio_settings_work_through_the_interface() {
         test_tone: true,
         measure: true,
         frames: None,
+        software_video: false,
         incoming_loss: 0.0,
     };
     let other_session = runtime.spawn(session::run(config, other_commands, other_events));
@@ -387,6 +388,7 @@ fn screens_are_shared_and_watched_through_the_interface() {
         test_tone: true,
         measure: true,
         frames: Some(frames),
+        software_video: false,
         incoming_loss: 0.0,
     };
     let other_session = runtime.spawn(session::run(config, other_commands, other_events));
@@ -517,7 +519,7 @@ fn screens_are_shared_and_watched_through_the_interface() {
             .query_by_label_contains("H.264 · 2.7 Mbps")
             .is_some()
     );
-    pick(&mut harness, 3, "HEVC");
+    pick(&mut harness, 3, "HEVC · NVENC (hardware)");
     pick(&mut harness, 2, "2 Mbps");
     run(&mut harness, 2.0);
     assert!(harness.query_by_label_contains("HEVC · 2.0 Mbps").is_some());

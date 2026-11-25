@@ -19,8 +19,8 @@ use flowerchat_app::theme;
 use flowerchat_app::views::{self, Action, Env, Picture, Screen, UiState};
 use flowerchat_client::audio::{self, AudioDevice, AudioDevices, DeviceWatch, MicCheck};
 use flowerchat_client::session::{
-    self, AudioSettings, Codec, Command, Event, FrameSink, SessionConfig, ShareSettings,
-    ShareSource, VideoFrame,
+    self, AudioSettings, Codec, Command, Event, FrameSink, SessionConfig, ShareCodec,
+    ShareSettings, ShareSource, VideoFrame,
 };
 use flowerchat_client::video::parse_size;
 use flowerchat_protocol::PeerId;
@@ -85,6 +85,10 @@ struct Args {
     /// 1920x1080, instead of asking which screen to share.
     #[arg(long, value_name = "WIDTHxHEIGHT", value_parser = size)]
     share_test: Option<(u32, u32)>,
+    /// Encode and decode video on the processor even where the graphics
+    /// card could.
+    #[arg(long)]
+    software_video: bool,
     /// For testing: lose this many percent of the packets that arrive, as
     /// a poor network would.
     #[arg(long, default_value_t = 0.0)]
@@ -142,8 +146,9 @@ struct App {
     view_height: Option<(PeerId, u32)>,
     /// The size and rate the session was last told to share at.
     share_settings: Option<ShareSettings>,
-    /// The codecs this machine can share a screen in.
-    codecs: Vec<Codec>,
+    /// The codecs this machine can share a screen in, and whether its
+    /// processor would have to encode them.
+    codecs: Vec<ShareCodec>,
     /// When the list of what could be shared was last made.
     choices_listed: Instant,
 }
@@ -213,10 +218,7 @@ impl App {
             view_height: None,
             share_settings: None,
             choices_listed: Instant::now(),
-            codecs: Codec::ALL
-                .into_iter()
-                .filter(|codec| codec.can_encode())
-                .collect(),
+            codecs: Codec::for_sharing(args.software_video),
             args,
         };
         app.list_devices();
@@ -654,6 +656,7 @@ impl App {
             test_tone: self.args.test_tone,
             measure: self.args.measure,
             frames: Some(frames),
+            software_video: self.args.software_video,
             incoming_loss: self.args.lose / 100.0,
         };
 

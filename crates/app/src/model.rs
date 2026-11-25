@@ -481,6 +481,8 @@ mod tests {
             source_height: 1440,
             fps: 60,
             codec: Codec::H264,
+            encoder: "NVENC".into(),
+            software: false,
             kbps: 8700,
             sent_fps: 60.0,
             encode_ms: 4.0,

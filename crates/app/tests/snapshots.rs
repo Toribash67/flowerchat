@@ -12,7 +12,9 @@ use flowerchat_app::settings::{DeviceChoice, SendMode};
 use flowerchat_app::talk::GlobalKey;
 use flowerchat_app::views::{self, Env, Picture, Screen, Tab, UiState};
 use flowerchat_client::audio::{AudioDevice, AudioDevices};
-use flowerchat_client::session::{Codec, ConnectionState, PeerStats, Route, Sharing, WatchStats};
+use flowerchat_client::session::{
+    Codec, ConnectionState, PeerStats, Route, ShareCodec, Sharing, WatchStats,
+};
 
 const WIDE: Vec2 = Vec2::new(1280.0, 720.0);
 const NARROW: Vec2 = Vec2::new(360.0, 640.0);
@@ -106,6 +108,26 @@ fn devices() -> AudioDevices {
     }
 }
 
+/// What a graphics card a few years old leaves to choose from: it encodes
+/// the first two, and the processor has to encode the third.
+const CODECS: [ShareCodec; 3] = [
+    ShareCodec {
+        codec: Codec::H264,
+        encoder: "NVENC",
+        software: false,
+    },
+    ShareCodec {
+        codec: Codec::Hevc,
+        encoder: "NVENC",
+        software: false,
+    },
+    ShareCodec {
+        codec: Codec::Av1,
+        encoder: "libaom",
+        software: true,
+    },
+];
+
 /// An ordinary machine with an open mic.
 fn env(devices: &AudioDevices) -> Env<'_> {
     Env {
@@ -113,7 +135,7 @@ fn env(devices: &AudioDevices) -> Env<'_> {
         global_key: GlobalKey::Off,
         transmitting: true,
         picture: None,
-        codecs: &Codec::ALL,
+        codecs: &CODECS,
     }
 }
 
@@ -125,6 +147,8 @@ fn sharing(watchers: &[u64]) -> Sharing {
         source_height: 1440,
         fps: 60,
         codec: Codec::H264,
+        encoder: "NVENC".into(),
+        software: false,
         kbps: 8700,
         sent_fps: 60.0,
         encode_ms: 4.0,
@@ -160,6 +184,7 @@ fn room_watching() -> RoomModel {
             fps: 59.8,
             dropped_percent: 0.1,
             decode_ms: 3.2,
+            decoder: "NVDEC",
             software: false,
         },
     });
@@ -376,7 +401,7 @@ fn room_wide_push_to_talk() {
         },
         transmitting: false,
         picture: None,
-        codecs: &Codec::ALL,
+        codecs: &CODECS,
     };
     snapshot("room_wide_push_to_talk", WIDE, |ui| {
         views::draw(ui, Screen::Room(&room), &env, &mut state);
@@ -398,7 +423,7 @@ fn room_narrow_audio() {
         ),
         transmitting: false,
         picture: None,
-        codecs: &Codec::ALL,
+        codecs: &CODECS,
     };
     snapshot("room_narrow_audio", NARROW, |ui| {
         views::draw(ui, Screen::Room(&room), &env, &mut state);
@@ -426,6 +451,46 @@ fn room_wide_sharing_our_screen() {
     });
 }
 
+/// Our processor encodes what we share, for want of a graphics card that
+/// encodes the codec picked.
+#[test]
+fn room_wide_sharing_in_software() {
+    let mut room = room();
+    room.me.share = OwnShare::Sharing(Sharing {
+        codec: Codec::Av1,
+        encoder: "libaom".into(),
+        software: true,
+        kbps: 5700,
+        encode_ms: 9.0,
+        ..sharing(&[3, 5])
+    });
+    let mut state = form();
+    state.settings.share_codec = Codec::Av1.id().into();
+    let devices = devices();
+    snapshot("room_wide_sharing_in_software", WIDE, |ui| {
+        views::draw(ui, Screen::Room(&room), &env(&devices), &mut state);
+    });
+}
+
+/// Our processor decodes what we watch, for want of a graphics card that
+/// decodes its codec.
+#[test]
+fn room_stream_decoded_in_software() {
+    let mut room = room_watching();
+    room.peers[0].sharing.as_mut().unwrap().codec = Codec::Av1;
+    let stats = &mut room.watching.as_mut().unwrap().stats;
+    (stats.decoder, stats.software) = ("dav1d", true);
+    let mut state = form();
+    let devices = devices();
+    snapshot_with_picture("room_stream_decoded_in_software", WIDE, |ui, picture| {
+        let env = Env {
+            picture: Some(picture),
+            ..env(&devices)
+        };
+        views::draw(ui, Screen::Room(&room), &env, &mut state);
+    });
+}
+
 #[test]
 fn room_stream() {
     let room = room_watching();
@@ -434,7 +499,7 @@ fn room_stream() {
     snapshot_with_picture("room_stream", WIDE, |ui, picture| {
         let env = Env {
             picture: Some(picture),
-            codecs: &Codec::ALL,
+            codecs: &CODECS,
             ..env(&devices)
         };
         views::draw(ui, Screen::Room(&room), &env, &mut state);
@@ -468,7 +533,7 @@ fn room_maximized() {
     snapshot_with_picture("room_maximized", WIDE, |ui, picture| {
         let env = Env {
             picture: Some(picture),
-            codecs: &Codec::ALL,
+            codecs: &CODECS,
             ..env(&devices)
         };
         views::draw(ui, Screen::Room(&room), &env, &mut state);
@@ -485,7 +550,7 @@ fn room_narrow_screens() {
     snapshot_with_picture("room_narrow_screens", NARROW, |ui, picture| {
         let env = Env {
             picture: Some(picture),
-            codecs: &Codec::ALL,
+            codecs: &CODECS,
             ..env(&devices)
         };
         views::draw(ui, Screen::Room(&room), &env, &mut state);

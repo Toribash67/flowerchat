@@ -68,6 +68,7 @@ fn join(url: &str, name: &str) -> Client {
         test_tone: true,
         measure: true,
         frames: Some(frames),
+        software_video: false,
         incoming_loss: 0.0,
     };
     tokio::spawn(session::run(config, command_rx, event_tx));
