@@ -5,3 +5,21 @@ members = ["crates/app","crates/client","crates/protocol", "crates/server"]
 [profile.release]
 strip = true
 lto = "thin"
+
+# Drawing the letters is slow without optimizing, and all of them are drawn
+# anew when the interface goes from a dark palette to a light one or back,
+# for which the edges of letters are smoothed differently. In a build for
+# trying things out that stopped the window for half a second or more.
+# These are the libraries that do the drawing; optimized, it takes about a
+# hundredth of that.
+[profile.dev.package]
+epaint = { opt-level = 3 }
+skrifa = { opt-level = 3 }
+read-fonts = { opt-level = 3 }
+vello_cpu = { opt-level = 3 }
+vello_common = { opt-level = 3 }
+glifo = { opt-level = 3 }
+fearless_simd = { opt-level = 3 }
+kurbo = { opt-level = 3 }
+peniko = { opt-level = 3 }
+harfrust = { opt-level = 3 }
