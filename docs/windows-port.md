@@ -169,7 +169,7 @@ else can join.
 | Picking what to share | `crates/app/src/screen.rs` | The desktop's own picker through the ScreenCast portal (`ashpd`) | A picker of our own: Windows gives a list of monitors and windows and nothing more. This is new UI, so it wants a proposal first |
 | Stream sound | `crates/client/src/sound.rs` | A recording stream that `pw-link` connects to every other program's output, found with `pw-dump --monitor` | `wasapi2src loopback=true` with `loopback-mode=exclude-process-tree` and `loopback-target-pid` set to our own process. Needs a recent Windows 10 build or Windows 11 |
 | Push-to-talk while the window is in the background | `crates/app/src/talk.rs` | GlobalShortcuts portal | A global hotkey or low-level keyboard hook. It must report the release as well as the press |
-| Preparing frames for display | `Decoder::start` in `video.rs` | `glupload ! glcolorconvert ! glcolorscale ! gldownload` | `d3d11upload ! d3d11convert ! d3d11download`, or leave it: see below |
+| Preparing frames for display | `Decoder::start` in `video.rs` | `glupload ! glcolorconvert ! gleffects effect=identity ! gldownload` | `d3d11upload ! d3d11convert ! d3d11download`, or leave it: see below |
 
 The Linux halves of `screen.rs` and `talk.rs` are behind
 `cfg(target_os = "linux")`, with stubs for everything else that return
