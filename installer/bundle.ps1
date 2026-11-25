@@ -24,16 +24,16 @@ $ErrorActionPreference = 'Stop'
 # element from another plugin, it goes here; `gst-inspect-1.0 ELEMENT` says
 # which plugin that is.
 #
-# openh264, libav and dav1d are for those without a graphics card that
-# encodes or decodes: H.264 both ways, HEVC and AV1 to watch. What would
-# encode those two on the processor stays out: x265 is under the GPL, and
-# GStreamer for Windows has no libaom.
+# openh264, x265, libav and dav1d are for those without a graphics card
+# that encodes or decodes: H.264 and HEVC both ways, and AV1 to watch,
+# since GStreamer for Windows has nothing that encodes it on the processor
+# in a way a call can use. x265 is under the GPL, as flowerchat is.
 $plugins = @(
     'app', 'audioconvert', 'audiomixer', 'audioresample', 'audiotestsrc',
     'coreelements', 'd3d11', 'dav1d', 'debug', 'dtls', 'level', 'libav',
     'nice', 'nvcodec', 'openh264', 'opus', 'rsrtp', 'rtp', 'rtpmanager',
     'sctp', 'srtp', 'videoconvertscale', 'videoparsersbad', 'videorate',
-    'videotestsrc', 'volume', 'wasapi2', 'webrtc', 'webrtcdsp'
+    'videotestsrc', 'volume', 'wasapi2', 'webrtc', 'webrtcdsp', 'x265'
 )
 
 # The names of the libraries a program or library asks Windows to load with
@@ -97,6 +97,7 @@ while ($waiting.Count -gt 0) {
 }
 
 Copy-Item "$PSScriptRoot\THIRD-PARTY.txt" $Out
+Copy-Item "$PSScriptRoot\..\LICENSE" "$Out\LICENSE.txt"
 
 $files = Get-ChildItem -Recurse -File $Out
 '{0} files, {1:N0} MB in {2}' -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB), (Resolve-Path $Out)

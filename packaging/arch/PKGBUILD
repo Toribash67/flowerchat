@@ -12,9 +12,8 @@ pkgrel=1
 pkgdesc='Voice chat and screen sharing for a small group of friends'
 arch=('x86_64')
 url='https://github.com/Toribash67/flowerchat'
-# No licence has been chosen for flowerchat itself yet. The font it carries
-# is under the SIL Open Font License.
-license=('LicenseRef-unknown' 'OFL-1.1')
+# The font flowerchat carries is under the SIL Open Font License.
+license=('GPL-3.0-or-later' 'OFL-1.1')
 depends=(
   'gcc-libs' 'glibc' 'glib2' 'openssl'
   # GStreamer, which does the sound, the calls and the screens. The bad

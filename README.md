@@ -339,6 +339,14 @@ Watchtower on the host picks it up.
 The app and the command-line client reach a server behind TLS with a
 `wss://` address, such as `wss://chat.example.org/ws`.
 
+## Licence
+
+flowerchat is free software under the GNU General Public License, version 3
+or later: see `LICENSE`. Version 3 and not 2, because some of what it is
+built on is under the Apache License 2.0, which only goes together with
+the later one. The font the app carries, Inter, is under the SIL Open Font
+License (`crates/app/assets/Inter-LICENSE.txt`).
+
 ## Tests
 
 ```sh

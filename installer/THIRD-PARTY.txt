@@ -1,7 +1,12 @@
-flowerchat comes with parts of GStreamer 1.28 and the libraries GStreamer
-itself is built on, unchanged, as the GStreamer project distributes them
-for Windows: the files in bin\ other than flowerchat's own programs, and
-everything in lib\ and libexec\.
+flowerchat is free software under the GNU General Public License, version 3
+or later: see LICENSE.txt. Its source code is at
+
+    https://github.com/Toribash67/flowerchat
+
+It comes with parts of GStreamer 1.28 and the libraries GStreamer itself is
+built on, unchanged, as the GStreamer project distributes them for Windows:
+the files in bin\ other than flowerchat's own programs, and everything in
+lib\ and libexec\.
 
 GStreamer is free software under the GNU Lesser General Public License,
 version 2.1 or later. Its source code, and the licenses of the libraries it
@@ -9,5 +14,8 @@ brings along (among them GLib, libnice, OpenSSL, Opus, libsrtp, usrsctp,
 dav1d, OpenH264, FFmpeg and the WebRTC audio processing library), are at
 
     https://gstreamer.freedesktop.org/
+
+One of those libraries, x265, is under the GNU General Public License,
+version 2 or later, and so is the GStreamer plugin that uses it.
 
 You may replace any of these files with a build of your own.

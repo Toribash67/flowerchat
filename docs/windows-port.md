@@ -121,12 +121,12 @@ Found on the way:
   libde265 nor libaom, so HEVC is decoded by FFmpeg (`avdec_h265`), which
   has decoded nothing on Linux either, and AV1 is not encoded on the
   processor at all: `svtav1enc` is there but stops after one frame in the
-  mode a call needs (see `EncoderKind::Aom`). And the installer leaves
-  out x265, which is under the GPL, so without a card that encodes it
-  HEVC is not offered there. That leaves a friend without an NVIDIA card
-  sharing in H.264 and watching all three. The bundle gained the
-  `openh264` and `libav` plugins for it and has not been built since:
-  the size below is from before, and FFmpeg's libraries will add to it.
+  mode a call needs (see `EncoderKind::Aom`). That leaves a friend without
+  an NVIDIA card sharing in H.264 and HEVC and watching all three. The
+  bundle gained the `openh264`, `x265` and `libav` plugins for it and has
+  not been built since: the size below is from before, and FFmpeg's and
+  x265's libraries will add to it. x265 is under the GPL, which is why
+  flowerchat took the GPL for itself (`LICENSE`, version 3 or later).
 
 Still to do:
 
@@ -262,7 +262,7 @@ $env:PKG_CONFIG_PATH = "$gst\lib\pkgconfig"
 
 - `cargo build --release`. Release builds of the app have no console
   window, so they print nothing; debug builds keep it.
-- `bundle.ps1` gathers the programs, the 29 GStreamer plugins the
+- `bundle.ps1` gathers the programs, the 30 GStreamer plugins the
   pipelines use, and the libraries those ask for, read from their import
   tables: 56 MB in `target\bundle`, of GStreamer's 1.1 GB. A pipeline that
   gains an element from another plugin needs that plugin added to the list
