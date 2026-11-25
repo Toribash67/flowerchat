@@ -111,6 +111,7 @@ async fn a_share_survives_being_pushed() {
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
     let config = Config {
         ice_servers: vec![],
+        releases: None,
     };
     tokio::spawn(async move { axum::serve(listener, app(config)).await.unwrap() });
 

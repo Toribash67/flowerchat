@@ -17,6 +17,9 @@ RUN cargo build --release --locked -p flowerchat-server
 
 FROM alpine:3
 
+# The server asks GitHub over HTTPS which installers the page offers.
+RUN apk add --no-cache ca-certificates
+
 # Inside the container the server listens on every interface; what reaches
 # it from outside is up to the port mapping and the reverse proxy.
 ENV FLOWERCHAT_LISTEN=0.0.0.0:80

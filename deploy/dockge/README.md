@@ -19,8 +19,26 @@ between the people in a call and never pass through it.
    repository, either make the package public or log in to GHCR on the
    TrueNAS host and give Watchtower the same login.
 3. Start the stack. `http://<truenas-host>:18084/healthz` answers `ok`, and
-   `http://<truenas-host>:18084/` shows the browser test page.
+   `http://<truenas-host>:18084/` shows the web page.
 4. Point a subdomain at it in nginx, as below.
+
+## Downloads
+
+The web page offers the installers attached to the repository's latest
+release, which needs nothing set up while the repository is public.
+`https://chat.flowerboi.se/api/release` lists what the page offers, and
+`https://chat.flowerboi.se/download/windows` starts the download of the
+latest Windows installer.
+
+Should the repository become private, the server needs a token to see its
+releases: a fine-grained token (Settings → Developer settings), for only
+this repository, with read-only access to Contents and nothing else, set as
+`FLOWERCHAT_GITHUB_TOKEN` under `environment` in `compose.yml`. Such tokens
+expire, a year at most. Without a working token, the page says that no
+installer has been published yet, and the server's log says why.
+
+The server reaches out to `api.github.com` for this, at most every five
+minutes. Nothing else needs to reach it.
 
 ## nginx
 

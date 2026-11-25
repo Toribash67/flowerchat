@@ -140,6 +140,7 @@ fn audio_settings_work_through_the_interface() {
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
         let config = Config {
             ice_servers: vec![],
+            releases: None,
         };
         tokio::spawn(async move {
             axum::serve(listener, flowerchat_server::app(config))
@@ -325,6 +326,7 @@ fn serve(runtime: &tokio::runtime::Runtime) -> String {
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
         let config = Config {
             ice_servers: vec![],
+            releases: None,
         };
         tokio::spawn(async move {
             axum::serve(listener, flowerchat_server::app(config))
@@ -654,6 +656,7 @@ fn what_to_share_is_chosen_in_the_window() {
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
         let config = Config {
             ice_servers: vec![],
+            releases: None,
         };
         tokio::spawn(async move {
             axum::serve(listener, flowerchat_server::app(config))

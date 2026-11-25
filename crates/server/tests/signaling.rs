@@ -21,6 +21,7 @@ async fn start_server() -> String {
             username: None,
             credential: None,
         }],
+        releases: None,
     };
     tokio::spawn(async move { axum::serve(listener, app(config)).await.unwrap() });
     format!("ws://{addr}/ws")

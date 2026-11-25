@@ -154,6 +154,7 @@ async fn a_shared_screen_reaches_whoever_watches() {
     // No STUN server: the two clients find each other on local addresses.
     let config = Config {
         ice_servers: vec![],
+        releases: None,
     };
     tokio::spawn(async move { axum::serve(listener, app(config)).await.unwrap() });
 

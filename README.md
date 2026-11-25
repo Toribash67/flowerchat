@@ -7,7 +7,8 @@ find each other.
 ## Layout
 
 - `crates/protocol`: the signaling messages shared by server and clients.
-- `crates/server`: the signaling server. It also serves a browser test client.
+- `crates/server`: the signaling server. It also serves the web page: a
+  smaller flowerchat for the browser, and the downloads of the app.
 - `crates/client`: the client engine (signaling, calls, audio, screen
   sharing) and a command-line client built on it.
 - `crates/app`: the desktop app, a window on top of the same engine.
@@ -27,12 +28,49 @@ Configuration is through environment variables:
 | --- | --- | --- |
 | `FLOWERCHAT_LISTEN` | `127.0.0.1:8080` | Address to listen on. |
 | `FLOWERCHAT_ICE_SERVERS` | a public STUN server | JSON array of ICE servers in `RTCIceServer` form, sent to every client. |
+| `FLOWERCHAT_RELEASES` | `Toribash67/flowerchat` | GitHub repository, as `owner/name`, whose latest release the page offers. Empty offers none. |
+| `FLOWERCHAT_GITHUB_TOKEN` | none | A token that may read that repository. Only needed if it is private. |
 
 Browsers only allow microphone access on `localhost` or over HTTPS, so anything
 beyond local testing needs to sit behind a TLS reverse proxy.
 
-The test page accepts `?name=…&room=…` to prefill the form, and `&autojoin` to
-join without clicking.
+### The web page
+
+The page is flowerchat for those who have not installed it, or are not at
+their own computer: voice and chat with whoever is in a room, app or
+browser, a volume per person with the same figures for each connection as
+the app, mute and deafen, and the choice of microphone and speakers with
+the browser's echo cancellation, noise suppression and automatic volume.
+Screens are not shared or watched there; it says who shares one, and links
+to the app. Below 900 px wide it goes to one column with tabs, like the app,
+and it follows the system in choosing a light or a dark palette.
+
+Before joining, it also offers the installers of the latest release on
+GitHub, with the one for the visitor's system first. `/download/windows`
+always leads to the latest Windows installer, whatever its version, which
+makes a link to hand out. Which release is latest is asked of GitHub at
+most every five minutes, and a download goes straight to GitHub; the
+installer does not pass through the server. A release is made by pushing a
+tag like `v0.1.0`, which builds the Windows installer and attaches it.
+Until there is one, the page says that nothing has been published yet.
+
+Were the repository private again, its files could only be had with a
+token: a fine-grained one for this repository alone, with read access to
+its contents and nothing else, given to the server as
+`FLOWERCHAT_GITHUB_TOKEN`. The server then gets an address valid for a few
+minutes from GitHub for every download. Without the token, a private
+repository looks to the server as if it had no release.
+
+`?room=…` fills in the room, which is what the Invite button copies.
+`?name=…` fills in the name, and `&autojoin` joins without clicking, for
+scripted tests.
+
+Two things about the app shape what the page sends. Whoever was in the room
+first makes the offer, the browser included. And GStreamer, under the app,
+turns down an answer in which a media section the browser refused lacks ICE
+credentials or a DTLS role, as browsers write them; Firefox refuses the
+app's HEVC video, for one. The page copies those into such sections of what
+it sends.
 
 ## Running the app
 

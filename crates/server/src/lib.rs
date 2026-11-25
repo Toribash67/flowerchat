@@ -2,22 +2,33 @@
 //!
 //! Keeps track of who is in which room and relays WebRTC signaling between
 //! peers. Media never passes through here.
+//!
+//! It also serves the web page: a smaller flowerchat that talks and chats
+//! from the browser, and links to the installers of the latest release.
+
+mod releases;
+
+pub use releases::ReleasesConfig;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::Json;
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::{Html, IntoResponse};
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use flowerchat_protocol::{
     ClientMsg, IceServer, MAX_NAME_LEN, MAX_ROOM_SIZE, PeerId, PeerInfo, ServerMsg,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use releases::{Lookup, Releases};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -36,6 +47,8 @@ const OUTBOX_CAPACITY: usize = 256;
 pub struct Config {
     /// Handed to every client in its `welcome`.
     pub ice_servers: Vec<IceServer>,
+    /// Where the page finds installers to offer. Without it, it offers none.
+    pub releases: Option<ReleasesConfig>,
 }
 
 pub fn app(config: Config) -> Router {
@@ -43,16 +56,64 @@ pub fn app(config: Config) -> Router {
         rooms: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         ice_servers: config.ice_servers,
+        releases: config.releases.map(Releases::new),
     }));
     Router::new()
-        .route("/", get(index))
+        .route("/", get(|| page("text/html; charset=utf-8", PAGE)))
+        .route("/style.css", get(|| page("text/css; charset=utf-8", STYLE)))
+        .route(
+            "/app.js",
+            get(|| page("text/javascript; charset=utf-8", SCRIPT)),
+        )
+        .route("/icon.png", get(|| page("image/png", ICON)))
+        .route("/api/release", get(latest_release))
+        .route("/download/{file}", get(download))
         .route("/healthz", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../static/index.html"))
+const PAGE: &[u8] = include_bytes!("../static/index.html");
+const STYLE: &[u8] = include_bytes!("../static/style.css");
+const SCRIPT: &[u8] = include_bytes!("../static/app.js");
+/// The app's own icon, so that the page's tab looks like the app.
+const ICON: &[u8] = include_bytes!("../../app/assets/icon.png");
+
+async fn page(content_type: &'static str, body: &'static [u8]) -> Response {
+    // Checked again on every load, so that a new version of the page
+    // never meets an old version of its script.
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// The latest release and the installers it has, for the page to list.
+async fn latest_release(State(state): State<AppState>) -> Response {
+    let Some(releases) = &state.0.releases else {
+        let body = json!({ "error": "This server offers no downloads." });
+        return (StatusCode::NOT_FOUND, Json(body)).into_response();
+    };
+    match releases.latest().await {
+        Lookup::Found(release) => Json(json!({ "release": release })).into_response(),
+        Lookup::None => Json(json!({ "release": null })).into_response(),
+        Lookup::Failed(err) => {
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": err }))).into_response()
+        }
+    }
+}
+
+/// Sends the browser to an installer of the latest release, named by its
+/// file name or by its platform, such as `/download/windows`.
+async fn download(State(state): State<AppState>, Path(file): Path<String>) -> Response {
+    match &state.0.releases {
+        Some(releases) => releases.download(&file).await,
+        None => (StatusCode::NOT_FOUND, "This server offers no downloads.").into_response(),
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -71,6 +132,7 @@ struct Shared {
     rooms: Mutex<HashMap<String, Room>>,
     next_id: AtomicU64,
     ice_servers: Vec<IceServer>,
+    releases: Option<Releases>,
 }
 
 #[derive(Clone)]
