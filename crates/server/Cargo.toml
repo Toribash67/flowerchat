@@ -1,12 +1,12 @@
 [package]
 name = "flowerchat-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
-flowerchat-protocol = { version = "0.1.0", path = "../protocol" }
+flowerchat-protocol = { version = "0.2.0", path = "../protocol" }
 futures-util = "0.3.34"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

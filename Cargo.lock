@@ -1522,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "flowerchat-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "flowerchat-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1572,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "flowerchat-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1580,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "flowerchat-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "flowerchat-protocol",
