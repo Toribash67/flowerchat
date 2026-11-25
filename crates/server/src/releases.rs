@@ -310,8 +310,14 @@ pub fn platform_of(name: &str) -> Option<&'static str> {
     let ends = |suffixes: &[&str]| suffixes.iter().any(|suffix| name.ends_with(suffix));
     if ends(&[".exe", ".msi", ".msix"]) {
         Some("windows")
-    } else if ends(&[".appimage", ".deb", ".rpm", ".flatpak"])
-        || (name.contains("linux") && ends(&[".tar.gz", ".tar.xz", ".tar.zst", ".zip"]))
+    } else if ends(&[
+        ".appimage",
+        ".deb",
+        ".rpm",
+        ".flatpak",
+        ".pkg.tar.zst",
+        ".pkg.tar.xz",
+    ]) || (name.contains("linux") && ends(&[".tar.gz", ".tar.xz", ".tar.zst", ".zip"]))
     {
         Some("linux")
     } else if ends(&[".dmg", ".pkg"]) {
@@ -334,6 +340,14 @@ mod tests {
         );
         assert_eq!(platform_of("flowerchat_0.1.0_amd64.deb"), Some("linux"));
         assert_eq!(platform_of("flowerchat-0.1.0-linux.tar.gz"), Some("linux"));
+        assert_eq!(
+            platform_of("flowerchat-0.1.0-1-x86_64.pkg.tar.zst"),
+            Some("linux")
+        );
+        assert_eq!(
+            platform_of("flowerchat-0.1.0-1-x86_64.pkg.tar.zst.sig"),
+            None
+        );
         assert_eq!(platform_of("flowerchat-0.1.0.tar.gz"), None);
         assert_eq!(platform_of("SHA256SUMS"), None);
         assert_eq!(platform_of("flowerchat-0.1.0-setup.exe.sha256"), None);

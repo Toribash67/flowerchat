@@ -1095,6 +1095,7 @@ async function showDownloads() {
   const mine = myPlatform();
   const assets = [...release.assets].sort((a, b) => (b.platform === mine) - (a.platform === mine));
   const labelOf = (asset) => {
+    if (/\.pkg\.tar\.(zst|xz)$/.test(asset.name)) return 'Arch Linux';
     const kind = asset.name.match(/\.(AppImage|deb|rpm|flatpak|msi|dmg)$/i);
     return `${PLATFORMS[asset.platform] || asset.platform}${kind ? ` (.${kind[1]})` : ''}`;
   };
@@ -1120,7 +1121,9 @@ async function showDownloads() {
   const missing = mine && !release.assets.some((asset) => asset.platform === mine)
     ? ` There is nothing for ${PLATFORMS[mine]} yet; the browser works there.`
     : '';
-  note.textContent = `${release.name}${when}.${missing}`;
+  const arch = release.assets.find((asset) => /\.pkg\.tar\.(zst|xz)$/.test(asset.name));
+  const howTo = arch ? ` On Arch Linux, install it with sudo pacman -U ${arch.name}.` : '';
+  note.textContent = `${release.name}${when}.${missing}${howTo}`;
 
   // In a room, a pointer to the app for what the browser cannot do.
   const ours = release.assets.find((asset) => asset.platform === mine);

@@ -1,0 +1,75 @@
+# The Arch Linux package of the app and the command-line client, built from
+# the checkout this file is in, whatever is there:
+#
+#   cd packaging/arch && makepkg -si
+#
+# The version is the app's, from crates/app/Cargo.toml. A tag like v0.1.0
+# also builds it on GitHub and attaches it to the release.
+
+pkgname=flowerchat
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Voice chat and screen sharing for a small group of friends'
+arch=('x86_64')
+url='https://github.com/Toribash67/flowerchat'
+# No licence has been chosen for flowerchat itself yet. The font it carries
+# is under the SIL Open Font License.
+license=('LicenseRef-unknown' 'OFL-1.1')
+depends=(
+  'gcc-libs' 'glibc' 'glib2' 'openssl'
+  # GStreamer, which does the sound, the calls and the screens.
+  'gstreamer' 'gst-plugins-base' 'gst-plugins-base-libs'
+  'gst-plugins-good' 'gst-plugins-bad' 'gst-plugins-bad-libs'
+  'gst-plugin-pipewire' 'libnice'
+  # pw-dump and pw-link, for the sound of a shared screen.
+  'pipewire'
+  # Microphones and speakers are opened through the PulseAudio protocol.
+  'pulse-native-provider'
+  # The window, on Wayland or X11.
+  'libglvnd' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
+  'libx11' 'libxcursor' 'libxi' 'libxrandr'
+)
+makedepends=('cargo' 'pkgconf')
+optdepends=(
+  'nvidia-utils: sharing and watching screens (NVENC and NVDEC)'
+  'xdg-desktop-portal: choosing what to share, and push-to-talk in every window'
+)
+# Cargo makes its own optimized, stripped build.
+options=('!lto' '!debug')
+
+_root="$(realpath "${startdir:-$PWD}/../..")"
+
+pkgver() {
+  sed -n 's/^version = "\(.*\)"/\1/p' "$_root/crates/app/Cargo.toml" | head -n1
+}
+
+prepare() {
+  cd "$_root"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_root"
+  export RUSTUP_TOOLCHAIN=stable
+  # Apart from the checkout's own target directory, which holds builds made
+  # with other flags.
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --frozen --release -p flowerchat-app -p flowerchat-client
+}
+
+package() {
+  local target="$srcdir/target/release"
+  install -Dm755 "$target/flowerchat" "$pkgdir/usr/bin/flowerchat"
+  install -Dm755 "$target/flowerchat-cli" "$pkgdir/usr/bin/flowerchat-cli"
+
+  # The launcher entry, under exactly this name: the desktop gives the
+  # push-to-talk shortcut only to apps it can identify by it.
+  local assets="$_root/crates/app/assets"
+  install -Dm644 "$assets/se.flowerboi.flowerchat.desktop" \
+    "$pkgdir/usr/share/applications/se.flowerboi.flowerchat.desktop"
+  install -Dm644 "$assets/icon.png" \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/se.flowerboi.flowerchat.png"
+  install -Dm644 "$assets/Inter-LICENSE.txt" \
+    "$pkgdir/usr/share/licenses/$pkgname/Inter-LICENSE.txt"
+}

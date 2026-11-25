@@ -3,6 +3,7 @@ Type=Application
 Name=flowerchat
 Comment=Voice chat for a small group of friends
 Exec=flowerchat
+Icon=se.flowerboi.flowerchat
 Terminal=false
 Categories=Network;Chat;
 StartupWMClass=flowerchat

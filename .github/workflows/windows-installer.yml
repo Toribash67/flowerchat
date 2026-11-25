@@ -1,7 +1,8 @@
 name: Windows installer
 
 # Builds the installer that friends on Windows run. Every run keeps it as
-# an artifact; a tag like v0.1.0 also puts it on a release of that name.
+# an artifact; a tag like v0.1.0 also puts it on a release of that name,
+# beside the Arch package.
 on:
   push:
     tags:
@@ -57,6 +58,7 @@ jobs:
           path: target/installer/*.exe
           if-no-files-found: error
 
+      # The Arch package's workflow may have made the release already.
       - name: Put installer on the release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -64,4 +66,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $installer = (Get-Item target/installer/*.exe).FullName
-          gh release create $env:GITHUB_REF_NAME $installer --title $env:GITHUB_REF_NAME --generate-notes
+          gh release view $env:GITHUB_REF_NAME *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:GITHUB_REF_NAME $installer --clobber
+          } else {
+            gh release create $env:GITHUB_REF_NAME $installer --title $env:GITHUB_REF_NAME --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'the installer could not be put on the release' }

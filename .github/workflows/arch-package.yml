@@ -1,0 +1,84 @@
+name: Arch package
+
+# Builds the Arch Linux package from packaging/arch, checks that what it
+# depends on is enough to run, and keeps it as an artifact. A tag like
+# v0.1.0 also puts it on the release of that name, beside the Windows
+# installer. Run by hand, it can put the package on an existing release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release to put the package on, such as v0.1.0. Empty keeps it as an artifact only."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    permissions:
+      contents: write
+    env:
+      RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Install git and the GitHub CLI
+        run: pacman -Syu --noconfirm --needed git github-cli
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # What the PKGBUILD says it needs, and nothing more, so that a missing
+      # dependency shows here and not on someone's machine.
+      - name: Install what the package needs
+        working-directory: packaging/arch
+        run: |
+          source PKGBUILD
+          pacman -S --noconfirm --needed "${depends[@]}" "${makedepends[@]}"
+
+      # makepkg refuses to run as root.
+      - name: Build package
+        run: |
+          useradd --create-home builder
+          chown -R builder .
+          cd packaging/arch
+          sudo -u builder makepkg --noconfirm
+          ls -l ./*.pkg.tar.zst
+
+      - name: Check that it runs
+        run: |
+          pacman -U --noconfirm packaging/arch/*.pkg.tar.zst
+          flowerchat-cli --help > /dev/null
+          # The parts of GStreamer a call and a share go through.
+          for element in webrtcbin nicesrc dtlssrtpenc sctpenc opusenc opusdec \
+              rtpopuspay rtpopusdepay webrtcdsp level volume audiomixer \
+              pulsesrc pulsesink pipewiresrc rtpjitterbuffer \
+              h264parse h265parse rtph264pay rtph265pay; do
+            gst-inspect-1.0 --exists "$element" || { echo "missing $element"; exit 1; }
+          done
+
+      - name: Keep package
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowerchat-arch
+          path: packaging/arch/*.pkg.tar.zst
+          if-no-files-found: error
+
+      # The Windows installer's workflow may have made the release already.
+      - name: Put package on the release
+        if: env.RELEASE != ''
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if gh release view "$RELEASE" > /dev/null 2>&1; then
+            gh release upload "$RELEASE" packaging/arch/*.pkg.tar.zst --clobber
+          else
+            gh release create "$RELEASE" packaging/arch/*.pkg.tar.zst --title "$RELEASE" --generate-notes
+          fi

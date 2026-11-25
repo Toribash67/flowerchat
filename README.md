@@ -87,6 +87,12 @@ On Windows nobody but a developer needs any of that: `installer\build.ps1`
 makes one installer that brings along the parts of GStreamer flowerchat
 uses.
 
+On Arch Linux, `packaging/arch` has a package of the app and the
+command-line client, with the launcher entry and the GStreamer parts they
+need as dependencies. `makepkg -si` in that directory builds the checkout
+and installs it. Each release on GitHub also carries the package built
+there, which `sudo pacman -U` installs; the web page offers it.
+
 ```sh
 cargo run -p flowerchat-app
 ```
@@ -198,7 +204,8 @@ is turned on. Which key triggers it is then set in the desktop, not in the
 app.
 
 Desktops only give such shortcuts to apps they can identify, so the launcher
-entry has to be installed, under exactly this name:
+entry has to be installed, under exactly this name. The Arch package does
+that; otherwise:
 
 ```sh
 install -Dm644 crates/app/assets/se.flowerboi.flowerchat.desktop \
