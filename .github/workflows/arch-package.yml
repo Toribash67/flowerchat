@@ -23,6 +23,11 @@ jobs:
     name: Build package
     runs-on: ubuntu-latest
     container: archlinux:base-devel
+    # In a container, steps would otherwise run in sh, which the PKGBUILD's
+    # arrays are not written for.
+    defaults:
+      run:
+        shell: bash
     permissions:
       contents: write
     env:
@@ -41,7 +46,7 @@ jobs:
       - name: Install what the package needs
         working-directory: packaging/arch
         run: |
-          source PKGBUILD
+          source ./PKGBUILD
           pacman -S --noconfirm --needed "${depends[@]}" "${makedepends[@]}"
 
       # makepkg refuses to run as root.
