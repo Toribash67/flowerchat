@@ -1,6 +1,6 @@
 [package]
 name = "flowerchat-app"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -12,8 +12,8 @@ eframe = { version = "0.36", features = ["persistence"] }
 egui = "0.36"
 egui-phosphor = "0.14.0"
 egui_extras = "0.36"
-flowerchat-client = { version = "0.2.1", path = "../client" }
-flowerchat-protocol = { version = "0.2.1", path = "../protocol" }
+flowerchat-client = { version = "0.3.0", path = "../client" }
+flowerchat-protocol = { version = "0.3.0", path = "../protocol" }
 futures-util = "0.3.34"
 gstreamer = "0.25.4"
 serde = { version = "1.0.229", features = ["derive"] }

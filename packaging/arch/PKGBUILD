@@ -7,7 +7,7 @@
 # also builds it on GitHub and attaches it to the release.
 
 pkgname=flowerchat
-pkgver=0.2.1
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='Voice chat and screen sharing for a small group of friends'
 arch=('x86_64')

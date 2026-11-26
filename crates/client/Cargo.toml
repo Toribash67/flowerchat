@@ -1,13 +1,13 @@
 [package]
 name = "flowerchat-client"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1.0.105"
 clap = { version = "4.6.9", features = ["derive"] }
-flowerchat-protocol = { version = "0.2.1", path = "../protocol" }
+flowerchat-protocol = { version = "0.3.0", path = "../protocol" }
 futures-util = "0.3.34"
 gstreamer = "0.25.4"
 gstreamer-app = "0.25.2"
