@@ -6,11 +6,13 @@
 //! It also serves the web page: a smaller flowerchat that talks and chats
 //! from the browser, and links to the installers of the latest release.
 
+pub mod invites;
 mod releases;
 
 pub use releases::ReleasesConfig;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,10 +25,11 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use flowerchat_protocol::{
-    ClientMsg, IceServer, MAX_NAME_LEN, MAX_ROOM_SIZE, PeerId, PeerInfo, ServerMsg,
+    ClientMsg, IceServer, MAX_NAME_LEN, MAX_ROOM_SIZE, PeerId, PeerInfo, RoomInfo, ServerMsg,
 };
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use invites::Invites;
 use releases::{Lookup, Releases};
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -49,14 +52,22 @@ pub struct Config {
     pub ice_servers: Vec<IceServer>,
     /// Where the page finds installers to offer. Without it, it offers none.
     pub releases: Option<ReleasesConfig>,
+    /// The file of invites. With it, only those invited may join a room;
+    /// without it, anyone who reaches the server may.
+    pub invites: Option<PathBuf>,
+    /// The rooms that are always there to join, in the order clients list
+    /// them. Any other room exists for as long as someone is in it.
+    pub rooms: Vec<String>,
 }
 
 pub fn app(config: Config) -> Router {
     let state = AppState(Arc::new(Shared {
-        rooms: Mutex::new(HashMap::new()),
+        state: Mutex::new(Rooms::default()),
+        listed: config.rooms,
         next_id: AtomicU64::new(1),
         ice_servers: config.ice_servers,
         releases: config.releases.map(Releases::new),
+        invites: config.invites.map(Invites::new),
     }));
     Router::new()
         .route("/", get(|| page("text/html; charset=utf-8", PAGE)))
@@ -67,6 +78,7 @@ pub fn app(config: Config) -> Router {
         )
         .route("/icon.png", get(|| page("image/png", ICON)))
         .route("/api/release", get(latest_release))
+        .route("/api/server", get(about))
         .route("/download/{file}", get(download))
         .route("/healthz", get(|| async { "ok" }))
         .route("/ws", get(ws_handler))
@@ -90,6 +102,12 @@ async fn page(content_type: &'static str, body: &'static [u8]) -> Response {
         body,
     )
         .into_response()
+}
+
+/// What a client needs to know before it joins: whether to ask for an
+/// invite.
+async fn about(State(state): State<AppState>) -> Response {
+    Json(json!({ "invites": state.0.invites.is_some() })).into_response()
 }
 
 /// The latest release and the installers it has, for the page to list.
@@ -128,11 +146,28 @@ struct Peer {
 
 type Room = HashMap<PeerId, Peer>;
 
+/// A connection that is told which rooms there are and who is in them.
+struct Watcher {
+    outbox: mpsc::Sender<ServerMsg>,
+    /// The rooms its invite is for, which are all it is told about. Empty
+    /// means every room.
+    only: Vec<String>,
+}
+
+#[derive(Default)]
+struct Rooms {
+    rooms: HashMap<String, Room>,
+    watchers: HashMap<PeerId, Watcher>,
+}
+
 struct Shared {
-    rooms: Mutex<HashMap<String, Room>>,
+    state: Mutex<Rooms>,
+    /// The rooms that are there even with nobody in them.
+    listed: Vec<String>,
     next_id: AtomicU64,
     ice_servers: Vec<IceServer>,
     releases: Option<Releases>,
+    invites: Option<Invites>,
 }
 
 #[derive(Clone)]
@@ -146,7 +181,8 @@ impl AppState {
         name: String,
         outbox: mpsc::Sender<ServerMsg>,
     ) -> Result<PeerId, &'static str> {
-        let mut rooms = self.0.rooms.lock().unwrap();
+        let mut state = self.0.state.lock().unwrap();
+        let rooms = &mut state.rooms;
         if rooms
             .get(room_name)
             .is_some_and(|r| r.len() >= MAX_ROOM_SIZE)
@@ -183,30 +219,91 @@ impl AppState {
             },
         );
         room.insert(id, Peer { name, outbox });
+        self.announce(&state);
         Ok(id)
     }
 
+    /// Starts telling a connection about the rooms, beginning now.
+    fn watch(&self, only: Vec<String>, outbox: mpsc::Sender<ServerMsg>) -> PeerId {
+        let mut state = self.0.state.lock().unwrap();
+        let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
+        let rooms = self.listing(&state, &only);
+        deliver(id, &outbox, ServerMsg::Rooms { rooms });
+        state.watchers.insert(id, Watcher { outbox, only });
+        id
+    }
+
+    fn unwatch(&self, id: PeerId) {
+        self.0.state.lock().unwrap().watchers.remove(&id);
+    }
+
+    /// Tells everyone watching how the rooms stand.
+    fn announce(&self, state: &Rooms) {
+        for (&id, watcher) in &state.watchers {
+            let rooms = self.listing(state, &watcher.only);
+            deliver(id, &watcher.outbox, ServerMsg::Rooms { rooms });
+        }
+    }
+
+    /// The rooms to show someone whose invite is for `only`, or for every
+    /// room if that is empty: the rooms that are always there, then the
+    /// invite's own, then whichever others have someone in them.
+    fn listing(&self, state: &Rooms, only: &[String]) -> Vec<RoomInfo> {
+        let mut names: Vec<&String> = self.0.listed.iter().collect();
+        names.extend(only.iter().filter(|name| !self.0.listed.contains(name)));
+        let mut others: Vec<&String> = state
+            .rooms
+            .keys()
+            .filter(|name| !names.contains(name))
+            .collect();
+        others.sort();
+        names.extend(others);
+        names
+            .into_iter()
+            .filter(|name| only.is_empty() || only.contains(name))
+            .map(|name| {
+                let mut peers: Vec<PeerInfo> = state
+                    .rooms
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .map(|(&id, peer)| PeerInfo {
+                        id,
+                        name: peer.name.clone(),
+                    })
+                    .collect();
+                // Ids are handed out in order, so this is the order of arrival.
+                peers.sort_by_key(|peer| peer.id);
+                RoomInfo {
+                    name: name.clone(),
+                    peers,
+                }
+            })
+            .collect()
+    }
+
     fn relay(&self, room_name: &str, from: PeerId, to: PeerId, data: serde_json::Value) {
-        let rooms = self.0.rooms.lock().unwrap();
+        let state = self.0.state.lock().unwrap();
         // The target may have just left; that is not an error.
-        if let Some(peer) = rooms.get(room_name).and_then(|room| room.get(&to)) {
+        if let Some(peer) = state.rooms.get(room_name).and_then(|room| room.get(&to)) {
             deliver(to, &peer.outbox, ServerMsg::Signal { from, data });
         }
     }
 
     fn leave(&self, room_name: &str, id: PeerId) {
-        let mut rooms = self.0.rooms.lock().unwrap();
-        let Some(room) = rooms.get_mut(room_name) else {
+        let mut state = self.0.state.lock().unwrap();
+        let Some(room) = state.rooms.get_mut(room_name) else {
             return;
         };
         room.remove(&id);
         if room.is_empty() {
-            rooms.remove(room_name);
-            return;
+            state.rooms.remove(room_name);
+        } else {
+            for (&other, peer) in room.iter() {
+                deliver(other, &peer.outbox, ServerMsg::PeerLeft { id });
+            }
         }
-        for (&other, peer) in room.iter() {
-            deliver(other, &peer.outbox, ServerMsg::PeerLeft { id });
-        }
+        self.announce(&state);
     }
 }
 
@@ -220,28 +317,43 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (sink, mut stream) = socket.split();
 
     let joined = tokio::time::timeout(JOIN_TIMEOUT, next_client_msg(&mut stream)).await;
-    let (room, name) = match joined {
-        Ok(Some(ClientMsg::Join { room, name })) => (room, name),
+    let (room, name, invite) = match joined {
+        Ok(Some(ClientMsg::Join { room, name, invite })) => (room, name, invite),
+        Ok(Some(ClientMsg::Watch { invite })) => return watch(sink, stream, state, invite).await,
         Ok(None) => return,
         _ => return reject(sink, "expected a join message").await,
     };
     if !valid_name(&room) || !valid_name(&name) {
         return reject(sink, "room and name must be 1 to 64 bytes").await;
     }
+    // On a server that invites, whose invite this is. It is for the log:
+    // the others in the room see the name the peer chose.
+    let invited = match &state.0.invites {
+        Some(invites) => match invites.check(invite.as_deref(), &room) {
+            Ok(invited) => Some(invited),
+            Err(refusal) => {
+                info!(%name, %room, ?refusal, "turned away");
+                return reject(sink, refusal.message()).await;
+            }
+        },
+        None => None,
+    };
 
     let (outbox, inbox) = mpsc::channel(OUTBOX_CAPACITY);
     let id = match state.join(&room, name.clone(), outbox) {
         Ok(id) => id,
         Err(reason) => return reject(sink, reason).await,
     };
-    info!(peer = id, %name, %room, "joined");
+    info!(peer = id, %name, %room, invite = invited.as_deref(), "joined");
 
     let mut writer = tokio::spawn(write_loop(sink, inbox));
     loop {
         tokio::select! {
             msg = next_client_msg(&mut stream) => match msg {
                 Some(ClientMsg::Signal { to, data }) => state.relay(&room, id, to, data),
-                Some(ClientMsg::Join { .. }) => debug!(peer = id, "ignoring repeated join"),
+                Some(ClientMsg::Join { .. } | ClientMsg::Watch { .. }) => {
+                    debug!(peer = id, "ignoring a second join")
+                }
                 None => break,
             },
             // The socket stopped accepting writes.
@@ -252,6 +364,33 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // Removing the peer drops its outbox sender, which ends the writer.
     state.leave(&room, id);
     info!(peer = id, %room, "left");
+}
+
+/// Keeps a connection told about the rooms until it closes.
+async fn watch(
+    sink: SplitSink<WebSocket, Message>,
+    mut stream: SplitStream<WebSocket>,
+    state: AppState,
+    invite: Option<String>,
+) {
+    let only = match &state.0.invites {
+        Some(invites) => match invites.find(invite.as_deref()) {
+            Ok(invite) => invite.rooms,
+            Err(refusal) => return reject(sink, refusal.message()).await,
+        },
+        None => Vec::new(),
+    };
+    let (outbox, inbox) = mpsc::channel(OUTBOX_CAPACITY);
+    let id = state.watch(only, outbox);
+    let mut writer = tokio::spawn(write_loop(sink, inbox));
+    loop {
+        tokio::select! {
+            // It has nothing to say, but its pongs show that it is there.
+            msg = next_client_msg(&mut stream) => if msg.is_none() { break },
+            _ = &mut writer => break,
+        }
+    }
+    state.unwatch(id);
 }
 
 /// Waits for the next well-formed client message. Returns `None` once the

@@ -63,6 +63,7 @@ fn join(url: &str, name: &str) -> Client {
         server: url.into(),
         room: "lounge".into(),
         name: name.into(),
+        invite: None,
         audio: AudioSettings::default(),
         transmitting: true,
         test_tone: true,
@@ -113,6 +114,8 @@ async fn a_share_survives_being_pushed() {
     let config = Config {
         ice_servers: vec![],
         releases: None,
+        invites: None,
+        rooms: vec![],
     };
     tokio::spawn(async move { axum::serve(listener, app(config)).await.unwrap() });
 

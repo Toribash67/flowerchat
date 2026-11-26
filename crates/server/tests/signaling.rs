@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use flowerchat_protocol::{ClientMsg, IceServer, MAX_ROOM_SIZE, PeerId, PeerInfo, ServerMsg};
+use flowerchat_protocol::{
+    ClientMsg, IceServer, MAX_ROOM_SIZE, PeerId, PeerInfo, RoomInfo, ServerMsg,
+};
 use flowerchat_server::{Config, app};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -13,6 +15,12 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 const STUN: &str = "stun:test.invalid:3478";
 
 async fn start_server() -> String {
+    start_server_with(None).await
+}
+
+/// Starts a server that lets in only those invited in the file at `invites`,
+/// or anyone if there is no such file.
+async fn start_server_with(invites: Option<std::path::PathBuf>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let config = Config {
@@ -22,6 +30,8 @@ async fn start_server() -> String {
             credential: None,
         }],
         releases: None,
+        invites,
+        rooms: vec!["lounge".into(), "games".into()],
     };
     tokio::spawn(async move { axum::serve(listener, app(config)).await.unwrap() });
     format!("ws://{addr}/ws")
@@ -45,6 +55,7 @@ impl Client {
             .send(&ClientMsg::Join {
                 room: room.into(),
                 name: name.into(),
+                invite: None,
             })
             .await;
         match client.recv().await {
@@ -127,6 +138,7 @@ async fn welcome_carries_the_configured_ice_servers() {
         .send(&ClientMsg::Join {
             room: "lounge".into(),
             name: "alice".into(),
+            invite: None,
         })
         .await;
     match client.recv().await {
@@ -165,6 +177,7 @@ async fn a_full_room_refuses_newcomers() {
     late.send(&ClientMsg::Join {
         room: "lounge".into(),
         name: "late".into(),
+        invite: None,
     })
     .await;
     assert_eq!(
@@ -173,6 +186,157 @@ async fn a_full_room_refuses_newcomers() {
             message: "room is full".into()
         }
     );
+}
+
+#[tokio::test]
+async fn a_server_with_invites_lets_in_only_those_invited() {
+    let path =
+        std::env::temp_dir().join(format!("flowerchat-ws-invites-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let token = flowerchat_server::invites::invite(&path, "anna", &["lounge".into()]).unwrap();
+    let url = start_server_with(Some(path.clone())).await;
+
+    let refused = |room: &'static str, invite: Option<String>| {
+        let url = url.clone();
+        async move {
+            let mut client = Client::connect(&url).await;
+            client
+                .send(&ClientMsg::Join {
+                    room: room.into(),
+                    name: "anna".into(),
+                    invite,
+                })
+                .await;
+            match client.recv().await {
+                ServerMsg::Error { message } => Some(message),
+                ServerMsg::Welcome { .. } => None,
+                other => panic!("expected a welcome or an error, got {other:?}"),
+            }
+        }
+    };
+
+    assert_eq!(
+        refused("lounge", None).await.as_deref(),
+        Some("this server needs an invite")
+    );
+    assert_eq!(
+        refused("lounge", Some("made-up".into())).await.as_deref(),
+        Some("this invite is not valid, or no longer")
+    );
+    assert_eq!(
+        refused("games", Some(token.clone())).await.as_deref(),
+        Some("this invite is not for this room")
+    );
+    assert_eq!(refused("lounge", Some(token.clone())).await, None);
+    // A pasted link works as well as the token in it.
+    let link = format!("https://chat.example.org/?invite={token}");
+    assert_eq!(refused("lounge", Some(link)).await, None);
+
+    // Taking the invite back needs no restart.
+    assert!(flowerchat_server::invites::revoke(&path, "anna").unwrap());
+    assert_eq!(
+        refused("lounge", Some(token)).await.as_deref(),
+        Some("this invite is not valid, or no longer")
+    );
+}
+
+/// What a watching connection is told next, as room names with the names
+/// of those in each.
+async fn rooms(client: &mut Client) -> Vec<(String, Vec<String>)> {
+    match client.recv().await {
+        ServerMsg::Rooms { rooms } => rooms
+            .into_iter()
+            .map(|RoomInfo { name, peers }| {
+                (name, peers.into_iter().map(|peer| peer.name).collect())
+            })
+            .collect(),
+        other => panic!("expected the rooms, got {other:?}"),
+    }
+}
+
+fn room(name: &str, peers: &[&str]) -> (String, Vec<String>) {
+    (
+        name.into(),
+        peers.iter().map(|peer| (*peer).into()).collect(),
+    )
+}
+
+#[tokio::test]
+async fn a_watcher_is_told_who_is_in_which_room() {
+    let url = start_server().await;
+    let mut watcher = Client::connect(&url).await;
+    watcher.send(&ClientMsg::Watch { invite: None }).await;
+    assert_eq!(
+        rooms(&mut watcher).await,
+        [room("lounge", &[]), room("games", &[])]
+    );
+
+    let (alice, ..) = Client::join(&url, "games", "alice").await;
+    assert_eq!(
+        rooms(&mut watcher).await,
+        [room("lounge", &[]), room("games", &["alice"])]
+    );
+    let (_bob, ..) = Client::join(&url, "games", "bob").await;
+    assert_eq!(
+        rooms(&mut watcher).await,
+        [room("lounge", &[]), room("games", &["alice", "bob"])]
+    );
+    // A room nobody set up is there while someone is in it.
+    let (carol, ..) = Client::join(&url, "attic", "carol").await;
+    assert_eq!(
+        rooms(&mut watcher).await,
+        [
+            room("lounge", &[]),
+            room("games", &["alice", "bob"]),
+            room("attic", &["carol"])
+        ]
+    );
+    drop(carol);
+    assert_eq!(
+        rooms(&mut watcher).await,
+        [room("lounge", &[]), room("games", &["alice", "bob"])]
+    );
+    drop(alice);
+    assert_eq!(
+        rooms(&mut watcher).await,
+        [room("lounge", &[]), room("games", &["bob"])]
+    );
+}
+
+#[tokio::test]
+async fn a_watcher_sees_only_the_rooms_of_its_invite() {
+    let path =
+        std::env::temp_dir().join(format!("flowerchat-ws-watch-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let everywhere = flowerchat_server::invites::invite(&path, "anna", &[]).unwrap();
+    let attic = flowerchat_server::invites::invite(&path, "bo", &["attic".into()]).unwrap();
+    let url = start_server_with(Some(path)).await;
+
+    let mut uninvited = Client::connect(&url).await;
+    uninvited.send(&ClientMsg::Watch { invite: None }).await;
+    assert_eq!(
+        uninvited.recv().await,
+        ServerMsg::Error {
+            message: "this server needs an invite".into()
+        }
+    );
+
+    let mut anna = Client::connect(&url).await;
+    anna.send(&ClientMsg::Watch {
+        invite: Some(everywhere),
+    })
+    .await;
+    assert_eq!(
+        rooms(&mut anna).await,
+        [room("lounge", &[]), room("games", &[])]
+    );
+
+    let mut bo = Client::connect(&url).await;
+    bo.send(&ClientMsg::Watch {
+        invite: Some(attic),
+    })
+    .await;
+    assert_eq!(rooms(&mut bo).await, [room("attic", &[])]);
 }
 
 #[tokio::test]

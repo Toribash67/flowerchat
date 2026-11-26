@@ -23,7 +23,7 @@ const MAX_TIMELINE = 500;
 // What is remembered between visits. Storage may be unavailable (private
 // windows, blocked site data), in which case nothing is remembered.
 const settings = Object.assign(
-  { name: '', room: 'lounge', mic: '', speaker: '', echo: true, noise: true, gain: true, volumes: {} },
+  { name: '', room: 'lounge', invite: '', mic: '', speaker: '', echo: true, noise: true, gain: true, volumes: {} },
   readSettings(),
 );
 
@@ -326,6 +326,9 @@ if (navigator.mediaDevices) {
 // ---------------------------------------------------------------------------
 // The call.
 
+/** Whether the field for another room holds what the user put there. */
+let roomTyped = false;
+
 const call = {
   ws: null,
   joined: false,
@@ -339,6 +342,8 @@ const call = {
   peers: new Map(),
   /** Why the last attempt to be in a room ended, if not by leaving. */
   ending: null,
+  /** The room last asked for, to try again without a microphone. */
+  wanted: '',
 };
 
 function sendToServer(msg) {
@@ -353,20 +358,24 @@ function bytes(s) {
   return new TextEncoder().encode(s).length;
 }
 
-async function join(withMic) {
+/** Joins `room`: the one clicked in the list, or the one typed. */
+async function join(withMic, room = $('room').value.trim()) {
   const name = $('name').value.trim();
-  const room = $('room').value.trim();
+  const invite = inviteIn($('invite-token').value);
   const problem = !name ? 'Enter a name.'
-    : !room ? 'Enter a room.'
+    : !room ? 'Enter the name of a room, or pick one from the list.'
+    : !invite && !$('invite-field').hidden ? 'This server needs an invite. Enter the token you were sent.'
     : bytes(name) > MAX_NAME_BYTES ? 'That name is too long.'
     : bytes(room) > MAX_NAME_BYTES ? 'That room name is too long.'
     : null;
   showJoinError(problem);
   if (problem) return;
 
+  call.wanted = room;
   settings.name = name;
   settings.room = room;
   saveSettings();
+  useInvite(invite);
   audio();
 
   $('join-button').disabled = true;
@@ -388,7 +397,7 @@ async function join(withMic) {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${scheme}://${location.host}/ws`);
   call.ws = ws;
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room, name }));
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'join', room, name, invite: invite || undefined }));
   ws.onmessage = (event) => {
     let msg;
     try {
@@ -404,6 +413,149 @@ async function join(withMic) {
       || (call.joined ? 'The connection to the server was lost.' : 'The server could not be reached.');
     leave(reason);
   };
+}
+
+/** Leaves the room we are in for another one, with or without a
+    microphone as we were. */
+function moveTo(room) {
+  const withMic = mic.live;
+  leave();
+  join(withMic, room);
+}
+
+// The token in what was pasted: the token itself, or a link carrying it.
+function inviteIn(pasted) {
+  const text = pasted.trim();
+  const at = text.indexOf('invite=');
+  return (at < 0 ? text : text.slice(at + 'invite='.length)).split(/[&#]/)[0];
+}
+
+// Asks the server whether it only lets invited people in, and shows the
+// field for the invite if so. An older server does not answer, and has no
+// invites.
+async function askAboutInvites() {
+  try {
+    const response = await fetch('/api/server');
+    if (response.ok && (await response.json()).invites) $('invite-field').hidden = false;
+  } catch {
+    // Joining will tell.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The rooms there are and who is in them, which the server tells over a
+// connection of its own, before joining and in a room alike.
+
+const rooms = {
+  ws: null,
+  /** The rooms as last told, or null while they are not known. */
+  list: null,
+  /** Why the server will not tell, if it said so. */
+  refusal: null,
+  /** The invite the connection was opened with. */
+  invite: '',
+  retryMs: 1000,
+  timer: null,
+};
+
+/** Asks for the rooms, in place of any connection that already does. */
+function watchRooms() {
+  clearTimeout(rooms.timer);
+  if (rooms.ws) {
+    rooms.ws.onclose = null;
+    rooms.ws.close();
+  }
+  rooms.invite = settings.invite;
+  rooms.refusal = null;
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${scheme}://${location.host}/ws`);
+  rooms.ws = ws;
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'watch', invite: rooms.invite || undefined }));
+  ws.onmessage = (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (msg.type === 'rooms' && Array.isArray(msg.rooms)) {
+      rooms.list = msg.rooms;
+      rooms.retryMs = 1000;
+      renderRooms();
+    } else if (msg.type === 'error') {
+      rooms.refusal = String(msg.message);
+    }
+  };
+  ws.onclose = () => {
+    if (rooms.ws !== ws) return;
+    rooms.ws = null;
+    rooms.list = null;
+    renderRooms();
+    // A server that said no says the same when asked again: one that wants
+    // an invite, or one from before rooms were listed, which gives up
+    // waiting for a join. A connection that just dropped is tried again,
+    // after longer and longer.
+    if (rooms.refusal) return;
+    rooms.timer = setTimeout(watchRooms, rooms.retryMs);
+    rooms.retryMs = Math.min(rooms.retryMs * 2, 30000);
+  };
+}
+
+/** Remembers the invite, and asks for the rooms anew if it changed: which
+    rooms are told of depends on it. */
+function useInvite(invite) {
+  settings.invite = invite;
+  saveSettings();
+  if (invite !== rooms.invite) watchRooms();
+}
+
+/** One room of the list: its name to click, and under it who is there. */
+function roomEntry(room) {
+  const current = call.joined && room.name === call.room;
+  const row = document.createElement('button');
+  row.type = 'button';
+  row.className = current ? 'room-row current' : 'room-row';
+  if (current) row.setAttribute('aria-current', 'true');
+  row.title = current ? 'You are here' : `Join ${room.name}`;
+  row.innerHTML = icon('speaker');
+  const name = document.createElement('span');
+  name.textContent = room.name;
+  row.append(name);
+  row.addEventListener('click', () => {
+    if (current || $('join-button').disabled) return;
+    if (call.joined) moveTo(room.name);
+    else join(true, room.name);
+  });
+
+  const peers = Array.isArray(room.peers) ? room.peers : [];
+  if (!peers.length) return [row];
+  const members = document.createElement('ul');
+  members.className = 'members';
+  for (const peer of peers) {
+    const member = document.createElement('li');
+    const me = current && peer.id === call.myId;
+    member.textContent = me ? `${peer.name} (you)` : peer.name;
+    if (me) member.className = 'you';
+    members.append(member);
+  }
+  return [row, members];
+}
+
+function renderRooms() {
+  const list = rooms.list || [];
+  // Each list gets rows of its own: an element is in one place only.
+  for (const id of ['lobby-rooms', 'room-rooms']) {
+    $(id).replaceChildren(...list.flatMap(roomEntry));
+  }
+  $('room-rooms-section').hidden = !rooms.list;
+  const note = !rooms.refusal ? null
+    : rooms.refusal.includes('invite')
+      ? (rooms.invite ? `The server said: ${rooms.refusal}.` : 'Enter your invite to see the rooms.')
+    : 'This server does not list its rooms. Enter the name of one below.';
+  $('rooms-note').hidden = !note;
+  $('rooms-note').textContent = note || '';
+  // The room typed last time is in the list now, to click.
+  if (!roomTyped && list.some((room) => room.name === $('room').value)) $('room').value = '';
 }
 
 function showJoinError(text) {
@@ -460,6 +612,7 @@ function enterRoom() {
   history.replaceState(null, '', `?room=${encodeURIComponent(call.room)}`);
   log(`You joined ${call.room}`);
   renderMic();
+  renderRooms();
 }
 
 /** Leaves the room, if in one, and shows the lobby with `reason`, if any. */
@@ -481,6 +634,7 @@ function leave(reason) {
   showJoinError(reason || null);
   document.title = 'flowerchat';
   renderMic();
+  renderRooms();
 }
 
 // One connection per peer. Whoever has the lower id makes the offer, as the
@@ -723,15 +877,17 @@ $('mute').addEventListener('click', async () => {
 $('deafen').addEventListener('click', () => setDeafened(!call.deafened));
 $('leave').addEventListener('click', () => leave());
 
-$('invite').addEventListener('click', async () => {
+// The link carries the room and nothing else: not the invite of whoever
+// copied it.
+$('copy-link').addEventListener('click', async () => {
   const link = `${location.origin}/?room=${encodeURIComponent(call.room)}`;
   try {
     await navigator.clipboard.writeText(link);
-    $('invite').textContent = 'Link copied';
+    $('copy-link').textContent = 'Link copied';
   } catch {
     window.prompt('A link to this room:', link);
   }
-  setTimeout(() => { $('invite').textContent = 'Invite'; }, 2000);
+  setTimeout(() => { $('copy-link').textContent = 'Copy room link'; }, 2000);
 });
 
 function icon(name) {
@@ -1145,13 +1301,30 @@ $('join').addEventListener('submit', (event) => {
   event.preventDefault();
   join(true);
 });
-$('join-listening').addEventListener('click', () => join(false));
+$('join-listening').addEventListener('click', () => join(false, call.wanted));
+// An invite typed or pasted in shows its rooms without waiting for a join.
+$('invite-token').addEventListener('change', () => useInvite(inviteIn($('invite-token').value)));
+$('room').addEventListener('input', () => { roomTyped = true; });
 
 // ?name=…&room=… fills in the form, and &autojoin joins straight away,
-// which scripted tests use. An invite link carries only the room.
+// which scripted tests use. The link from Copy room link carries only
+// the room. ?invite=… is the token a person was sent: it is remembered, and
+// taken out of the address so that it is not passed on with it.
 const params = new URLSearchParams(location.search);
 $('name').value = params.get('name') || settings.name;
+// The room of last time is filled in for a server that lists no rooms. One
+// that does has it to click, and the field is emptied unless it was typed
+// in or came with the address, or the page is to join by itself.
 $('room').value = params.get('room') || settings.room || 'lounge';
+roomTyped = params.has('room') || params.has('autojoin');
+if (params.has('invite')) {
+  settings.invite = inviteIn(params.get('invite'));
+  saveSettings();
+  params.delete('invite');
+  const rest = params.toString();
+  history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : ''));
+}
+$('invite-token').value = settings.invite;
 if (!$('name').value) $('name').focus();
 
 if (!window.RTCPeerConnection || !navigator.mediaDevices) {
@@ -1164,4 +1337,7 @@ if (!window.RTCPeerConnection || !navigator.mediaDevices) {
 renderMic();
 listDevices();
 showDownloads();
-if (params.has('autojoin') && !$('join-button').disabled) join(true);
+watchRooms();
+askAboutInvites().then(() => {
+  if (params.has('autojoin') && !$('join-button').disabled) join(true);
+});

@@ -8,6 +8,7 @@ license = "GPL-3.0-or-later"
 axum = { version = "0.8.9", features = ["ws"] }
 flowerchat-protocol = { version = "0.2.1", path = "../protocol" }
 futures-util = "0.3.34"
+ring = "0.17"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }

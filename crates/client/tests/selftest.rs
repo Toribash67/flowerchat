@@ -41,6 +41,8 @@ async fn two_clients_hear_each_other() {
     let config = Config {
         ice_servers: vec![],
         releases: None,
+        invites: None,
+        rooms: vec![],
     };
     tokio::spawn(async move { axum::serve(listener, app(config)).await.unwrap() });
 

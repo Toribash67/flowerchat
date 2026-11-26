@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use flowerchat_client::session::{ConnectionState, Event, PeerStats, Sharing, WatchStats};
-use flowerchat_protocol::PeerId;
+use flowerchat_protocol::{PeerId, RoomInfo};
 
 /// Louder than this counts as speaking.
 const SPEAKING_ABOVE_DB: f32 = -40.0;
@@ -15,6 +15,28 @@ const SPEAKING_ABOVE_DB: f32 = -40.0;
 const SPEAKING_HOLD: Duration = Duration::from_millis(300);
 /// The bottom of the level meters. Quieter than this shows as empty.
 const METER_FLOOR_DB: f32 = -60.0;
+
+/// What the server has said about its rooms and who is in them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Directory {
+    /// Asked, and not answered yet.
+    #[default]
+    Asking,
+    Listed(Vec<RoomInfo>),
+    /// There is no list, and this is why: the server cannot be reached, or
+    /// is from before it listed its rooms.
+    Unavailable(String),
+}
+
+impl Directory {
+    /// The rooms to choose from, if the server named any.
+    pub fn rooms(&self) -> Option<&[RoomInfo]> {
+        match self {
+            Self::Listed(rooms) if !rooms.is_empty() => Some(rooms),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RoomModel {

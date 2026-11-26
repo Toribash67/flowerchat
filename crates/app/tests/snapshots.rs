@@ -1,12 +1,13 @@
 //! Renders each screen from a fixed model and compares it with the image in
 //! `tests/snapshots`. Run with `UPDATE_SNAPSHOTS=1` to accept new output.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use egui::Vec2;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use flowerchat_app::model::{Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
+use flowerchat_app::model::{Directory, Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
 use flowerchat_app::screen::{Choice, Choices};
 use flowerchat_app::settings::{DeviceChoice, SendMode};
 use flowerchat_app::talk::GlobalKey;
@@ -15,6 +16,7 @@ use flowerchat_client::audio::{AudioDevice, AudioDevices};
 use flowerchat_client::session::{
     Codec, ConnectionState, PeerStats, Route, ShareCodec, Sharing, WatchStats,
 };
+use flowerchat_protocol::{PeerInfo, RoomInfo};
 
 const WIDE: Vec2 = Vec2::new(1280.0, 720.0);
 const NARROW: Vec2 = Vec2::new(360.0, 640.0);
@@ -128,9 +130,59 @@ const CODECS: [ShareCodec; 3] = [
     },
 ];
 
+/// A server's rooms, with these people in them.
+fn directory(rooms: &[(&str, &[&str])]) -> Directory {
+    let mut id = 0;
+    Directory::Listed(
+        rooms
+            .iter()
+            .map(|(name, people)| RoomInfo {
+                name: (*name).into(),
+                peers: people
+                    .iter()
+                    .map(|name| {
+                        id += 1;
+                        PeerInfo {
+                            id,
+                            name: (*name).into(),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect(),
+    )
+}
+
+/// The rooms as someone in the lounge of [`room`] is told of them.
+static ROOMS: LazyLock<Directory> = LazyLock::new(|| {
+    directory(&[
+        ("lounge", &["alex", "sam", "kim", "jo", "robin", "charlie"]),
+        ("games", &["mika", "noor"]),
+        ("quiet corner", &[]),
+    ])
+});
+
+/// The same server, to someone who is yet to join a room.
+static ROOMS_FROM_OUTSIDE: LazyLock<Directory> = LazyLock::new(|| {
+    directory(&[
+        ("lounge", &["alex", "sam", "kim", "jo"]),
+        ("games", &["mika", "noor"]),
+        ("quiet corner", &[]),
+    ])
+});
+
+/// An ordinary machine, not in a room.
+fn lobby_env(devices: &AudioDevices) -> Env<'_> {
+    Env {
+        rooms: &ROOMS_FROM_OUTSIDE,
+        ..env(devices)
+    }
+}
+
 /// An ordinary machine with an open mic.
 fn env(devices: &AudioDevices) -> Env<'_> {
     Env {
+        rooms: &ROOMS,
         devices,
         global_key: GlobalKey::Off,
         transmitting: true,
@@ -240,7 +292,21 @@ fn snapshot_with_picture(name: &str, size: Vec2, mut draw: impl FnMut(&mut egui:
     });
 }
 
+/// Held while a test draws. Each test draws with a graphics device of its
+/// own, and on Windows, through Direct3D 12, several of them at work at
+/// once ended about two runs in five with an access violation.
+static DRAWING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Waits for the turn to draw. A test that failed while it had the turn
+/// does not take it from the others.
+fn turn() -> std::sync::MutexGuard<'static, ()> {
+    DRAWING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn snapshot(name: &str, size: Vec2, mut draw: impl FnMut(&mut egui::Ui)) {
+    let _turn = turn();
     let mut harness = Harness::builder()
         .with_size(size)
         .with_pixels_per_point(1.0)
@@ -268,7 +334,7 @@ fn lobby_wide() {
         mic_level: 0.42,
     };
     snapshot("lobby_wide", WIDE, |ui| {
-        views::draw(ui, screen(), &env(&devices), &mut state);
+        views::draw(ui, screen(), &lobby_env(&devices), &mut state);
     });
 }
 
@@ -282,7 +348,7 @@ fn lobby_with_error() {
             error: Some("cannot reach the signaling server at wss://chat.example.org/ws"),
             mic_level: 0.0,
         };
-        views::draw(ui, screen, &env(&devices), &mut state);
+        views::draw(ui, screen, &lobby_env(&devices), &mut state);
     });
 }
 
@@ -395,6 +461,7 @@ fn room_wide_push_to_talk() {
     });
     let devices = devices();
     let env = Env {
+        rooms: &ROOMS,
         devices: &devices,
         global_key: GlobalKey::Ready {
             trigger: String::new(),
@@ -416,6 +483,7 @@ fn room_narrow_audio() {
     state.settings.send = SendMode::WhileKeyHeld;
     let devices = devices();
     let env = Env {
+        rooms: &ROOMS,
         devices: &devices,
         global_key: GlobalKey::Unavailable(
             "the desktop does not know this app (is se.flowerboi.flowerchat.desktop installed?)"
@@ -564,6 +632,7 @@ fn lobby_choosing_colours() {
     let mut state = form();
     let devices = devices();
     {
+        let _turn = turn();
         let mut harness = Harness::builder()
             .with_size(WIDE)
             .with_pixels_per_point(1.0)
@@ -574,7 +643,7 @@ fn lobby_choosing_colours() {
                     error: None,
                     mic_level: 0.42,
                 };
-                views::draw(ui, screen, &env(&devices), &mut state);
+                views::draw(ui, screen, &lobby_env(&devices), &mut state);
             });
         harness.run();
         harness.get_by_label("Colours").click();

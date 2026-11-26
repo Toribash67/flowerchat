@@ -8,17 +8,17 @@ use std::time::Duration;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align, Align2, Button, CentralPanel, ComboBox, CornerRadius, FontId, Frame, Layout, Margin,
-    Panel, Popup, PopupCloseBehavior, Rect, RichText, ScrollArea, Sense, Slider, Stroke,
+    Align, Align2, Button, CentralPanel, Color32, ComboBox, CornerRadius, FontId, Frame, Layout,
+    Margin, Panel, Popup, PopupCloseBehavior, Rect, RichText, ScrollArea, Sense, Slider, Stroke,
     StrokeKind, TextEdit, Ui, Vec2, WidgetInfo, WidgetType,
 };
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use flowerchat_client::audio::{AudioDevice, AudioDevices};
 use flowerchat_client::session::{ConnectionState, Route, ShareCodec};
-use flowerchat_protocol::PeerId;
+use flowerchat_protocol::{PeerId, RoomInfo};
 
-use crate::model::{Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
+use crate::model::{Directory, Entry, EntryKind, OwnShare, PeerRow, RoomModel, Watching};
 use crate::palettes;
 use crate::screen::{Choice, Choices, Picked};
 use crate::settings::{DeviceChoice, MAX_RECEIVE_BUFFER_MS, SendMode, Settings};
@@ -40,6 +40,9 @@ const PICKER_WIDTH: f32 = 480.0;
 const CHOICE_HEIGHT: f32 = 28.0;
 /// Width of the list of palettes.
 const PALETTES_WIDTH: f32 = 230.0;
+/// Height of a room in the list of rooms, and of a person under it.
+const ROOM_HEIGHT: f32 = 28.0;
+const MEMBER_HEIGHT: f32 = 24.0;
 
 pub enum Screen<'a> {
     /// Not in a room. `connecting` is set while a join is under way, and
@@ -67,6 +70,8 @@ pub struct Env<'a> {
     /// The codecs this machine can share a screen in, and for each whether
     /// its processor would have to encode it.
     pub codecs: &'a [ShareCodec],
+    /// The server's rooms and who is in them, as far as it has said.
+    pub rooms: &'a Directory,
 }
 
 /// A frame of a shared screen, ready to draw.
@@ -83,6 +88,11 @@ pub struct UiState {
     pub name: String,
     pub room: String,
     pub server: String,
+    /// The invite token, or a link that carries it, for a server that only
+    /// lets invited people in. Empty for one that is open.
+    pub invite: String,
+    /// The name of a room that is not in the list, while it is being typed.
+    pub other_room: String,
     pub chat_draft: String,
     /// Which part of the room a narrow window shows.
     pub tab: Tab,
@@ -132,7 +142,8 @@ pub enum Tab {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// Join with the name, room and server in [`UiState`].
+    /// Join with the name, room and server in [`UiState`]. From inside a
+    /// room, that means leaving it for the other.
     Join,
     Leave,
     SetMuted(bool),
@@ -186,8 +197,20 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState)
             mic_level,
         } if wide => {
             side_panel("lobby").show(ui, |ui| {
-                app_name(ui, &mut state.settings);
-                join_form(ui, connecting, error, state, &mut actions);
+                Panel::bottom("who")
+                    .resizable(false)
+                    .frame(Frame::new().inner_margin(Margin {
+                        top: 12,
+                        ..Margin::ZERO
+                    }))
+                    .show(ui, |ui| who_and_where(ui, connecting, error, state));
+                CentralPanel::no_frame().show(ui, |ui| {
+                    app_name(ui, &mut state.settings);
+                    ui.add_space(6.0);
+                    ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                        rooms_to_join(ui, connecting, env, state, &mut actions);
+                    });
+                });
             });
             Panel::right("lobby-audio")
                 .exact_size(AUDIO_WIDTH)
@@ -208,8 +231,8 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState)
                     ui.set_max_width(360.0);
                     ui.label(strong("Not in a room").size(15.0));
                     ui.label(muted(
-                        "Enter a name and a room on the left. The audio panel on the right \
-                         already works, so you can check your microphone before joining.",
+                        "Pick a room on the left to join it. The audio panel on the right \
+                         already works, so you can check your microphone first.",
                     ));
                 });
             });
@@ -226,7 +249,12 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState)
                 .show(ui, |ui| {
                     ui.set_max_width(320.0);
                     app_name(ui, &mut state.settings);
-                    join_form(ui, connecting, error, state, &mut actions);
+                    ui.add_space(6.0);
+                    ScrollArea::vertical().show(ui, |ui| {
+                        rooms_to_join(ui, connecting, env, state, &mut actions);
+                        ui.add_space(14.0);
+                        who_and_where(ui, connecting, error, state);
+                    });
                 });
         }
         Screen::Room(room) => {
@@ -254,58 +282,240 @@ pub fn draw(ui: &mut Ui, screen: Screen<'_>, env: &Env<'_>, state: &mut UiState)
 
 // --- Lobby -----------------------------------------------------------------
 
-fn join_form(
+/// The rooms of the server, to join with a click, and a field for one that
+/// is not among them. A server that names no rooms gets the field alone.
+fn rooms_to_join(
     ui: &mut Ui,
     connecting: bool,
-    error: Option<&str>,
+    env: &Env<'_>,
     state: &mut UiState,
     actions: &mut Vec<Action>,
 ) {
-    ui.add_space(10.0);
-    ui.label(theme::title("Join a room"));
-    ui.add_space(4.0);
-
-    let mut submitted = false;
-    ui.add_enabled_ui(!connecting, |ui| {
-        for (label, value) in [
-            ("Name", &mut state.name),
-            ("Room", &mut state.room),
-            ("Server", &mut state.server),
-        ] {
-            ui.spacing_mut().item_spacing.y = 3.0;
-            ui.label(muted(label));
-            let field = ui.add(
-                TextEdit::singleline(value)
-                    .desired_width(f32::INFINITY)
-                    .margin(Margin::symmetric(8, 5)),
-            );
-            submitted |= field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let named = !state.name.trim().is_empty() && !state.server.trim().is_empty();
+    let ready = named && !connecting;
+    match env.rooms.rooms() {
+        Some(rooms) => {
+            room_list(ui, rooms, None, ready, state, actions);
             ui.add_space(6.0);
+            let mut other = std::mem::take(&mut state.other_room);
+            if room_field(ui, &mut other, "Another room", ready) {
+                state.room = other.trim().to_owned();
+                actions.push(Action::Join);
+            } else {
+                state.other_room = other;
+            }
         }
+        None => {
+            ui.label(heading("Room"));
+            let mut room = std::mem::take(&mut state.room);
+            let join = room_field(ui, &mut room, "", ready);
+            state.room = room;
+            if join {
+                actions.push(Action::Join);
+            }
+            // Why there is a field and no list, unless it is that the
+            // server is still to answer or has no rooms of its own.
+            if let Directory::Unavailable(reason) = env.rooms {
+                ui.add_space(2.0);
+                ui.label(muted(format!("No list of rooms. {reason}")));
+            }
+        }
+    }
+    ui.add_space(4.0);
+    if connecting {
+        ui.label(muted(format!("Joining {}…", state.room.trim())));
+    } else if !named {
+        ui.label(muted("Enter a name below to join."));
+    }
+}
 
-        let ready = [&state.name, &state.room, &state.server]
-            .iter()
-            .all(|value| !value.trim().is_empty());
-        let label = if connecting { "Joining…" } else { "Join" };
-        let join = Button::new(strong(label).color(theme::colors().on_accent))
-            .fill(theme::colors().accent);
-        let size = Vec2::new(ui.available_width(), BIG_BUTTON_HEIGHT);
-        let clicked = ui
-            .add_enabled(ready, |ui: &mut Ui| ui.add_sized(size, join))
-            .clicked();
-        if (clicked || submitted) && ready {
-            actions.push(Action::Join);
-        }
+/// A field for the name of a room with the button that joins it. Returns
+/// whether to join.
+fn room_field(ui: &mut Ui, room: &mut String, hint: &str, enabled: bool) -> bool {
+    let mut join = false;
+    ui.add_enabled_ui(enabled, |ui| {
+        row(ui, theme::CONTROL_HEIGHT, |ui| {
+            let filled = !room.trim().is_empty();
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let button = Button::new(strong("Join").color(theme::colors().on_accent))
+                    .fill(theme::colors().accent);
+                join |= ui.add_enabled(filled, button).clicked();
+                let field = ui.add(
+                    TextEdit::singleline(room)
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY)
+                        .margin(Margin::symmetric(8, 5)),
+                );
+                join |= filled
+                    && field.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            });
+        });
     });
+    join
+}
 
+/// The name to go by, and the server with its invite: what stays the same
+/// from one room to the next.
+fn who_and_where(ui: &mut Ui, connecting: bool, error: Option<&str>, state: &mut UiState) {
     if let Some(error) = error {
-        ui.add_space(8.0);
         ui.label(
             RichText::new(error)
                 .size(theme::SMALL)
                 .color(theme::colors().warn),
         );
+        ui.add_space(8.0);
     }
+    ui.add_enabled_ui(!connecting, |ui| {
+        // The invite is as good as a password, and is hidden like one.
+        for (label, value, secret) in [
+            ("Name", &mut state.name, false),
+            ("Server", &mut state.server, false),
+            ("Invite", &mut state.invite, true),
+        ] {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.label(heading(label));
+            ui.add(
+                TextEdit::singleline(value)
+                    .password(secret)
+                    .hint_text(if secret {
+                        "If the server asks for one"
+                    } else {
+                        ""
+                    })
+                    .desired_width(f32::INFINITY)
+                    .margin(Margin::symmetric(8, 5)),
+            );
+            ui.add_space(6.0);
+        }
+    });
+}
+
+// --- The list of rooms ------------------------------------------------------
+
+/// A small heading in capitals, over a part of a side column.
+fn heading(text: &str) -> RichText {
+    RichText::new(text.to_uppercase())
+        .family(theme::semibold())
+        .size(theme::TINY)
+        .color(theme::colors().muted)
+}
+
+/// The rooms with the people in each. A click on a room other than
+/// `current`, the one we are in, asks to join it.
+fn room_list(
+    ui: &mut Ui,
+    rooms: &[RoomInfo],
+    current: Option<&str>,
+    enabled: bool,
+    state: &mut UiState,
+    actions: &mut Vec<Action>,
+) {
+    ui.label(heading("Rooms"));
+    ui.spacing_mut().item_spacing.y = 2.0;
+    for room in rooms {
+        let here = current == Some(room.name.as_str());
+        if room_row(ui, &room.name, here, enabled && !here).clicked() {
+            state.room = room.name.clone();
+            actions.push(Action::Join);
+        }
+        for peer in &room.peers {
+            member_row(ui, &peer.name);
+        }
+    }
+}
+
+/// A room in the list: lit up while the pointer is on it, and more so if
+/// it is the one we are in.
+fn room_row(ui: &mut Ui, name: &str, here: bool, enabled: bool) -> egui::Response {
+    let colors = theme::colors();
+    let size = Vec2::new(ui.available_width(), ROOM_HEIGHT);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, name));
+    let pointed = enabled && response.hovered();
+    let painter = ui.painter_at(rect);
+    if here || pointed {
+        let fill = if here {
+            colors.control_hover
+        } else {
+            colors.control
+        };
+        painter.rect_filled(rect, CornerRadius::same(theme::RADIUS), fill);
+    }
+    let ink = if here || pointed {
+        colors.text
+    } else {
+        colors.muted
+    };
+    painter.text(
+        rect.left_center() + Vec2::new(8.0, 0.0),
+        Align2::LEFT_CENTER,
+        icon::SPEAKER_HIGH,
+        FontId::proportional(ICON_SIZE),
+        ink,
+    );
+    let font = if here {
+        FontId::new(theme::BODY, theme::semibold())
+    } else {
+        FontId::proportional(theme::BODY)
+    };
+    painter.text(
+        rect.left_center() + Vec2::new(32.0, 0.0),
+        Align2::LEFT_CENTER,
+        name,
+        font,
+        ink,
+    );
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// Someone in a room of the list: their initial on a disc of a colour that
+/// is theirs by their name, and the name.
+fn member_row(ui: &mut Ui, name: &str) {
+    const DISCS: [Color32; 6] = [
+        Color32::from_rgb(0x58, 0x65, 0xF2),
+        Color32::from_rgb(0x2D, 0x8A, 0x55),
+        Color32::from_rgb(0xC2, 0x5B, 0x1A),
+        Color32::from_rgb(0xC9, 0x3C, 0x86),
+        Color32::from_rgb(0xD0, 0x3A, 0x3E),
+        Color32::from_rgb(0x2B, 0x7F, 0xB8),
+    ];
+    let size = Vec2::new(ui.available_width(), MEMBER_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, name));
+    let painter = ui.painter_at(rect);
+    let sum: usize = name.bytes().map(usize::from).sum();
+    let centre = rect.left_center() + Vec2::new(41.0, 0.0);
+    painter.circle_filled(centre, 9.0, DISCS[sum % DISCS.len()]);
+    let initial: String = name
+        .trim()
+        .chars()
+        .next()
+        .map(|first| first.to_uppercase().collect())
+        .unwrap_or_default();
+    painter.text(
+        centre,
+        Align2::CENTER_CENTER,
+        initial,
+        FontId::new(theme::TINY, theme::semibold()),
+        Color32::WHITE,
+    );
+    painter.text(
+        rect.left_center() + Vec2::new(58.0, 0.0),
+        Align2::LEFT_CENTER,
+        name,
+        FontId::proportional(theme::SMALL),
+        theme::colors().text,
+    );
 }
 
 // --- Room, wide -------------------------------------------------------------
@@ -329,19 +539,47 @@ fn room_wide(
                 let screen = Some((&mut state.settings, env.codecs));
                 me_block(ui, room, mode, screen, actions);
             });
+        // Above that and always in sight, however long the list of rooms.
+        Panel::bottom("stay")
+            .resizable(false)
+            .frame(Frame::new().inner_margin(Margin {
+                top: 8,
+                ..Margin::ZERO
+            }))
+            .show(ui, |ui| {
+                row(ui, theme::CONTROL_HEIGHT, |ui| {
+                    ui.label(muted("In room"));
+                    ui.label(RichText::new(clock(room.in_room)).size(theme::SMALL));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Leave").clicked() {
+                            actions.push(Action::Leave);
+                        }
+                    });
+                });
+            });
         CentralPanel::no_frame().show(ui, |ui| {
             app_name(ui, &mut state.settings);
-            ui.add_space(10.0);
-            ui.label(theme::title(&room.room));
-            ui.add_space(4.0);
-            kv(ui, "Server", &room.server);
-            kv(ui, "Status", "Connected");
-            kv(ui, "People", (room.peers.len() + 1).to_string());
-            kv(ui, "In room", clock(room.in_room));
             ui.add_space(6.0);
-            if ui.button("Leave").clicked() {
-                actions.push(Action::Leave);
-            }
+            ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                // The rooms, to go from this one to another with a click.
+                // Without a list, the name of this one.
+                match env.rooms.rooms() {
+                    Some(rooms) => {
+                        ui.scope(|ui| {
+                            room_list(ui, rooms, Some(&room.room), true, state, actions);
+                        });
+                        ui.add_space(8.0);
+                    }
+                    None => {
+                        ui.add_space(4.0);
+                        ui.label(theme::title(&room.room));
+                        ui.add_space(4.0);
+                    }
+                }
+                kv(ui, "Server", &room.server);
+                kv(ui, "Status", "Connected");
+                kv(ui, "People", (room.peers.len() + 1).to_string());
+            });
         });
     });
 

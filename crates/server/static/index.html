@@ -40,10 +40,26 @@
       <label class="field">Name
         <input type="text" id="name" autocomplete="nickname" spellcheck="false" required>
       </label>
-      <label class="field">Room
-        <input type="text" id="room" value="lounge" autocomplete="off" spellcheck="false" required>
+      <!-- Shown by a server that only lets invited people in. -->
+      <label class="field" id="invite-field" hidden>Invite
+        <input type="password" id="invite-token" autocomplete="off" spellcheck="false"
+          placeholder="The token you were sent">
       </label>
-      <button class="primary" id="join-button">Join</button>
+      <!-- The rooms the server tells of, with who is in each. A click on
+           one joins it. -->
+      <section class="rooms-section">
+        <h2 class="heading">Rooms</h2>
+        <div class="rooms" id="lobby-rooms"></div>
+        <p class="muted small" id="rooms-note" hidden></p>
+      </section>
+      <!-- For a room that is not in the list, or when there is no list. -->
+      <div class="field">
+        <label for="room">Other room</label>
+        <div class="row">
+          <input type="text" id="room" autocomplete="off" spellcheck="false" placeholder="Its name">
+          <button class="primary" id="join-button">Join</button>
+        </div>
+      </div>
       <p id="join-error" class="error" role="alert" hidden></p>
       <button type="button" id="join-listening" hidden>Join without a microphone</button>
     </form>
@@ -125,6 +141,12 @@
       <div class="brand"><img src="/icon.png" alt=""> flowerchat</div>
       <h1 class="room-name" id="room-name"></h1>
       <span class="narrow-only muted small" id="room-summary"></span>
+      <!-- The same list as before joining. A click on another room moves
+           there. A narrow window has no place for it. -->
+      <section class="rooms-section" id="room-rooms-section" hidden>
+        <h2 class="heading">Rooms</h2>
+        <div class="rooms" id="room-rooms"></div>
+      </section>
       <dl class="facts">
         <dt>Server</dt><dd id="fact-server"></dd>
         <dt>Status</dt><dd id="fact-status"></dd>
@@ -132,8 +154,8 @@
         <dt>In room</dt><dd id="fact-time"></dd>
       </dl>
       <div class="buttons">
-        <button type="button" id="invite" title="Copy a link to this room">Invite</button>
-        <button type="button" id="leave">Leave</button>
+        <button type="button" id="copy-link" title="Copy a link to this room">Copy room link</button>
+        <button type="button" class="danger" id="leave">Leave</button>
       </div>
       <p class="get-app small" id="room-get-app" hidden></p>
     </div>
@@ -168,8 +190,8 @@
         <span class="num col-recv">Receiving</span><span class="col-screen">Screen</span><span>Volume</span>
       </div>
       <div id="peers"></div>
-      <p class="empty" id="alone">Nobody else is here yet. Invite copies a link to this room to send
-        to someone.</p>
+      <p class="empty" id="alone">Nobody else is here yet. Copy room link gives a link to this room to
+        send to someone.</p>
     </section>
   </main>
 

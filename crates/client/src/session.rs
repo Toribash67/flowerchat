@@ -30,6 +30,8 @@ pub struct SessionConfig {
     pub server: String,
     pub room: String,
     pub name: String,
+    /// The invite token, for a server that only lets invited people in.
+    pub invite: Option<String>,
     pub audio: AudioSettings,
     /// Whether the microphone is sent from the start. Push-to-talk starts
     /// without, and turns it on with [`Command::SetTransmitting`].
@@ -170,8 +172,13 @@ pub async fn run(
     mut commands: UnboundedReceiver<Command>,
     events: UnboundedSender<Event>,
 ) -> Result<()> {
-    let (welcome, mut to_server, mut from_server) =
-        signaling::join(&config.server, &config.room, &config.name).await?;
+    let (welcome, mut to_server, mut from_server) = signaling::join(
+        &config.server,
+        &config.room,
+        &config.name,
+        config.invite.as_deref(),
+    )
+    .await?;
     let my_id = welcome.id;
 
     let (call_events_tx, mut call_events) = unbounded_channel();
@@ -218,7 +225,7 @@ pub async fn run(
                     }
                 }
                 Ok(Some(ServerMsg::Error { message })) => break Err(anyhow!("server: {message}")),
-                Ok(Some(ServerMsg::Welcome { .. })) => {}
+                Ok(Some(ServerMsg::Welcome { .. } | ServerMsg::Rooms { .. })) => {}
                 Ok(None) => break Err(anyhow!("the signaling server disconnected")),
                 Err(err) => break Err(err),
             },

@@ -1,21 +1,29 @@
-/* The app's own palette, "Flowerchat", and a light one for systems that
-   ask for light. The names are the app's, from crates/app/src/theme.rs. */
+/* A dark palette in the manner of Discord: grey panels that get darker
+   towards the edges and the fields, one blue-violet accent, and green for
+   what is live. A light one for systems that ask for light. The names are
+   the app's, from crates/app/src/theme.rs; `ok`, `danger` and `link` are
+   the page's own. */
 :root {
   color-scheme: dark;
-  --background: #15171b;
-  --panel: #1a1c21;
-  --field: #1d2025;
-  --control: #23272e;
-  --control-hover: #2c3038;
-  --border: #30353e;
-  --hairline: #23272e;
-  --text: #e8eaed;
-  --muted: #a3aab5;
-  --idle: #6b7280;
-  --accent: #4cc38a;
-  --on-accent: #0e1512;
-  --warn: #f2994a;
-  --on-warn: #1a1206;
+  --background: #313338;
+  --panel: #2b2d31;
+  --field: #1e1f22;
+  --control: #3c3e45;
+  --control-hover: #4e5058;
+  --border: #3f4147;
+  --hairline: #232428;
+  --text: #dbdee1;
+  --muted: #949ba4;
+  --idle: #6d6f78;
+  --accent: #5865f2;
+  --on-accent: #ffffff;
+  --warn: #f0b232;
+  --on-warn: #1e1f22;
+  /* Someone speaking, a level, a yes. */
+  --ok: #23a55a;
+  /* Leaving. */
+  --danger: #f23f43;
+  --link: #00a8fc;
 
   --side: 232px;
   --chat: 300px;
@@ -39,6 +47,9 @@
     --on-accent: #ffffff;
     --warn: #986801;
     --on-warn: #ffffff;
+    --ok: #17784f;
+    --danger: #c4314b;
+    --link: #17784f;
   }
 }
 
@@ -58,7 +69,7 @@ h1 { font-size: 1.3rem; font-weight: 650; }
 h2 { font-size: 1rem; font-weight: 650; }
 h3 { font-size: .85rem; font-weight: 500; color: var(--muted); }
 p { margin: 0; }
-a { color: var(--accent); }
+a { color: var(--link); }
 .muted { color: var(--muted); }
 .warn { color: var(--warn); }
 .small { font-size: .9em; }
@@ -95,9 +106,11 @@ button[aria-pressed="true"] {
   border-color: var(--warn);
   color: var(--on-warn);
 }
+button.danger { color: var(--danger); }
+button.danger:hover { background: var(--danger); border-color: var(--danger); color: #ffffff; }
 button svg, .button svg { width: 16px; height: 16px; flex: none; }
 
-input[type="text"], select {
+input[type="text"], input[type="password"], select {
   width: 100%;
   min-height: 30px;
   padding: .3rem .55rem;
@@ -107,7 +120,7 @@ input[type="text"], select {
   color: var(--text);
   font: inherit;
 }
-input[type="text"]::placeholder { color: var(--idle); }
+input::placeholder { color: var(--idle); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
@@ -156,10 +169,48 @@ label.check { display: flex; align-items: center; gap: .5rem; cursor: pointer; }
 .field { display: flex; flex-direction: column; gap: .25rem; color: var(--muted); }
 .field > input, .field > select, .field > .row { color: var(--text); }
 .row { display: flex; gap: .5rem; align-items: center; }
-.row > select { flex: 1; min-width: 0; }
+.row > select, .row > input { flex: 1; min-width: 0; }
 .stack { display: flex; flex-direction: column; gap: .5rem; }
 .grow { flex: 1; }
 .error { color: var(--warn); }
+
+/* The rooms there are, each with the people in it underneath. A room is a
+   row to click; the one we are in is lit. */
+.heading {
+  font-size: .75rem;
+  font-weight: 700;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.rooms-section { display: flex; flex-direction: column; gap: .35rem; margin-top: .25rem; }
+.rooms { display: flex; flex-direction: column; gap: 2px; }
+.rooms:empty { display: none; }
+.room-row {
+  justify-content: flex-start;
+  width: 100%;
+  min-height: 32px;
+  padding: .3rem .5rem;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  font-weight: 500;
+}
+.room-row:hover { background: var(--control); color: var(--text); }
+.room-row.current, .room-row.current:hover { background: var(--control-hover); color: var(--text); cursor: default; }
+.room-row span { overflow: hidden; text-overflow: ellipsis; }
+.members {
+  display: flex;
+  flex-direction: column;
+  gap: .2rem;
+  margin: 0 0 .3rem;
+  padding: 0 .5rem 0 1.95rem;
+  list-style: none;
+  color: var(--muted);
+}
+.members li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.members .you { color: var(--text); }
 
 /* Label and value pairs. */
 dl.facts {
@@ -180,7 +231,7 @@ dl.facts dd { margin: 0; text-align: right; overflow: hidden; text-overflow: ell
 .meter > div {
   height: 100%;
   width: 0;
-  background: var(--accent);
+  background: var(--ok);
   transition: width 60ms linear;
 }
 
@@ -212,7 +263,7 @@ table.compare th, table.compare td {
 table.compare th:not(:first-child), table.compare td:not(:first-child) { text-align: center; width: 5.5rem; }
 table.compare thead th { color: var(--muted); }
 table.compare tr:last-child td { border-bottom: none; }
-.yes { color: var(--accent); }
+.yes { color: var(--ok); }
 .no { color: var(--idle); }
 
 /* In a room. */
@@ -246,7 +297,7 @@ table.compare tr:last-child td { border-bottom: none; }
 .peer .vol { display: flex; align-items: center; gap: .5rem; }
 .peer .vol output { width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
 .peer .break { display: none; }
-.peer .screen.on { color: var(--accent); }
+.peer .screen.on { color: var(--ok); }
 .empty { padding: 1.5rem 0; color: var(--muted); }
 
 .dot {
@@ -256,9 +307,9 @@ table.compare tr:last-child td { border-bottom: none; }
   border-radius: 50%;
 }
 .dot.speaking {
-  border-color: var(--accent);
-  background: radial-gradient(circle, var(--accent) 0 3px, transparent 3.5px);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
+  border-color: var(--ok);
+  background: radial-gradient(circle, var(--ok) 0 3px, transparent 3.5px);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 30%, transparent);
 }
 .dot.muted { border-color: var(--warn); border-style: dashed; }
 .dot.away { opacity: .5; }
@@ -325,7 +376,7 @@ table.compare tr:last-child td { border-bottom: none; }
     padding: .75rem 1rem .25rem;
     background: var(--panel);
   }
-  .room .room-head .brand, .room .room-head dl, .room .get-app { display: none; }
+  .room .room-head .brand, .room .room-head dl, .room .get-app, .room .rooms-section { display: none; }
   .room .room-head h1 { font-size: 1.15rem; }
   .room .room-head .buttons { margin-left: auto; }
   .narrow-only { display: inline; }

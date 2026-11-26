@@ -1,8 +1,10 @@
 //! The palettes the interface can be drawn in.
 //!
-//! The first is our own and the one a new user gets. The rest are colour
-//! schemes people know from their editors and terminals, with each
-//! scheme's own colours put to the uses we have for them. Where a scheme
+//! The first is the one a new user gets: the greys and the blue-violet
+//! that chat apps have made familiar. The second is our own, from before
+//! that. The rest are colour schemes people know from their editors and
+//! terminals, with each scheme's own colours put to the uses we have for
+//! them. Where a scheme
 //! has no colour that suits a use, such as text dim enough to step back
 //! and still bright enough to read, one is made from those it has.
 //!
@@ -30,7 +32,29 @@ const fn c(hex: u32) -> Color32 {
 }
 
 /// Every palette, in the order they are offered.
-pub static ALL: [Palette; 23] = [
+pub static ALL: [Palette; 24] = [
+    Palette {
+        id: "blurple",
+        name: "Blurple",
+        light: false,
+        colors: Colors {
+            background: c(0x313338),
+            stage: c(0x111214),
+            panel: c(0x2B2D31),
+            field: c(0x1E1F22),
+            control: c(0x3A3C42),
+            control_hover: c(0x43464D),
+            border: c(0x3F4147),
+            hairline: c(0x3A3C42),
+            text: c(0xDBDEE1),
+            muted: c(0xA3A8B0),
+            idle: c(0x80848E),
+            accent: c(0x6C78F4),
+            on_accent: c(0x111214),
+            warn: c(0xF0B232),
+            on_warn: c(0x1E1F22),
+        },
+    },
     Palette {
         id: "flowerchat",
         name: "Flowerchat",
@@ -579,7 +603,7 @@ mod tests {
             assert_eq!(by_id(palette.id), Some(palette));
         }
         assert_eq!(by_id("no such palette"), None);
-        assert_eq!(default().id, "flowerchat");
+        assert_eq!(default().id, "blurple");
     }
 
     #[test]

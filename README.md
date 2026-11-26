@@ -30,9 +30,50 @@ Configuration is through environment variables:
 | `FLOWERCHAT_ICE_SERVERS` | a public STUN server | JSON array of ICE servers in `RTCIceServer` form, sent to every client. |
 | `FLOWERCHAT_RELEASES` | `Toribash67/flowerchat` | GitHub repository, as `owner/name`, whose latest release the page offers. Empty offers none. |
 | `FLOWERCHAT_GITHUB_TOKEN` | none | A token that may read that repository. Only needed if it is private. |
+| `FLOWERCHAT_INVITES` | none | The file of invites. With it, only invited people may join a room. |
+| `FLOWERCHAT_ROOMS` | `lounge` | The rooms that are always there, separated by commas, in the order they are listed. |
 
 Browsers only allow microphone access on `localhost` or over HTTPS, so anything
 beyond local testing needs to sit behind a TLS reverse proxy.
+
+### Rooms
+
+The app and the page list the server's rooms down their left side, with the
+people in each, and a click on a room joins it, or leaves the one you are in
+for it. The rooms in `FLOWERCHAT_ROOMS` are always in the list. Any other
+room can still be joined by typing its name, and is in the list for as long
+as someone is in it. So a room's name is no secret: whoever can reach the
+server, or on a server with invites whoever has one, sees every room and who
+is in it, except that an invite for certain rooms shows only those.
+
+### Invites
+
+Without `FLOWERCHAT_INVITES`, anyone who reaches the server may join any
+room. With it, a join needs an invite: a token that the server's owner
+makes for one person and hands to them.
+
+```sh
+export FLOWERCHAT_INVITES=/data/invites.json
+flowerchat-server invite anna            # to every room
+flowerchat-server invite bo games        # to the room "games" only
+flowerchat-server invites                # who is invited
+flowerchat-server revoke anna
+```
+
+`invite` prints the token, once. In the app it goes in the Invite field,
+with the command-line client after `--invite`, and the page takes it from
+its address: `https://chat.example.org/?invite=<token>` is a link to send
+someone, after which their browser remembers it. A pasted link works
+wherever a token does.
+
+The file holds each name with a hash of its token, not the token, and is
+read at every join, so the commands take effect on a running server.
+Inviting a name that is already invited gives it a new token and ends the
+old one. Someone whose invite is taken back while they are in a room stays
+until they leave it. The name on an invite is for the owner, in the list
+and in the server's log; in a room, people go by the name they typed.
+
+An invite is a secret like a password, and as safe as the way it was sent.
 
 ### The web page
 
@@ -61,7 +102,7 @@ its contents and nothing else, given to the server as
 minutes from GitHub for every download. Without the token, a private
 repository looks to the server as if it had no release.
 
-`?room=…` fills in the room, which is what the Invite button copies.
+`?room=…` fills in the room, which is what the Copy room link button copies.
 `?name=…` fills in the name, and `&autojoin` joins without clicking, for
 scripted tests.
 
@@ -111,7 +152,9 @@ there, which `sudo pacman -U` installs; the web page offers it.
 cargo run -p flowerchat-app
 ```
 
-Enter a name, a room and the server's address, and join. The window shows
+Enter a name and the server's address, with an invite if the server asks
+for one, and click a room in the list on the left; a click on another room
+goes there from the one you are in. The window shows
 who is in the room with each connection's route, delay, loss, jitter and
 bitrate, a volume slider per person, and a chat whose timeline also records
 what happens in the room. Below 900 px wide the columns collapse into one.
@@ -298,7 +341,9 @@ Clients connect to `/ws` and exchange JSON messages, each with a `type` field.
 
 | Direction | Message | Purpose |
 | --- | --- | --- |
-| client to server | `{"type":"join","room":"…","name":"…"}` | Must be sent first. |
+| client to server | `{"type":"join","room":"…","name":"…"}` | Must be sent first. With `"invite":"…"` on a server that asks for one. |
+| client to server | `{"type":"watch"}` | Sent first in place of a `join`, also with `invite`: asks for the rooms. Such a connection is in no room. |
+| server to client | `{"type":"rooms","rooms":[{"name":"…","peers":[{"id":1,"name":"…"}]}]}` | To a connection that sent `watch`: at once, and whenever someone joins or leaves a room. |
 | client to server | `{"type":"signal","to":2,"data":{…}}` | Relay `data` to a peer in the same room. |
 | server to client | `{"type":"welcome","id":3,"peers":[…],"iceServers":[…]}` | Join accepted; lists the peers already present. |
 | server to client | `{"type":"peer-joined","id":4,"name":"…"}` | Someone joined the room. |

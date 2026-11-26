@@ -21,6 +21,8 @@ pub async fn serve() -> String {
     let config = Config {
         ice_servers: vec![],
         releases: None,
+        invites: None,
+        rooms: vec![],
     };
     tokio::spawn(async move { axum::serve(listener, app(config)).await.unwrap() });
     url
@@ -125,6 +127,7 @@ pub fn join(url: &str, name: &str, loss: f64, software_video: bool) -> Client {
         server: url.into(),
         room: "lounge".into(),
         name: name.into(),
+        invite: None,
         audio: AudioSettings::default(),
         transmitting: true,
         test_tone: true,

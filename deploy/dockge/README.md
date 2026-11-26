@@ -5,8 +5,8 @@ This stack follows the Sengoku Jidai deployment:
 - Image: `ghcr.io/toribash67/flowerchat-server:latest`
 - Host port: `18084`
 - Container port: `80`
-- Nothing to keep between restarts: the server holds who is in which room
-  in memory, and nothing else.
+- Nothing to keep between restarts but the file of invites, if invites are
+  turned on: the server holds who is in which room in memory.
 - Watchtower updates: enabled by label
 
 Only the signaling server runs here. Voice, screens and chat go straight
@@ -39,6 +39,31 @@ installer has been published yet, and the server's log says why.
 
 The server reaches out to `api.github.com` for this, at most every five
 minutes. Nothing else needs to reach it.
+
+## Invites
+
+As set up above, anyone who knows the address can join any room. To let in
+only people who were invited:
+
+1. In `compose.yml`, take the `#` off `FLOWERCHAT_INVITES`, `volumes` and
+   the line under it, and deploy the stack again. From then on nobody gets
+   in without an invite, including whoever runs an app from before invites.
+2. Invite each person from a shell on the TrueNAS host:
+
+   ```sh
+   docker exec flowerchat-server flowerchat-server invite anna
+   ```
+
+   It prints a token, once. Send it to Anna: she pastes it into the app's
+   Invite field, or opens `https://chat.flowerboi.se/?invite=<token>`.
+
+`flowerchat-server invites` lists who is invited and `flowerchat-server
+revoke anna` takes an invite back, both through `docker exec` in the same
+way, and `invite anna games` invites to the room `games` only. None of them
+restarts the server or disturbs a call.
+
+A whole folder is mounted, not the file alone, because the server replaces
+the file when it changes, which a mount of a single file does not allow.
 
 ## nginx
 

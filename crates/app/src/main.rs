@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
-use flowerchat_app::model::{OwnShare, RoomModel, meter_level};
+use flowerchat_app::model::{Directory, OwnShare, RoomModel, meter_level};
 use flowerchat_app::screen::{self, Cast, Pick, Picked};
 use flowerchat_app::settings::{DeviceChoice, SendMode, Settings};
 use flowerchat_app::talk::Talk;
@@ -22,6 +22,7 @@ use flowerchat_client::session::{
     self, AudioSettings, Codec, Command, Event, FrameSink, SessionConfig, ShareCodec,
     ShareSettings, ShareSource, VideoFrame,
 };
+use flowerchat_client::signaling;
 use flowerchat_client::video::parse_size;
 use flowerchat_protocol::PeerId;
 use tokio::runtime::Runtime;
@@ -50,6 +51,10 @@ struct Args {
     /// last time.
     #[arg(long)]
     server: Option<String>,
+    /// The invite token for a server that only lets invited people in,
+    /// instead of the one used last time.
+    #[arg(long)]
+    invite: Option<String>,
     /// Join straight away instead of showing the form first.
     #[arg(long)]
     autojoin: bool,
@@ -129,6 +134,18 @@ struct App {
     active: Option<Active>,
     /// Why the last join or session failed, shown on the join form.
     error: Option<String>,
+    /// Set when another room was picked from inside one: once this one is
+    /// left, that one is joined.
+    rejoin: bool,
+    /// Set from then until the other room is joined. The window stays
+    /// laid out as a room meanwhile, where it would otherwise show the
+    /// join screen for a few frames and the whole of it would jump.
+    switching: bool,
+    /// What the server says about its rooms, kept current by `room_watch`.
+    directory: Arc<Mutex<Directory>>,
+    /// The server and invite the rooms are being asked of, and the task
+    /// that asks, if there is a server to ask.
+    room_watch: Option<(String, String, Option<JoinHandle<()>>)>,
     /// Absent when this system cannot list its audio devices.
     watch: Option<DeviceWatch>,
     devices: AudioDevices,
@@ -192,6 +209,11 @@ impl App {
                 .clone()
                 .or_else(|| saved("server"))
                 .unwrap_or_else(|| DEFAULT_SERVER.into()),
+            invite: args
+                .invite
+                .clone()
+                .or_else(|| saved("invite"))
+                .unwrap_or_default(),
             settings: settings_with(
                 cc.storage
                     .and_then(|storage| eframe::get_value(storage, "settings"))
@@ -209,6 +231,10 @@ impl App {
             ui,
             active: None,
             error: None,
+            rejoin: false,
+            switching: false,
+            directory: Arc::default(),
+            room_watch: None,
             devices: AudioDevices::default(),
             watch,
             mic_check: None,
@@ -241,7 +267,37 @@ impl App {
                 Ok(Err(err)) => Some(sentence(&format!("{err:#}"))),
                 Err(_) => Some("The session stopped unexpectedly.".into()),
             };
+            if std::mem::take(&mut self.rejoin) && self.error.is_none() {
+                self.join();
+                self.switching = true;
+            }
         }
+    }
+
+    /// Keeps asking the server in the form for its rooms, and starts over
+    /// when the server or the invite there has changed.
+    fn sync_rooms(&mut self, ctx: &egui::Context) {
+        let server = self.ui.server.trim();
+        let invite = self.ui.invite.trim();
+        if let Some((asked, with, _)) = &self.room_watch {
+            // Not at every letter of an address that is being typed.
+            if (asked.as_str(), with.as_str()) == (server, invite) || ctx.text_edit_focused() {
+                return;
+            }
+        }
+        if let Some((_, _, Some(task))) = self.room_watch.take() {
+            task.abort();
+        }
+        *self.directory.lock().unwrap() = Directory::Asking;
+        let task = (!server.is_empty()).then(|| {
+            self.runtime.spawn(watch_rooms(
+                server.to_owned(),
+                invite.to_owned(),
+                self.directory.clone(),
+                ctx.clone(),
+            ))
+        });
+        self.room_watch = Some((server.to_owned(), invite.to_owned(), task));
     }
 
     fn perform(&mut self, action: Action) {
@@ -626,7 +682,15 @@ impl App {
     }
 
     fn join(&mut self) {
-        if self.active.is_some() {
+        if let Some(active) = &self.active {
+            // From one room to another: this one is left first, and `reap`
+            // joins the other once it is.
+            let shared = active.shared.lock().unwrap();
+            let elsewhere = shared.room.room != self.ui.room.trim();
+            if shared.joined_at.is_some() && elsewhere && !self.rejoin {
+                self.rejoin = true;
+                let _ = active.commands.send(Command::Leave);
+            }
             return;
         }
         self.error = None;
@@ -651,6 +715,7 @@ impl App {
             server: server.clone(),
             room: room.clone(),
             name: name.clone(),
+            invite: Some(self.ui.invite.trim().to_owned()).filter(|invite| !invite.is_empty()),
             audio: audio.clone(),
             transmitting,
             test_tone: self.args.test_tone,
@@ -684,6 +749,32 @@ impl App {
             frame,
             cast,
         });
+    }
+}
+
+/// How long to wait before asking a server for its rooms again, after it
+/// could not be reached or would not say.
+const ROOMS_RETRY: Duration = Duration::from_secs(10);
+
+/// Keeps `directory` to what the server says about its rooms, for as long
+/// as the task runs.
+async fn watch_rooms(
+    server: String,
+    invite: String,
+    directory: Arc<Mutex<Directory>>,
+    ctx: egui::Context,
+) {
+    let invite = Some(invite.as_str()).filter(|invite| !invite.is_empty());
+    loop {
+        let listed = |rooms| {
+            *directory.lock().unwrap() = Directory::Listed(rooms);
+            ctx.request_repaint();
+        };
+        if let Err(err) = signaling::watch(&server, invite, listed).await {
+            *directory.lock().unwrap() = Directory::Unavailable(sentence(&format!("{err:#}")));
+            ctx.request_repaint();
+        }
+        tokio::time::sleep(ROOMS_RETRY).await;
     }
 }
 
@@ -723,13 +814,16 @@ async fn follow(
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.reap();
+        self.sync_rooms(ui.ctx());
         self.sync_audio(ui.ctx());
         self.sync_choices();
         let picture = self.update_picture(ui.ctx());
         if self.ui.popped_out {
             self.popped_out_window(ui.ctx(), picture);
         }
+        let directory = self.directory.lock().unwrap().clone();
         let env = Env {
+            rooms: &directory,
             devices: &self.devices,
             global_key: self.talk.global_key(),
             transmitting: self.talk.transmitting(),
@@ -742,9 +836,13 @@ impl eframe::App for App {
                 let mut shared = active.shared.lock().unwrap();
                 let screen = match shared.joined_at {
                     Some(joined_at) => {
+                        self.switching = true;
                         shared.room.tick(Instant::now(), joined_at);
                         Screen::Room(&shared.room)
                     }
+                    // On the way from another room: the one being joined,
+                    // with nobody in it yet.
+                    None if self.switching => Screen::Room(&shared.room),
                     None => Screen::Lobby {
                         connecting: true,
                         error: None,
@@ -754,6 +852,7 @@ impl eframe::App for App {
                 views::draw(ui, screen, &env, &mut self.ui)
             }
             None => {
+                self.switching = true;
                 let screen = Screen::Lobby {
                     connecting: false,
                     error: self.error.as_deref(),
@@ -776,6 +875,7 @@ impl eframe::App for App {
         storage.set_string("name", self.ui.name.clone());
         storage.set_string("room", self.ui.room.clone());
         storage.set_string("server", self.ui.server.clone());
+        storage.set_string("invite", self.ui.invite.clone());
         eframe::set_value(storage, "settings", &self.ui.settings);
     }
 
@@ -784,9 +884,12 @@ impl eframe::App for App {
         self.mic_check = None;
         if let Some(active) = self.active.take() {
             let _ = active.commands.send(Command::Leave);
+            // The timer is made inside the runtime: made out here, where
+            // none is running, it panics, and closing the window while in
+            // a room ended the app with an error.
             let _ = self
                 .runtime
-                .block_on(tokio::time::timeout(EXIT_GRACE, active.task));
+                .block_on(async { tokio::time::timeout(EXIT_GRACE, active.task).await });
         }
     }
 }

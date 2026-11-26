@@ -1,7 +1,7 @@
 //! Client side of the signaling connection.
 
 use anyhow::{Context, Result, anyhow, bail};
-use flowerchat_protocol::{ClientMsg, IceServer, PeerId, PeerInfo, ServerMsg};
+use flowerchat_protocol::{ClientMsg, IceServer, PeerId, PeerInfo, RoomInfo, ServerMsg};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -21,7 +21,12 @@ pub struct Welcome {
     pub ice_servers: Vec<IceServer>,
 }
 
-pub async fn join(url: &str, room: &str, name: &str) -> Result<(Welcome, Sender, Receiver)> {
+pub async fn join(
+    url: &str,
+    room: &str,
+    name: &str,
+    invite: Option<&str>,
+) -> Result<(Welcome, Sender, Receiver)> {
     let (socket, _) = connect_async(url)
         .await
         .with_context(|| format!("cannot reach the signaling server at {url}"))?;
@@ -33,6 +38,7 @@ pub async fn join(url: &str, room: &str, name: &str) -> Result<(Welcome, Sender,
         .send(&ClientMsg::Join {
             room: room.to_owned(),
             name: name.to_owned(),
+            invite: invite.map(str::to_owned),
         })
         .await?;
     match receiver.next().await? {
@@ -52,6 +58,37 @@ pub async fn join(url: &str, room: &str, name: &str) -> Result<(Welcome, Sender,
         Some(ServerMsg::Error { message }) => bail!("the server refused the join: {message}"),
         Some(other) => bail!("expected a welcome from the server, got {other:?}"),
         None => bail!("the server closed the connection before welcoming us"),
+    }
+}
+
+/// Asks the server which rooms there are and who is in them, and hands
+/// each answer to `on_rooms`: one straight away, and one whenever someone
+/// joins or leaves a room. Returns, with the reason, once the connection
+/// ends. A server from before rooms were listed gives an error after some
+/// seconds of saying nothing.
+pub async fn watch(
+    url: &str,
+    invite: Option<&str>,
+    mut on_rooms: impl FnMut(Vec<RoomInfo>),
+) -> Result<()> {
+    let (socket, _) = connect_async(url)
+        .await
+        .with_context(|| format!("cannot reach the signaling server at {url}"))?;
+    let (sink, stream) = socket.split();
+    let mut sender = Sender(sink);
+    let mut receiver = Receiver(stream);
+    sender
+        .send(&ClientMsg::Watch {
+            invite: invite.map(str::to_owned),
+        })
+        .await?;
+    loop {
+        match receiver.next().await? {
+            Some(ServerMsg::Rooms { rooms }) => on_rooms(rooms),
+            Some(ServerMsg::Error { message }) => bail!("the server said: {message}"),
+            Some(_) => {}
+            None => bail!("the signaling server disconnected"),
+        }
     }
 }
 

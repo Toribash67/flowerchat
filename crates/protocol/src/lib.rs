@@ -23,7 +23,21 @@ pub const MAX_NAME_LEN: usize = 64;
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ClientMsg {
     /// Must be the first message on a connection.
-    Join { room: String, name: String },
+    Join {
+        room: String,
+        name: String,
+        /// The invite token, for a server that only lets invited people in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invite: Option<String>,
+    },
+    /// In place of a `join`: asks which rooms there are and who is in them.
+    /// The server answers with `rooms`, and again whenever that changes,
+    /// for as long as the connection is open. Such a connection is in no
+    /// room and cannot join one.
+    Watch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invite: Option<String>,
+    },
     /// Relay `data` to another peer in the same room.
     Signal { to: PeerId, data: serde_json::Value },
 }
@@ -53,6 +67,11 @@ pub enum ServerMsg {
         from: PeerId,
         data: serde_json::Value,
     },
+    /// The rooms there are, to a connection that asked with `watch`: those
+    /// the server always has, and any other with someone in it.
+    Rooms {
+        rooms: Vec<RoomInfo>,
+    },
     /// Sent before the server closes the connection.
     Error {
         message: String,
@@ -63,6 +82,13 @@ pub enum ServerMsg {
 pub struct PeerInfo {
     pub id: PeerId,
     pub name: String,
+}
+
+/// A room and who is in it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoomInfo {
+    pub name: String,
+    pub peers: Vec<PeerInfo>,
 }
 
 /// Same shape as the browser's `RTCIceServer`, so clients can pass it through.
@@ -89,8 +115,15 @@ mod tests {
             msg,
             ClientMsg::Join {
                 room: "lounge".into(),
-                name: "martin".into()
+                name: "martin".into(),
+                invite: None,
             }
+        );
+        // A join without an invite is written as it was before there were
+        // any, for servers from then.
+        assert_eq!(
+            serde_json::to_value(&msg).unwrap(),
+            json!({"type": "join", "room": "lounge", "name": "martin"})
         );
     }
 

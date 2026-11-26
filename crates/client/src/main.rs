@@ -30,6 +30,9 @@ struct Args {
     /// WebSocket address of the signaling server.
     #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
     server: String,
+    /// The invite token, for a server that only lets invited people in.
+    #[arg(long)]
+    invite: Option<String>,
     /// Microphone to use, as a PipeWire/PulseAudio source name.
     #[arg(long)]
     input: Option<String>,
@@ -165,6 +168,7 @@ async fn main() -> Result<()> {
             server: args.server,
             room: args.room.clone(),
             name: args.name.clone(),
+            invite: args.invite,
             audio,
             transmitting: true,
             test_tone: args.test_tone,

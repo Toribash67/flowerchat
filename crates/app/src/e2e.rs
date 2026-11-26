@@ -141,6 +141,8 @@ fn audio_settings_work_through_the_interface() {
         let config = Config {
             ice_servers: vec![],
             releases: None,
+            invites: None,
+            rooms: vec![],
         };
         tokio::spawn(async move {
             axum::serve(listener, flowerchat_server::app(config))
@@ -158,6 +160,7 @@ fn audio_settings_work_through_the_interface() {
         server: url.clone(),
         room: ROOM.into(),
         name: "other".into(),
+        invite: None,
         audio: AudioSettings::default(),
         transmitting: true,
         test_tone: true,
@@ -208,7 +211,7 @@ fn audio_settings_work_through_the_interface() {
     );
     assert!(level > 0.5, "the join screen shows the microphone's level");
 
-    harness.get_by_role_and_label(button, "Join").click();
+    harness.get_by_role_and_label(button, ROOM).click();
     run(&mut harness, 5.0);
     assert!(harness.query_by_label("In room").is_some(), "joined");
     assert!(harness.state().mic_check.is_none());
@@ -308,7 +311,7 @@ fn audio_settings_work_through_the_interface() {
     assert!(harness.state().active.is_none(), "left");
     assert_eq!(harness.state().error, None);
     assert!(harness.state().mic_check.is_some());
-    harness.get_by_role_and_label(button, "Join").click();
+    harness.get_by_role_and_label(button, ROOM).click();
     run(&mut harness, 5.0);
     assert!(harness.query_by_label("In room").is_some(), "joined again");
     assert!(hear_after_change(&mut harness, &us) > AUDIBLE_DB);
@@ -322,12 +325,20 @@ fn audio_settings_work_through_the_interface() {
 
 /// Starts a signaling server on this machine and returns its address.
 fn serve(runtime: &tokio::runtime::Runtime) -> String {
+    serve_rooms(runtime, &[])
+}
+
+/// The same, with rooms that are there before anyone is in them.
+fn serve_rooms(runtime: &tokio::runtime::Runtime, rooms: &[&str]) -> String {
+    let rooms: Vec<String> = rooms.iter().map(|room| (*room).to_owned()).collect();
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
         let config = Config {
             ice_servers: vec![],
             releases: None,
+            invites: None,
+            rooms,
         };
         tokio::spawn(async move {
             axum::serve(listener, flowerchat_server::app(config))
@@ -336,6 +347,75 @@ fn serve(runtime: &tokio::runtime::Runtime) -> String {
         });
         url
     })
+}
+
+/// The room the app is in, or on its way into.
+fn room_of(harness: &Harness<'_, App>) -> Option<String> {
+    let active = harness.state().active.as_ref()?;
+    Some(active.shared.lock().unwrap().room.room.clone())
+}
+
+/// The server's rooms are listed, joined with a click, and left for
+/// another with a click on that one.
+#[test]
+fn rooms_are_joined_and_changed_from_the_list() {
+    gst::init().unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let url = serve_rooms(&runtime, &["lounge", "games"]);
+    let args = Args::parse_from([
+        "flowerchat",
+        "--name",
+        "robin",
+        "--server",
+        &url,
+        "--test-tone",
+        "--measure",
+    ]);
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(1280.0, 720.0))
+        .build_eframe(|cc| App::new(cc, args).unwrap());
+    let button = Role::Button;
+    run(&mut harness, 1.0);
+    assert!(harness.query_by_label("Not in a room").is_some());
+    shot(&mut harness, "rooms-listed");
+
+    harness.get_by_role_and_label(button, "games").click();
+    run(&mut harness, 4.0);
+    assert!(harness.query_by_label("In room").is_some(), "joined");
+    assert_eq!(room_of(&harness).as_deref(), Some("games"));
+    shot(&mut harness, "rooms-in-games");
+
+    // On the way there the window stays laid out as a room. Drawn as often
+    // as the machine manages, so that no frame of the way is missed.
+    harness.get_by_role_and_label(button, "lounge").click();
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(4) {
+        harness.step();
+        assert!(
+            harness.query_by_label("Not in a room").is_none(),
+            "the join screen showed between the rooms"
+        );
+        assert!(harness.query_by_label("In room").is_some());
+    }
+    assert_eq!(harness.state().error, None);
+    assert!(
+        harness.query_by_label("In room").is_some(),
+        "joined the other"
+    );
+    assert_eq!(room_of(&harness).as_deref(), Some("lounge"));
+    shot(&mut harness, "rooms-in-lounge");
+
+    harness.get_by_role_and_label(button, "Leave").click();
+    run(&mut harness, 1.5);
+    assert!(harness.state().active.is_none(), "left");
+    assert_eq!(harness.state().error, None);
+
+    // Closing the window while in a room leaves the room first.
+    harness.get_by_role_and_label(button, "games").click();
+    run(&mut harness, 3.0);
+    assert_eq!(room_of(&harness).as_deref(), Some("games"));
+    eframe::App::on_exit(harness.state_mut());
+    assert!(harness.state().active.is_none());
 }
 
 /// Saves what the window shows, for a person to look at, where
@@ -383,6 +463,7 @@ fn screens_are_shared_and_watched_through_the_interface() {
         server: url.clone(),
         room: ROOM.into(),
         name: "other".into(),
+        invite: None,
         audio: AudioSettings::default(),
         transmitting: true,
         test_tone: true,
@@ -427,8 +508,9 @@ fn screens_are_shared_and_watched_through_the_interface() {
         .with_size(egui::Vec2::new(1280.0, 720.0))
         .build_eframe(|cc| App::new(cc, args).unwrap());
     let button = Role::Button;
-    run(&mut harness, 0.5);
-    harness.get_by_role_and_label(button, "Join").click();
+    // Long enough for the server to have said which rooms it has.
+    run(&mut harness, 1.0);
+    harness.get_by_role_and_label(button, ROOM).click();
     run(&mut harness, 5.0);
     assert!(harness.query_by_label("In room").is_some(), "joined");
 
@@ -659,6 +741,8 @@ fn what_to_share_is_chosen_in_the_window() {
         let config = Config {
             ice_servers: vec![],
             releases: None,
+            invites: None,
+            rooms: vec![],
         };
         tokio::spawn(async move {
             axum::serve(listener, flowerchat_server::app(config))

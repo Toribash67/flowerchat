@@ -85,6 +85,8 @@ async fn start_server(releases: Option<ReleasesConfig>) -> String {
     let config = Config {
         ice_servers: vec![],
         releases,
+        invites: None,
+        rooms: vec![],
     };
     tokio::spawn(async move { axum::serve(listener, app(config)).await.unwrap() });
     format!("http://{addr}")
